@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
 /// Approval tier, ordered from least to most restrictive.
+///
+/// SECURITY: variant order is security-relevant. The derived `Ord` is used
+/// for tier comparison (an approval covers an action only if its tier is
+/// `>=` the required tier), so reordering variants changes what approvals
+/// cover. Keep them ordered least to most restrictive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Tier {
     Auto,

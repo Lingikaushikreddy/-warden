@@ -14,6 +14,8 @@
 //!
 //! The spent-nonce set is held in memory only. A restarted `Approver` forgets
 //! which nonces were spent; persisting it across restarts is Plan 2.
+//! The set grows only with legitimate redemptions: a nonce is recorded only
+//! after every other check has passed, so rejected approvals never add to it.
 
 use crate::action::Action;
 use crate::policy::Tier;
@@ -28,22 +30,17 @@ use std::fmt;
 /// Domain-separation prefix for the signed approval message.
 pub const APPROVAL_DOMAIN: &[u8] = b"warden/approval/v1\0";
 
-/// Pinned tier-to-byte mapping used in the signed message. Changing a value
-/// invalidates every outstanding approval; a test pins this table.
-pub const TIER_BYTES: [(Tier, u8); 4] = [
-    (Tier::Auto, 0),
-    (Tier::Yes, 1),
-    (Tier::YesPin, 2),
-    (Tier::Blocked, 3),
-];
-
 /// The byte that encodes `tier` in the signed message.
+///
+/// Pinned by a test. Changing a value invalidates every outstanding approval.
+/// The match is exhaustive, so a new `Tier` variant fails to compile here.
 pub fn tier_byte(tier: Tier) -> u8 {
-    TIER_BYTES
-        .iter()
-        .find(|(t, _)| *t == tier)
-        .map(|(_, b)| *b)
-        .expect("TIER_BYTES covers every Tier")
+    match tier {
+        Tier::Auto => 0,
+        Tier::Yes => 1,
+        Tier::YesPin => 2,
+        Tier::Blocked => 3,
+    }
 }
 
 /// The exact bytes an approval signature covers.
@@ -112,6 +109,17 @@ impl Approver {
     }
 
     /// An approver using an existing key, with no spent nonces.
+    ///
+    /// # Security
+    ///
+    /// The returned `Approver` starts with an EMPTY spent-nonce set, and
+    /// approvals carry no expiry or epoch. Reloading a key this way (for
+    /// example after a restart) re-enables every approval that key ever
+    /// signed, including ones already redeemed: they can be replayed once
+    /// more. Until the spent-nonce set is persisted alongside the key and
+    /// approvals carry an expiry (Plan 2), only use this with a fresh key or
+    /// in tests. See docs/SECURITY-NOTES.md, "Approvals: expiry and persisted
+    /// nonces".
     pub fn from_signing_key(key: SigningKey) -> Approver {
         Approver {
             key,
@@ -154,10 +162,12 @@ impl Approver {
         if required == Tier::Blocked || approval.tier == Tier::Blocked {
             return Err(ApprovalError::Blocked);
         }
-        if action_hash(action) != approval.action_hash {
+        let hash = action_hash(action);
+        if hash != approval.action_hash {
             return Err(ApprovalError::WrongAction);
         }
-        let msg = approval_message(&approval.action_hash, approval.tier, &approval.nonce);
+        // Sign-check over the locally computed hash, never the claimed one.
+        let msg = approval_message(&hash, approval.tier, &approval.nonce);
         self.key
             .verifying_key()
             .verify_strict(&msg, &approval.signature)
@@ -165,10 +175,10 @@ impl Approver {
         if approval.tier < required {
             return Err(ApprovalError::InsufficientTier);
         }
-        if self.spent.contains(&approval.nonce) {
+        // Single check-and-mark, reached only after every other check passed.
+        if !self.spent.insert(approval.nonce) {
             return Err(ApprovalError::AlreadyUsed);
         }
-        self.spent.insert(approval.nonce);
         Ok(())
     }
 }

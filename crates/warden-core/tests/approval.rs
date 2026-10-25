@@ -173,6 +173,36 @@ fn failed_redeem_does_not_burn_nonce() {
 }
 
 #[test]
+fn bad_signature_copy_does_not_burn_original_nonce() {
+    let mut ap = Approver::generate();
+    let a = write_action("/tmp/a");
+    let original = ap.grant(&a, Tier::Yes).unwrap();
+    let mut copy = original.clone();
+    let mut sig = copy.signature.to_bytes();
+    sig[10] ^= 0x80;
+    copy.signature = ed25519_dalek::Signature::from_bytes(&sig);
+    assert_eq!(
+        ap.redeem(&a, Tier::Yes, &copy),
+        Err(ApprovalError::BadSignature)
+    );
+    assert_eq!(ap.redeem(&a, Tier::Yes, &original), Ok(()));
+}
+
+#[test]
+fn tampered_tier_copy_does_not_burn_original_nonce() {
+    let mut ap = Approver::generate();
+    let a = write_action("/tmp/a");
+    let original = ap.grant(&a, Tier::YesPin).unwrap();
+    let mut copy = original.clone();
+    copy.tier = Tier::Yes;
+    assert_eq!(
+        ap.redeem(&a, Tier::Yes, &copy),
+        Err(ApprovalError::BadSignature)
+    );
+    assert_eq!(ap.redeem(&a, Tier::Yes, &original), Ok(()));
+}
+
+#[test]
 fn approval_from_other_approver_is_bad_signature() {
     let other = Approver::generate();
     let mut ap = Approver::generate();
@@ -204,10 +234,18 @@ fn grant_binds_action_hash_and_fresh_nonce() {
 
 #[test]
 fn tier_byte_mapping_is_pinned() {
-    assert_eq!(tier_byte(Tier::Auto), 0);
-    assert_eq!(tier_byte(Tier::Yes), 1);
-    assert_eq!(tier_byte(Tier::YesPin), 2);
-    assert_eq!(tier_byte(Tier::Blocked), 3);
+    // Changing any byte invalidates every outstanding approval.
+    let pinned = [
+        (Tier::Auto, 0u8),
+        (Tier::Yes, 1),
+        (Tier::YesPin, 2),
+        (Tier::Blocked, 3),
+    ];
+    for (tier, byte) in pinned {
+        assert_eq!(tier_byte(tier), byte, "{tier:?}");
+    }
+    let bytes: Vec<u8> = pinned.iter().map(|(t, _)| tier_byte(*t)).collect();
+    assert_eq!(bytes, (0..=3).collect::<Vec<u8>>());
 }
 
 #[test]

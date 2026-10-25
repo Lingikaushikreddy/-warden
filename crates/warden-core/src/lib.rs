@@ -5,5 +5,5 @@ pub mod policy;
 pub use policy::{classify, PolicyConfig, Tier};
 pub mod approval;
 pub use approval::{
-    approval_message, tier_byte, Approval, ApprovalError, Approver, APPROVAL_DOMAIN, TIER_BYTES,
+    approval_message, tier_byte, Approval, ApprovalError, Approver, APPROVAL_DOMAIN,
 };
