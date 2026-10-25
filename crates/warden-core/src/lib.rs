@@ -9,3 +9,5 @@ pub use approval::{
 };
 pub mod audit;
 pub use audit::{AuditEntry, AuditLog, VerifyReport};
+pub mod snapshot;
+pub use snapshot::{SnapshotError, SnapshotId, SnapshotStore};
