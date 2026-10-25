@@ -87,13 +87,16 @@ fn relative_paths_never_count_as_inside() {
 }
 
 #[test]
-fn dotdot_above_filesystem_root_is_not_inside() {
+fn dotdot_at_fs_root_clamps_to_root() {
     let c = PolicyConfig {
         allowed_roots: vec![PathBuf::from("/")],
     };
     // /.. normalizes to / lexically; still absolute, so inside "/"
     assert_eq!(classify(&act(vec![read("/../etc")]), &c), Tier::Auto);
-    // relative root never matches
+}
+
+#[test]
+fn relative_root_never_matches() {
     let c = PolicyConfig {
         allowed_roots: vec![PathBuf::from("root")],
     };
@@ -116,4 +119,54 @@ fn root_with_dotdot_is_normalized() {
 #[test]
 fn tier_ordering() {
     assert!(Tier::Auto < Tier::Yes && Tier::Yes < Tier::YesPin && Tier::YesPin < Tier::Blocked);
+}
+
+#[test]
+fn every_capability_tier_is_pinned() {
+    use Capability::*;
+    let p = |s: &str| PathBuf::from(s);
+    let table = vec![
+        (ReadPath(p("/root/a")), Tier::Auto),
+        (ReadPath(p("/etc/a")), Tier::Yes),
+        (WritePath(p("/root/a")), Tier::Yes),
+        (WritePath(p("/etc/a")), Tier::Yes),
+        (DeletePath(p("/root/a")), Tier::YesPin),
+        (RunNewScript("s".into()), Tier::Yes),
+        (OpenApp("a".into()), Tier::Yes),
+        (MessagePerson("m".into()), Tier::YesPin),
+        (SendEmail("e".into()), Tier::YesPin),
+        (InstallSoftware("i".into()), Tier::YesPin),
+        (NetworkSend("n".into()), Tier::YesPin),
+        (FormatDisk, Tier::Blocked),
+        (EditRegistry, Tier::Blocked),
+        (DisableSecurityTool, Tier::Blocked),
+        (ReadSavedPasswords, Tier::Blocked),
+    ];
+    for (cap, want) in table {
+        assert_eq!(classify(&act(vec![cap.clone()]), &cfg()), want, "{cap:?}");
+    }
+}
+
+#[test]
+fn order_independent() {
+    let a = act(vec![Capability::FormatDisk, read("/root/a")]);
+    assert_eq!(classify(&a, &cfg()), Tier::Blocked);
+}
+
+#[test]
+fn multiple_allowed_roots() {
+    let c = PolicyConfig {
+        allowed_roots: vec![PathBuf::from("/root"), PathBuf::from("/data")],
+    };
+    assert_eq!(classify(&act(vec![read("/data/x")]), &c), Tier::Auto);
+    assert_eq!(classify(&act(vec![read("/root/x")]), &c), Tier::Auto);
+    assert_eq!(classify(&act(vec![read("/other/x")]), &c), Tier::Yes);
+}
+
+#[test]
+fn empty_allowed_roots_means_every_read_is_yes() {
+    let c = PolicyConfig {
+        allowed_roots: vec![],
+    };
+    assert_eq!(classify(&act(vec![read("/root/a")]), &c), Tier::Yes);
 }
