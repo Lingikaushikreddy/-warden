@@ -29,30 +29,44 @@
 //!
 //! # Restore
 //!
-//! The manifest on disk is untrusted. [`SnapshotStore::restore`] runs in
+//! The manifest on disk is untrusted. [`SnapshotStore::restore`] and
+//! [`SnapshotStore::record_after`] take the allowed root from the caller;
+//! its canonical form must equal the root recorded in the manifest, so an
+//! edited manifest cannot widen where restore may write. Restore runs in
 //! two phases:
 //!
 //! 1. Verify, touching nothing: the recorded root must still canonicalize
-//!    to itself; every entry path must be absolute, contain only normal
+//!    to itself and equal the caller's canonical root; every entry path must be absolute, contain only normal
 //!    components below the root, and have no symlinked parent or target;
 //!    every blob must hash to its name; and, if
 //!    [`SnapshotStore::record_after`] was called and `force` is false,
 //!    every file's current state must equal its recorded after-state
 //!    (otherwise [`SnapshotError::ChangedSinceSnapshot`]).
 //! 2. Apply: each file that existed is written to a temp file in its own
-//!    directory (re-hashed while copying), given its recorded mode,
-//!    fsynced and renamed over the target; each file that did not exist is
+//!    directory (created `0o600`, re-hashed while copying), given its
+//!    recorded mode masked to `0o777` (setuid, setgid and sticky bits are
+//!    never recorded or applied), fsynced and renamed over the target; each file that did not exist is
 //!    removed if present. Missing parent directories are recreated.
 //!
 //! If `record_after` was never called, restore skips the changed-since
 //! check.
 //!
+//! Undoing a file recorded as `existed: false` removes only the file.
+//! Parent directories the agent created around it are left in place.
+//!
+//! The store directory, `blobs/` and `manifests/` are created `0o700`, and
+//! every blob, manifest and restore temp file is created `0o600` before any
+//! bytes are written, so snapshot contents are never group or world
+//! readable.
+//!
 //! # Known limits
 //!
 //! - **TOCTOU.** Every symlink check is `symlink_metadata` followed later
-//!   by use of the path. The crate forbids `unsafe` and has no `libc`
-//!   dependency, so it cannot open with `O_NOFOLLOW` or use `openat`-style
-//!   directory handles. Reads compare the `(dev, ino)` of the opened file
+//!   by use of the path. This is a design choice for Plan 1, not a
+//!   language restriction: opens do not pass `O_NOFOLLOW` (possible in safe
+//!   std via `OpenOptionsExt::custom_flags`) and paths are not walked with
+//!   `openat`-style directory handles (for example via `rustix` or
+//!   `cap-std`). Adopting one of those is a Plan 2 item. Reads compare the `(dev, ino)` of the opened file
 //!   with the earlier `symlink_metadata`, which detects a target swapped for
 //!   a symlink between check and open. Writes go to a fresh `create_new`
 //!   temp file and are moved into place with `rename`, which replaces a
@@ -62,8 +76,8 @@
 //!   or rename, and so redirect one write outside the root; and a target
 //!   swapped for a FIFO between check and open can block a read.
 //! - **Manifests are unauthenticated.** Anyone who can write the store
-//!   directory can edit a manifest, including its recorded root, and so
-//!   direct restore to any regular-file path the process can write (still
+//!   directory can edit a manifest's entries and blobs, and so choose what
+//!   bytes land on which regular-file paths under the caller's root (still
 //!   no `..`, no symlinks, blob hashes verified). Keep the store directory
 //!   writable only by the Warden process.
 //! - **Apply is not transactional.** Phase 1 catches every condition this
@@ -156,8 +170,9 @@ impl SnapshotStore {
 
     /// Opens (creating if needed) a store rooted at `dir`.
     pub fn open(dir: &Path) -> io::Result<Self> {
-        fs::create_dir_all(dir.join("blobs"))?;
-        fs::create_dir_all(dir.join("manifests"))?;
+        create_private_dir(dir)?;
+        create_private_dir(&dir.join("blobs"))?;
+        create_private_dir(&dir.join("manifests"))?;
         Ok(Self {
             dir: dir.to_path_buf(),
             max_file_size: Self::DEFAULT_MAX_FILE_SIZE,
@@ -254,7 +269,7 @@ impl SnapshotStore {
         let tmp = self
             .blobs_dir()
             .join(format!("{TMP_PREFIX}{}", random_hex(16)));
-        let mut out = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut out = create_private_file(&tmp)?;
         let result = read_regular(full, &mut out, Some(self.max_file_size)).and_then(|r| {
             if r.is_some() {
                 out.sync_all()?;
@@ -287,7 +302,7 @@ impl SnapshotStore {
             .manifests_dir()
             .join(format!("{TMP_PREFIX}{}", random_hex(16)));
         let res = (|| -> io::Result<()> {
-            let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            let mut f = create_private_file(&tmp)?;
             f.write_all(&bytes)?;
             f.sync_all()?;
             drop(f);
@@ -319,11 +334,12 @@ impl SnapshotStore {
 
     /// Records each file's state after the change, for the changed-since
     /// check in [`SnapshotStore::restore`]. A missing file is recorded as
-    /// absent.
-    pub fn record_after(&self, id: &SnapshotId) -> Result<(), SnapshotError> {
+    /// absent. `allowed_root` must canonicalize to the root recorded at
+    /// snapshot time, else [`SnapshotError::OutsideRoot`].
+    pub fn record_after(&self, id: &SnapshotId, allowed_root: &Path) -> Result<(), SnapshotError> {
         let _lock = self.lock()?;
         let mut m = self.load_manifest(id)?;
-        let (root, rels) = validate_manifest(&m)?;
+        let (root, rels) = validate_manifest(&m, allowed_root)?;
         for (entry, rel) in m.entries.iter_mut().zip(rels) {
             entry.after = Some(current_state(&root, &rel)?);
         }
@@ -333,10 +349,23 @@ impl SnapshotStore {
 
     /// Writes every recorded file back and removes files recorded as
     /// absent. Returns the paths written or removed.
-    pub fn restore(&self, id: &SnapshotId, force: bool) -> Result<Vec<PathBuf>, SnapshotError> {
+    ///
+    /// `allowed_root` must canonicalize to the root recorded at snapshot
+    /// time, else [`SnapshotError::OutsideRoot`].
+    ///
+    /// The changed-since protection exists only if
+    /// [`SnapshotStore::record_after`] was called for this snapshot. If it
+    /// was not, restore overwrites whatever is on disk now, exactly as with
+    /// `force = true`.
+    pub fn restore(
+        &self,
+        id: &SnapshotId,
+        allowed_root: &Path,
+        force: bool,
+    ) -> Result<Vec<PathBuf>, SnapshotError> {
         let _lock = self.lock()?;
         let m = self.load_manifest(id)?;
-        let (root, rels) = validate_manifest(&m)?;
+        let (root, rels) = validate_manifest(&m, allowed_root)?;
 
         // Phase 1: verify everything before touching the filesystem.
         for (entry, rel) in m.entries.iter().zip(&rels) {
@@ -410,7 +439,7 @@ impl SnapshotStore {
             .to_string_lossy();
         let tmp = parent.join(format!(".{name}.warden-restore-{}", random_hex(8)));
         // create_new = O_CREAT|O_EXCL: never opens an existing file or link.
-        let mut out = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut out = create_private_file(&tmp)?;
         let res = (|| -> Result<(), SnapshotError> {
             let blob = self.open_blob(hash)?;
             let (got, _) = copy_hashing(blob, &mut out, None, full)?;
@@ -544,9 +573,12 @@ fn normal_rel(path: &Path, root: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Checks the manifest's root and every entry; returns the root and each
-/// entry's path relative to it.
-fn validate_manifest(m: &Manifest) -> Result<(PathBuf, Vec<PathBuf>), SnapshotError> {
+/// Checks the manifest's root against the caller's root, and every entry;
+/// returns the root and each entry's path relative to it.
+fn validate_manifest(
+    m: &Manifest,
+    allowed_root: &Path,
+) -> Result<(PathBuf, Vec<PathBuf>), SnapshotError> {
     if m.version != MANIFEST_VERSION {
         return Err(SnapshotError::CorruptManifest);
     }
@@ -561,6 +593,15 @@ fn validate_manifest(m: &Manifest) -> Result<(PathBuf, Vec<PathBuf>), SnapshotEr
     if !root_is_plain {
         return Err(SnapshotError::OutsideRoot(root.clone()));
     }
+    // The recorded root itself must not have become a symlink (or moved).
+    if fs::canonicalize(root)? != *root {
+        return Err(SnapshotError::Symlink(root.clone()));
+    }
+    // The manifest is untrusted: only the caller decides where restore may
+    // write.
+    if fs::canonicalize(allowed_root)? != *root {
+        return Err(SnapshotError::OutsideRoot(allowed_root.to_path_buf()));
+    }
     let mut rels = Vec::with_capacity(m.entries.len());
     for e in &m.entries {
         if !e.path.is_absolute() {
@@ -572,10 +613,6 @@ fn validate_manifest(m: &Manifest) -> Result<(PathBuf, Vec<PathBuf>), SnapshotEr
             return Err(SnapshotError::CorruptManifest);
         }
         rels.push(rel);
-    }
-    // The root itself must not have become a symlink (or moved).
-    if fs::canonicalize(root)? != *root {
-        return Err(SnapshotError::Symlink(root.clone()));
     }
     Ok((root.clone(), rels))
 }
@@ -719,7 +756,7 @@ fn same_file(_a: &fs::Metadata, b: &fs::Metadata) -> bool {
 #[cfg(unix)]
 fn mode_of(m: &fs::Metadata) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
-    Some(m.permissions().mode() & 0o7777)
+    Some(m.permissions().mode() & 0o777)
 }
 
 #[cfg(not(unix))]
@@ -731,7 +768,7 @@ fn mode_of(_m: &fs::Metadata) -> Option<u32> {
 fn set_mode(f: &File, mode: Option<u32>) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     match mode {
-        Some(m) => f.set_permissions(fs::Permissions::from_mode(m & 0o7777)),
+        Some(m) => f.set_permissions(fs::Permissions::from_mode(m & 0o777)),
         None => Ok(()),
     }
 }
@@ -739,6 +776,30 @@ fn set_mode(f: &File, mode: Option<u32>) -> io::Result<()> {
 #[cfg(not(unix))]
 fn set_mode(_f: &File, _mode: Option<u32>) -> io::Result<()> {
     Ok(())
+}
+
+/// Creates a new file (`O_CREAT|O_EXCL`) with mode `0o600` from the start.
+fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// Creates `dir` and any missing ancestors with mode `0o700`.
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let mut b = fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)
 }
 
 #[cfg(unix)]

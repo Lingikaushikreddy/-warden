@@ -79,8 +79,8 @@ fn snapshot_and_restore_roundtrip() {
         .snapshot(std::slice::from_ref(&a), f.root())
         .unwrap();
     fs::write(&a, "two").unwrap();
-    f.store.record_after(&id).unwrap();
-    let restored = f.store.restore(&id, false).unwrap();
+    f.store.record_after(&id, f.root()).unwrap();
+    let restored = f.store.restore(&id, f.root(), false).unwrap();
     assert_eq!(read(&a), "one");
     assert_eq!(restored, vec![canon(&a)]);
 }
@@ -105,8 +105,8 @@ fn missing_file_is_recorded_and_removed_on_restore() {
     let m = f.manifest(&id);
     assert_eq!(m["entries"][0]["existed"], serde_json::Value::Bool(false));
     fs::write(&new, "created by the agent").unwrap();
-    f.store.record_after(&id).unwrap();
-    let restored = f.store.restore(&id, false).unwrap();
+    f.store.record_after(&id, f.root()).unwrap();
+    let restored = f.store.restore(&id, f.root(), false).unwrap();
     assert!(!new.exists());
     assert_eq!(restored, vec![canon(f.root()).join("new.txt")]);
 }
@@ -119,7 +119,7 @@ fn missing_file_absent_at_restore_is_a_no_op() {
         .store
         .snapshot(std::slice::from_ref(&new), f.root())
         .unwrap();
-    let restored = f.store.restore(&id, false).unwrap();
+    let restored = f.store.restore(&id, f.root(), false).unwrap();
     assert!(restored.is_empty());
     assert!(!new.exists());
 }
@@ -185,9 +185,9 @@ fn restore_refuses_if_changed_again_without_force() {
     let id = f.store.snapshot(&[a.clone(), b.clone()], f.root()).unwrap();
     fs::write(&a, "a2").unwrap();
     fs::write(&b, "b2").unwrap();
-    f.store.record_after(&id).unwrap();
+    f.store.record_after(&id, f.root()).unwrap();
     fs::write(&b, "b3").unwrap();
-    let err = f.store.restore(&id, false).unwrap_err();
+    let err = f.store.restore(&id, f.root(), false).unwrap_err();
     match err {
         SnapshotError::ChangedSinceSnapshot(p) => assert_eq!(p, canon(&b)),
         other => panic!("unexpected {other:?}"),
@@ -207,15 +207,15 @@ fn restore_refuses_if_deleted_file_was_recreated() {
         .snapshot(std::slice::from_ref(&a), f.root())
         .unwrap();
     fs::remove_file(&a).unwrap();
-    f.store.record_after(&id).unwrap();
+    f.store.record_after(&id, f.root()).unwrap();
     fs::write(&a, "new").unwrap();
-    let err = f.store.restore(&id, false).unwrap_err();
+    let err = f.store.restore(&id, f.root(), false).unwrap_err();
     assert!(
         matches!(err, SnapshotError::ChangedSinceSnapshot(_)),
         "{err:?}"
     );
     assert_eq!(read(&a), "new");
-    f.store.restore(&id, true).unwrap();
+    f.store.restore(&id, f.root(), true).unwrap();
     assert_eq!(read(&a), "a1");
 }
 
@@ -228,9 +228,9 @@ fn restore_with_force_overwrites() {
         .snapshot(std::slice::from_ref(&a), f.root())
         .unwrap();
     fs::write(&a, "two").unwrap();
-    f.store.record_after(&id).unwrap();
+    f.store.record_after(&id, f.root()).unwrap();
     fs::write(&a, "three").unwrap();
-    f.store.restore(&id, true).unwrap();
+    f.store.restore(&id, f.root(), true).unwrap();
     assert_eq!(read(&a), "one");
 }
 
@@ -243,7 +243,7 @@ fn restore_without_record_after_skips_changed_check() {
         .snapshot(std::slice::from_ref(&a), f.root())
         .unwrap();
     fs::write(&a, "two").unwrap();
-    f.store.restore(&id, false).unwrap();
+    f.store.restore(&id, f.root(), false).unwrap();
     assert_eq!(read(&a), "one");
 }
 
@@ -256,7 +256,7 @@ fn restore_recreates_missing_parent_directories() {
         .snapshot(std::slice::from_ref(&a), f.root())
         .unwrap();
     fs::remove_dir_all(f.root().join("d")).unwrap();
-    f.store.restore(&id, false).unwrap();
+    f.store.restore(&id, f.root(), false).unwrap();
     assert_eq!(read(&a), "deep");
 }
 
@@ -287,7 +287,7 @@ fn prune_removes_old_manifests_and_orphan_blobs() {
         .to_string();
     assert_eq!(blobs, vec![new_hash]);
     assert!(matches!(
-        f.store.restore(&old, false).unwrap_err(),
+        f.store.restore(&old, f.root(), false).unwrap_err(),
         SnapshotError::UnknownSnapshot
     ));
 }
@@ -315,7 +315,7 @@ fn tampered_manifest_with_dotdot_is_rejected_and_nothing_written() {
     let evil = format!("{}/../escaped.txt", canon(f.root()).display());
     m["entries"][1]["path"] = serde_json::json!(evil);
     f.write_manifest(&id, &m);
-    let err = f.store.restore(&id, true).unwrap_err();
+    let err = f.store.restore(&id, f.root(), true).unwrap_err();
     assert!(matches!(err, SnapshotError::OutsideRoot(_)), "{err:?}");
     assert_eq!(read(&a), "a2");
     assert!(!canon(f.root())
@@ -336,7 +336,7 @@ fn tampered_manifest_outside_root_is_rejected() {
     let mut m = f.manifest(&id);
     m["entries"][0]["path"] = serde_json::json!(canon(other.path()).join("victim.txt"));
     f.write_manifest(&id, &m);
-    let err = f.store.restore(&id, true).unwrap_err();
+    let err = f.store.restore(&id, f.root(), true).unwrap_err();
     assert!(matches!(err, SnapshotError::OutsideRoot(_)), "{err:?}");
     assert_eq!(read(&victim), "precious");
 
@@ -346,7 +346,7 @@ fn tampered_manifest_outside_root_is_rejected() {
     m["allowed_root"] = serde_json::json!("/");
     m["entries"][0]["path"] = serde_json::json!("relative.txt");
     f.write_manifest(&id, &m);
-    let err = f.store.restore(&id, true).unwrap_err();
+    let err = f.store.restore(&id, f.root(), true).unwrap_err();
     assert!(matches!(err, SnapshotError::OutsideRoot(_)), "{err:?}");
 }
 
@@ -358,7 +358,7 @@ fn tampered_blob_hash_name_is_rejected() {
     let mut m = f.manifest(&id);
     m["entries"][0]["sha256"] = serde_json::json!("../../../etc/passwd");
     f.write_manifest(&id, &m);
-    let err = f.store.restore(&id, true).unwrap_err();
+    let err = f.store.restore(&id, f.root(), true).unwrap_err();
     assert!(matches!(err, SnapshotError::CorruptManifest), "{err:?}");
 }
 
@@ -375,14 +375,14 @@ fn invalid_snapshot_id_is_rejected() {
         let id = SnapshotId(bad.into());
         assert!(
             matches!(
-                f.store.restore(&id, true),
+                f.store.restore(&id, f.root(), true),
                 Err(SnapshotError::UnknownSnapshot)
             ),
             "restore accepted {bad:?}"
         );
         assert!(
             matches!(
-                f.store.record_after(&id),
+                f.store.record_after(&id, f.root()),
                 Err(SnapshotError::UnknownSnapshot)
             ),
             "record_after accepted {bad:?}"
@@ -390,7 +390,7 @@ fn invalid_snapshot_id_is_rejected() {
     }
     let missing = SnapshotId("0123456789abcdef0123456789abcdef".into());
     assert!(matches!(
-        f.store.restore(&missing, true),
+        f.store.restore(&missing, f.root(), true),
         Err(SnapshotError::UnknownSnapshot)
     ));
 }
@@ -420,7 +420,7 @@ fn corrupt_blob_is_detected_and_nothing_written() {
         .unwrap()
         .to_string();
     fs::write(f.blob_path(&hash_b), "bit rot").unwrap();
-    let err = f.store.restore(&id, true).unwrap_err();
+    let err = f.store.restore(&id, f.root(), true).unwrap_err();
     assert!(matches!(err, SnapshotError::CorruptBlob(_)), "{err:?}");
     assert_eq!(read(&a), "a2");
     assert_eq!(read(&b), "b2");
@@ -437,7 +437,7 @@ fn swapped_blob_is_detected() {
     let ha = m["entries"][0]["sha256"].as_str().unwrap().to_string();
     let hb = m["entries"][1]["sha256"].as_str().unwrap().to_string();
     fs::copy(f.blob_path(&hb), f.blob_path(&ha)).unwrap();
-    let err = f.store.restore(&id, true).unwrap_err();
+    let err = f.store.restore(&id, f.root(), true).unwrap_err();
     assert!(matches!(err, SnapshotError::CorruptBlob(_)), "{err:?}");
     assert_eq!(read(&a), "a2");
 }
@@ -451,7 +451,7 @@ fn symlinked_parent_is_rejected_at_restore() {
     let outside = TempDir::new().unwrap();
     fs::remove_dir_all(f.root().join("d")).unwrap();
     symlink(outside.path(), f.root().join("d")).unwrap();
-    let err = f.store.restore(&id, true).unwrap_err();
+    let err = f.store.restore(&id, f.root(), true).unwrap_err();
     assert!(matches!(err, SnapshotError::Symlink(_)), "{err:?}");
     assert!(!outside.path().join("a.txt").exists());
 }
@@ -470,7 +470,7 @@ fn symlinked_target_is_rejected_at_restore() {
     fs::write(&victim, "precious").unwrap();
     fs::remove_file(&a).unwrap();
     symlink(&victim, &a).unwrap();
-    let err = f.store.restore(&id, true).unwrap_err();
+    let err = f.store.restore(&id, f.root(), true).unwrap_err();
     assert!(matches!(err, SnapshotError::Symlink(_)), "{err:?}");
     assert_eq!(read(&victim), "precious");
 }
@@ -487,7 +487,7 @@ fn permission_bits_are_preserved() {
         .unwrap();
     fs::write(&a, "changed").unwrap();
     fs::set_permissions(&a, fs::Permissions::from_mode(0o600)).unwrap();
-    f.store.restore(&id, false).unwrap();
+    f.store.restore(&id, f.root(), false).unwrap();
     assert_eq!(
         fs::metadata(&a).unwrap().permissions().mode() & 0o7777,
         0o750
@@ -496,7 +496,7 @@ fn permission_bits_are_preserved() {
 
     // A file deleted after the snapshot comes back with its mode too.
     fs::remove_file(&a).unwrap();
-    f.store.restore(&id, false).unwrap();
+    f.store.restore(&id, f.root(), false).unwrap();
     assert_eq!(
         fs::metadata(&a).unwrap().permissions().mode() & 0o7777,
         0o750
@@ -538,7 +538,165 @@ fn root_replaced_by_symlink_is_rejected_at_restore() {
     let outside = TempDir::new().unwrap();
     fs::remove_dir_all(&root).unwrap();
     symlink(outside.path(), &root).unwrap();
-    let err = store.restore(&id, true).unwrap_err();
+    let err = store.restore(&id, &root, true).unwrap_err();
     assert!(matches!(err, SnapshotError::Symlink(_)), "{err:?}");
     assert!(!outside.path().join("a.txt").exists());
+}
+
+#[test]
+fn manifest_root_widened_to_slash_is_refused_and_nothing_written() {
+    let f = fixture();
+    let a = f.file("a.txt", "a1");
+    let id = f
+        .store
+        .snapshot(std::slice::from_ref(&a), f.root())
+        .unwrap();
+    let other = TempDir::new().unwrap();
+    let victim = other.path().join("victim.txt");
+    fs::write(&victim, "precious").unwrap();
+    let mut m = f.manifest(&id);
+    m["allowed_root"] = serde_json::json!("/");
+    m["entries"][0]["path"] = serde_json::json!(canon(&victim));
+    f.write_manifest(&id, &m);
+    let err = f.store.restore(&id, f.root(), true).unwrap_err();
+    assert!(matches!(err, SnapshotError::OutsideRoot(_)), "{err:?}");
+    assert_eq!(read(&victim), "precious");
+    let err = f.store.record_after(&id, f.root()).unwrap_err();
+    assert!(matches!(err, SnapshotError::OutsideRoot(_)), "{err:?}");
+}
+
+#[test]
+fn caller_root_different_from_recorded_root_is_refused() {
+    let f = fixture();
+    let a = f.file("sub/a.txt", "a1");
+    let id = f
+        .store
+        .snapshot(std::slice::from_ref(&a), f.root())
+        .unwrap();
+    fs::write(&a, "a2").unwrap();
+    let other = TempDir::new().unwrap();
+    for wrong in [other.path().to_path_buf(), f.root().join("sub")] {
+        let err = f.store.restore(&id, &wrong, true).unwrap_err();
+        assert!(matches!(err, SnapshotError::OutsideRoot(_)), "{err:?}");
+        let err = f.store.record_after(&id, &wrong).unwrap_err();
+        assert!(matches!(err, SnapshotError::OutsideRoot(_)), "{err:?}");
+    }
+    assert_eq!(read(&a), "a2");
+    // The canonical spelling of the right root is accepted.
+    f.store.restore(&id, &canon(f.root()), false).unwrap();
+    assert_eq!(read(&a), "a1");
+}
+
+#[cfg(unix)]
+#[test]
+fn store_dirs_are_0700_and_blobs_and_restores_are_0600() {
+    let f = fixture();
+    let nested = f.store_dir.path().join("fresh/store");
+    let s2 = SnapshotStore::open(&nested).unwrap();
+    for d in [
+        nested.clone(),
+        nested.join("blobs"),
+        nested.join("manifests"),
+    ] {
+        assert_eq!(
+            fs::metadata(&d).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    let a = f.file("secret.txt", "private");
+    fs::set_permissions(&a, fs::Permissions::from_mode(0o600)).unwrap();
+    let id = s2.snapshot(std::slice::from_ref(&a), f.root()).unwrap();
+    let blob_dir = nested.join("blobs");
+    for e in fs::read_dir(&blob_dir).unwrap() {
+        let mode = e.unwrap().metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "blob must not be group/other readable");
+    }
+    let mpath = nested.join("manifests").join(format!("{}.json", id.0));
+    assert_eq!(
+        fs::metadata(&mpath).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    fs::write(&a, "changed").unwrap();
+    s2.restore(&id, f.root(), false).unwrap();
+    assert_eq!(
+        fs::metadata(&a).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    fs::remove_file(&a).unwrap();
+    s2.restore(&id, f.root(), false).unwrap();
+    assert_eq!(
+        fs::metadata(&a).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn setuid_bits_are_stripped() {
+    let f = fixture();
+    let a = f.file("tool", "#!/bin/sh\n");
+    fs::set_permissions(&a, fs::Permissions::from_mode(0o4755)).unwrap();
+    assert_eq!(
+        fs::metadata(&a).unwrap().permissions().mode() & 0o7777,
+        0o4755
+    );
+    let id = f
+        .store
+        .snapshot(std::slice::from_ref(&a), f.root())
+        .unwrap();
+    assert_eq!(
+        f.manifest(&id)["entries"][0]["mode"],
+        serde_json::json!(0o755)
+    );
+    fs::remove_file(&a).unwrap();
+    f.store.restore(&id, f.root(), false).unwrap();
+    assert_eq!(
+        fs::metadata(&a).unwrap().permissions().mode() & 0o7777,
+        0o755
+    );
+
+    // A tampered manifest mode cannot reintroduce setuid/setgid/sticky.
+    let mut m = f.manifest(&id);
+    m["entries"][0]["mode"] = serde_json::json!(0o7755);
+    f.write_manifest(&id, &m);
+    fs::remove_file(&a).unwrap();
+    f.store.restore(&id, f.root(), false).unwrap();
+    assert_eq!(
+        fs::metadata(&a).unwrap().permissions().mode() & 0o7777,
+        0o755
+    );
+}
+
+#[test]
+fn manifest_id_mismatching_file_name_is_rejected() {
+    let f = fixture();
+    let a = f.file("a.txt", "a1");
+    let id = f
+        .store
+        .snapshot(std::slice::from_ref(&a), f.root())
+        .unwrap();
+    let other = SnapshotId("0123456789abcdef0123456789abcdef".into());
+    fs::copy(f.manifest_path(&id), f.manifest_path(&other)).unwrap();
+    fs::write(&a, "a2").unwrap();
+    let err = f.store.restore(&other, f.root(), true).unwrap_err();
+    assert!(matches!(err, SnapshotError::CorruptManifest), "{err:?}");
+    assert_eq!(read(&a), "a2");
+}
+
+#[test]
+fn absent_entry_now_a_directory_is_not_a_file_and_deletes_nothing() {
+    let f = fixture();
+    let a = f.file("a.txt", "a1");
+    let gone = f.root().join("made-later");
+    let id = f
+        .store
+        .snapshot(&[a.clone(), gone.clone()], f.root())
+        .unwrap();
+    fs::write(&a, "a2").unwrap();
+    fs::create_dir(&gone).unwrap();
+    fs::write(gone.join("inner.txt"), "keep").unwrap();
+    let err = f.store.restore(&id, f.root(), true).unwrap_err();
+    assert!(matches!(err, SnapshotError::NotAFile(_)), "{err:?}");
+    assert_eq!(read(&a), "a2");
+    assert_eq!(read(&gone.join("inner.txt")), "keep");
 }
