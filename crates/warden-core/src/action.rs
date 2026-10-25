@@ -36,7 +36,7 @@ fn path_hex(p: &Path) -> String {
         use std::os::unix::ffi::OsStrExt;
         hex::encode(p.as_os_str().as_bytes())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
         let bytes: Vec<u8> = p
@@ -45,6 +45,13 @@ fn path_hex(p: &Path) -> String {
             .flat_map(|u| u.to_le_bytes())
             .collect();
         hex::encode(bytes)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = p;
+        compile_error!(
+            "warden-core: lossless path encoding is only implemented for unix and windows targets"
+        );
     }
 }
 
@@ -104,7 +111,8 @@ impl Action {
             capabilities: self.capabilities.iter().map(CanonCap::from).collect(),
         };
         // Only strings, unit variants and sequences: serialization is infallible.
-        serde_json::to_vec(&canon).unwrap_or_default()
+        serde_json::to_vec(&canon)
+            .expect("canonical encoding is infallible: only strings, unit variants and sequences")
     }
 }
 
