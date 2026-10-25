@@ -7,3 +7,5 @@ pub mod approval;
 pub use approval::{
     approval_message, tier_byte, Approval, ApprovalError, Approver, APPROVAL_DOMAIN,
 };
+pub mod audit;
+pub use audit::{AuditEntry, AuditLog, VerifyReport};
