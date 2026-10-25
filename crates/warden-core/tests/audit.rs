@@ -430,3 +430,38 @@ fn field_boundaries_are_unambiguous() {
     shifted.summary = "bc".into();
     assert_ne!(base.compute_hash(), shifted.compute_hash());
 }
+
+/// Pins the documented limit: the hash is unkeyed, so anyone who can write
+/// the file can edit entry k and re-chain k..end, and verify passes it.
+/// Only an externally anchored `head()` detects the forgery.
+#[test]
+fn rechained_forged_suffix_passes_verify_documented_limit() {
+    let (_d, path) = tmp_log();
+    write_entries(&path, 4);
+    let anchored_head = AuditLog::open(&path).unwrap().head();
+
+    let mut ls = lines(&path);
+    let mut prev = parse(&ls[0]).hash;
+    for (k, line) in ls.iter_mut().enumerate().skip(1) {
+        let mut e = parse(line);
+        if k == 1 {
+            e.summary = "forged".into();
+            e.decision = "denied".into();
+        }
+        e.prev_hash = prev.clone();
+        e.hash = e.compute_hash();
+        prev.clone_from(&e.hash);
+        *line = line_of(&e);
+    }
+    write_lines(&path, &ls);
+
+    // The limit: verify cannot tell.
+    assert_eq!(
+        AuditLog::verify(&path).unwrap(),
+        VerifyReport::Ok { entries: 4 }
+    );
+    // The mitigation: the anchored head no longer matches.
+    let forged_head = AuditLog::open(&path).unwrap().head();
+    assert_eq!(forged_head.0, anchored_head.0);
+    assert_ne!(forged_head.1, anchored_head.1);
+}

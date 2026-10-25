@@ -40,14 +40,21 @@
 //!
 //! # Known limits
 //!
-//! A hash chain detects edits, deletion of entries in the middle and
-//! reordering. It does NOT detect truncation of whole trailing entries,
-//! nor wholesale replacement of the file by an attacker who can write it
-//! (they can simply recompute the chain). Detecting those needs an
-//! external anchor, such as periodically storing the latest hash
-//! somewhere the attacker cannot write, signed. That is out of scope here;
-//! [`AuditLog::head`] exposes `(next index, last hash)` so a caller can
-//! build one.
+//! The hash is unkeyed. Without an external anchor, the chain detects only
+//! accidental corruption and edits by someone who does not recompute the
+//! hashes. Anyone who can write the file can rewrite any suffix from any
+//! entry onward (edit, delete, reorder, truncate trailing entries, or
+//! replace the whole file) and verify will pass it. Only comparing against
+//! an anchored [`AuditLog::head`] detects this. An external anchor (for
+//! example periodically storing the latest `head()` somewhere the writer
+//! cannot modify, signed) is out of scope for this crate; `head()` returns
+//! `(next index, last hash)` so a caller can build one.
+//!
+//! After a torn write (an append whose write, flush or `sync_data` fails),
+//! the in-memory [`AuditLog`] is poisoned and refuses further appends. If a
+//! partial line reached the file, reopening refuses with `InvalidData`.
+//! There is no automatic tail recovery; an operator must repair the file.
+//! The poison path is untested (there is no fault injection in the tests).
 //!
 //! The exclusive lock taken by [`AuditLog::open`] is advisory
 //! (`File::try_lock`): it stops a second cooperating writer, not an
@@ -247,6 +254,9 @@ impl AuditLog {
     /// Verify the log at `path` without opening it for writing (no lock).
     /// I/O errors (e.g. missing file) are `Err`; any content problem is
     /// `Ok(VerifyReport::Broken { .. })`. Never panics on file content.
+    ///
+    /// Because it takes no lock, verifying a live log can transiently report
+    /// the last line broken if it reads while a writer is mid-append.
     pub fn verify(path: &Path) -> io::Result<VerifyReport> {
         let bytes = std::fs::read(path)?;
         Ok(match walk(&bytes) {
