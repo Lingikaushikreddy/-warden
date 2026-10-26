@@ -5,7 +5,6 @@
 //! log, stdout or stderr. Audit summaries name the kind and target only.
 
 use crate::cli::{AuditCommand, Cli, Command, Kind};
-use crate::pin::{self, PinCheck, SetPinError};
 use crate::{EXIT_BLOCKED, EXIT_DENIED, EXIT_ERROR, EXIT_OK};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -14,6 +13,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
+use warden_core::pin::{self, PinCheck, SetPinError};
 use warden_core::{
     classify, Action, AuditLog, Capability, PolicyConfig, SnapshotError, SnapshotId, SnapshotStore,
     Tier, VerifyReport,

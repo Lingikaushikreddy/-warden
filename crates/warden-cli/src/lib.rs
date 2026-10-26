@@ -7,7 +7,6 @@
 
 pub mod cli;
 pub mod commands;
-pub mod pin;
 
 pub use cli::Cli;
 
