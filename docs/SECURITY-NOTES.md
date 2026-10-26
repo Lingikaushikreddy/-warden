@@ -7,10 +7,55 @@ resolve symlinks. A `ReadPath("/root/link/id_rsa")` where `link -> ~/.ssh` is
 therefore classified `Auto` because it lies lexically inside an allowed root.
 Roots containing `..` are likewise normalized lexically.
 
-Requirement for the Plan 2 executor: before acting on an `Auto` read, it MUST
-either canonicalize the path and re-check it against the allowed roots, or open
-it with no-follow semantics. The snapshot module does not cover reads, so this
-check belongs to the executor.
+The agent executor (`warden_agent::exec`, see "Agent executor" below) closes
+the lexical gap for reads: before any read or listing it canonicalizes the
+deepest existing ancestor of the path and re-checks it against its canonical
+root, refuses any existing symlink component below the root, and opens the
+file with `O_NOFOLLOW | O_NONBLOCK` and checks through the handle that it is a
+regular file. What remains is the parent-swap window: a process that can write
+inside the root can replace a parent directory with a symlink between the
+checks and the open. Closing it needs an `openat`-style walk (`rustix` or
+`cap-std`), a later item.
+
+## Agent executor
+
+`warden_agent::exec::Executor::run(action, tool, auth, now_ms)` is the only
+agent code that touches the disk. It takes the `Authorized` token by value
+(one token, one run) and checks, before any filesystem write: the token has
+not expired (`TokenExpired`); the token's action hash matches the action and
+the tool maps to exactly that action (`TokenMismatch`); then the path rules.
+
+- **Root.** The path must be lexically under the root (as given or
+  canonical) and, after canonicalizing its deepest existing ancestor, under
+  the canonical root (`OutsideRoot`). The root itself is never written or
+  deleted (`Protected`).
+- **Symlinks.** Any existing component below the root that is a symlink is
+  refused (`Symlink`), even when it points inside the root. `list_dir` shows
+  symlinks with a trailing `@` and never follows them.
+- **Protected paths.** Paths equal to or inside a `protected` directory are
+  refused (`Protected`), checked on the lexical and the canonical form. The
+  snapshot store and the approver home MUST live outside the root or be
+  listed in `protected`; otherwise an authorized write could edit the
+  approver key, the spent-nonce log or snapshot manifests.
+- **Writes and deletes** require a regular file with link count 1 (`NotAFile`,
+  `HardLink`), and an existing parent (parents are never created). The
+  snapshot is taken first (a new file is recorded as absent), then the write
+  goes through a temp file with an unpredictable name (8 random bytes from
+  the OS RNG), created `0o600` with `O_NOFOLLOW`, given its final mode (an
+  existing file's mode masked to `0o777`, else `0o600`), synced, renamed over
+  the target, and the directory is fsynced; then `record_after`. A failure
+  after the snapshot still returns the snapshot id (`ExecFailure::snapshot`)
+  and removes the temp file.
+- **Reads** are capped at `max_bytes` through the opened handle and converted
+  lossily to UTF-8; a FIFO or device is `NotAFile` and does not block.
+- Error messages never contain file contents.
+
+Remaining: the parent-swap TOCTOU window described under "Auto reads and
+symlinks" applies to reads, writes and deletes alike (only the final
+component of a read and the temp file use `O_NOFOLLOW`; rename and unlink are
+path-based). A hard link created concurrently between the link-count check
+and the operation is not caught. Fix: walk from a root directory handle with
+`openat`/`renameat`/`unlinkat` (`rustix` or `cap-std`).
 
 ## Approvals: expiry and persisted nonces
 
@@ -241,8 +286,9 @@ self dev-dependency. The hook never lets a refused action through, but failing
 the append that follows an executed action leaves that action without its
 final audit record, which is the audit gap described above.
 
-The `write`/`delete` executor relies on the snapshot module's symlink checks;
-it inherits the same TOCTOU gap described under "Snapshots and restore".
+The CLI `write`/`delete` executor relies on the snapshot module's symlink
+checks; it inherits the same TOCTOU gap described under "Snapshots and
+restore". The agent executor has its own checks (see "Agent executor").
 
 ### Hard links
 

@@ -121,7 +121,7 @@ fn parse_args<T: serde::de::DeserializeOwned>(call: &ToolCall) -> Result<T, Tool
 /// RLM (U+200E, U+200F) or a soft hyphen (U+00AD) are rejected on purpose,
 /// because the same characters can make two different paths look identical
 /// in an approval prompt.
-fn is_forbidden_path_char(c: char) -> bool {
+pub(crate) fn is_forbidden_path_char(c: char) -> bool {
     c.is_control()
         || matches!(c,
             '\u{00AD}' | '\u{061C}' | '\u{0085}'

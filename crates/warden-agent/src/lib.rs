@@ -9,5 +9,6 @@
 compile_error!("warden-agent requires a Unix platform for now");
 
 pub mod authorize;
+pub mod exec;
 pub mod redact;
 pub mod tools;
