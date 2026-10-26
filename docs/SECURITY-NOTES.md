@@ -148,6 +148,44 @@ Remaining items:
   `--yes` and the PIN (see "CLI PIN"); they do not create or redeem signed
   approvals. Signed approvals are used by the agent engine only.
 
+## Planner boundary
+
+`warden_agent::planner` is the only path to a model. What is sent: the
+system prompt, the conversation turns and the tool specs (name,
+description, JSON schema). Text and tool results are `Redacted` (built only
+by `redact`); tool-call arguments echoed back into history are
+`RedactedJson`, built only by `Block::tool_use`, which runs `redact_json`
+(a raw `Value` in `Block::ToolUse` does not compile). Redaction is
+pattern-based, so its known limits (see `redact.rs`) apply to everything
+sent: unknown secret formats, obfuscated or split secrets and so on still
+leave the machine.
+
+- **Responses are untrusted.** Text is truncated at 64 KiB. Tool calls go
+  through `parse_call`, `classify` and approval like any other model output.
+  Tool-use ids and names must match `[A-Za-z0-9_-]{1,64}` (they are echoed
+  into later requests), and at most 64 calls are accepted per response;
+  otherwise the whole response is `Malformed`. Unknown block types
+  (thinking, server tools) are ignored.
+- **Bounded reads.** The body is read chunk by chunk and abandoned past
+  1 MiB (`TooLarge`); Content-Length is not consulted. A non-2xx status is
+  returned as `Status(code)` without reading the body. Parse errors use
+  fixed messages and never quote the body.
+- **Transport.** HTTPS only (rustls), except `http://` to `127.0.0.1`,
+  `localhost` or `[::1]` for tests and local proxies; base URLs with
+  credentials, a query or a fragment are refused. Redirects are not
+  followed (a 3xx is a `Status` error). Timeouts: 10 s connect, 60 s for the
+  whole request by default (`with_timeout`). Transport errors are a short
+  category plus reqwest's message with the URL removed (`without_url`);
+  the source chain is dropped.
+- **No retries.** One POST per `plan` call; a 429 or 5xx is returned to the
+  caller.
+- **API key.** Passed in by the caller (the CLI reads it from an
+  environment variable); never written to disk, the audit log or logs. It
+  is held only as a `HeaderValue` marked sensitive, and the `String` it
+  came from is zeroized (the header's own buffer is not). `Debug` of the
+  planner shows the model, base URL and timeout, never the key; no error
+  carries it.
+
 ## Agent approver store
 
 `warden_agent::authorize::ApproverStore` implements the contract above. It is

@@ -28,7 +28,7 @@ pub struct ToolCall {
 }
 
 /// A tool the model may be offered.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,

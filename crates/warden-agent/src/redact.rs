@@ -133,6 +133,14 @@ impl fmt::Display for Redacted {
     }
 }
 
+/// Serializes as a plain JSON string. There is deliberately no
+/// `Deserialize`: the only way to obtain a `Redacted` is [`redact`].
+impl serde::Serialize for Redacted {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
 impl fmt::Debug for Redacted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Redacted({:?})", self.0)
