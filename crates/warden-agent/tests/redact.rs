@@ -565,3 +565,219 @@ fn escaped_quote_inside_json_value_is_covered() {
     let o = out("{\"password\":\"abc\\\"def\"}");
     assert_eq!(o, "{\"password\":\"[REDACTED:kv_secret]\"}");
 }
+
+#[test]
+fn kv_suffixes_are_not_a_leak() {
+    for (input, expected) in [
+        (
+            "SECRET_KEY_BASE=abcd1234",
+            "SECRET_KEY_BASE=[REDACTED:kv_secret]",
+        ),
+        (
+            "secret_key_base: abcd1234",
+            "secret_key_base: [REDACTED:kv_secret]",
+        ),
+        (
+            "DATABASE_PASSWORD_PROD=abcd1234",
+            "DATABASE_PASSWORD_PROD=[REDACTED:kv_secret]",
+        ),
+        (
+            "OPENAI_API_KEY_2=abcd1234",
+            "OPENAI_API_KEY_2=[REDACTED:kv_secret]",
+        ),
+        ("TOKEN_PROD=abcd1234", "TOKEN_PROD=[REDACTED:kv_secret]"),
+        ("password1=abcd1234", "password1=[REDACTED:kv_secret]"),
+    ] {
+        assert_eq!(out(input), expected);
+    }
+    let (r, _) =
+        redact_json(&json!({"SECRET_KEY_BASE":"x1","db_password_prod":"y1","tokenizer":"z"}));
+    assert_eq!(
+        r,
+        json!({"SECRET_KEY_BASE":"[REDACTED:kv_secret]","db_password_prod":"[REDACTED:kv_secret]","tokenizer":"z"})
+    );
+}
+
+#[test]
+fn deny_listed_suffixes_stay_untouched() {
+    for s in [
+        "max_tokens: 1024",
+        "token_count=123456",
+        "password_hash: abcdefgh",
+        "tokenizer: bert-base",
+        "secretary: alice-smith",
+        "token_path = /etc/token",
+        "secret_name: my-secret-name",
+        "token_ttl: 360000",
+        "api_key_id: abcd1234",
+        "password_confirmation: abcd1234",
+        "token-count: 123456",
+    ] {
+        assert_eq!(out(s), s);
+    }
+}
+
+#[test]
+fn credentials_are_secret() {
+    assert_eq!(
+        out("credentials: \"user:hunter22\""),
+        "credentials: \"[REDACTED:kv_secret]\""
+    );
+    assert_eq!(
+        out("credentials: abcd1234"),
+        "credentials: [REDACTED:kv_secret]"
+    );
+    let (r, _) = redact_json(&json!({"credentials":"user:hunter22"}));
+    assert_eq!(r, json!({"credentials":"[REDACTED:kv_secret]"}));
+}
+
+#[test]
+fn chained_aws_keys_are_fully_redacted_in_one_pass() {
+    for n in [10, 100, 1000] {
+        let s = "AKIAIOSFODNN7EXAMPLE".repeat(n);
+        let (r, rep) = redact(&s);
+        assert!(!r.as_str().contains("AKIA"), "n={n}");
+        assert_eq!(r.as_str(), "[REDACTED:api_key]".repeat(n));
+        assert_eq!(rep.count, n);
+        assert_eq!(out(r.as_str()), r.as_str());
+    }
+}
+
+#[test]
+fn adversarial_key_chain_with_digit_spam_is_linear() {
+    let mut s = "AKIAIOSFODNN7EXAMPLE".repeat(50_000);
+    s.push_str(&"5 4 ".repeat(250_000));
+    let start = Instant::now();
+    let (r, _) = redact(&s);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(!r.as_str().contains("AKIA"));
+}
+
+#[test]
+fn real_card_shapes_are_redacted() {
+    for (input, ok) in [
+        ("6011 1111 1111 1117", true),
+        ("6011-1111-1111-1117", true),
+        ("2221 0000 0000 0009", true),
+        ("5555 5555 5555 4444", true),
+        ("3782 822463 10005", true),
+        ("3787 344936 71000", true),
+        ("3056 930902 5904", true),
+        ("3782 8224 6310 005", true),
+        ("4000 0000 0000 0000 006", true),
+        ("4000-0000-0000-0000-006", true),
+        ("4111 1111-1111 1111", false),
+    ] {
+        let o = out(&format!("n {input} x"));
+        assert_eq!(o.contains("[REDACTED:card]"), ok, "{input} -> {o}");
+    }
+    assert!(out("n 4111 1111-1111 1111 x").contains("4111 1111-1111"));
+}
+
+#[test]
+fn number_lists_that_pass_luhn_are_not_cards() {
+    for s in ["2000 3000 4000 5000 600", "bytes 2048 4096 8192 1638 400"] {
+        assert_eq!(out(s), s);
+    }
+}
+
+fn luhn_ref(d: &[u8]) -> bool {
+    let mut sum = 0u32;
+    for (i, b) in d.iter().rev().enumerate() {
+        let mut n = u32::from(b - b'0');
+        if i % 2 == 1 {
+            n *= 2;
+            if n > 9 {
+                n -= 9;
+            }
+        }
+        sum += n;
+    }
+    #[allow(clippy::manual_is_multiple_of)]
+    let ok = sum % 10 == 0;
+    ok
+}
+
+/// Independent reference: leftmost, longest window of a real shape that passes
+/// Luhn and starts with a plausible prefix (single spaces only).
+fn expected_cards(nums: &[String]) -> usize {
+    let shapes: [&[usize]; 5] = [
+        &[4, 4, 4, 4],
+        &[4, 4, 4, 4, 3],
+        &[4, 6, 5],
+        &[4, 6, 4],
+        &[4, 4, 4, 3],
+    ];
+    let plausible = |d: &str| {
+        let b = d.as_bytes();
+        match b[0] {
+            b'4' | b'5' | b'6' => true,
+            b'2' => (2221..=2720).contains(&d[..4].parse::<u32>().unwrap()),
+            b'3' => matches!(b[1], b'0' | b'4'..=b'9'),
+            _ => false,
+        }
+    };
+    let mut count = 0;
+    let mut i = 0;
+    while i < nums.len() {
+        let mut hit = None;
+        for j in (i..nums.len().min(i + 5)).rev() {
+            let w = &nums[i..=j];
+            let digits: String = w.concat();
+            let single = w.len() == 1
+                && (13..=19).contains(&digits.len())
+                && (b'2'..=b'6').contains(&digits.as_bytes()[0]);
+            let multi = w.len() > 1
+                && shapes
+                    .iter()
+                    .any(|s| s.len() == w.len() && s.iter().zip(w).all(|(l, g)| g.len() == *l))
+                && plausible(&digits);
+            if (single || multi) && luhn_ref(digits.as_bytes()) {
+                hit = Some(j);
+                break;
+            }
+        }
+        match hit {
+            Some(j) => {
+                count += 1;
+                i = j + 1;
+            }
+            None => i += 1,
+        }
+    }
+    count
+}
+
+#[test]
+fn generated_number_rows_only_redact_real_luhn_valid_windows() {
+    let mut seed: u64 = 777;
+    let mut next = |m: u64| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) % m
+    };
+    let (mut total_expected, mut total_actual) = (0, 0);
+    for shape in 0..3 {
+        for _ in 0..5000 {
+            let nums: Vec<String> = match shape {
+                0 => (0..5).map(|_| format!("{:04}", next(10000))).collect(),
+                1 => (0..6).map(|_| format!("{:04}", next(10000))).collect(),
+                _ => (0..8).map(|_| next(100000).to_string()).collect(),
+            };
+            let row = nums.join(" ");
+            let (_, rep) = redact(&row);
+            let exp = expected_cards(&nums);
+            assert_eq!(rep.count, exp, "{row}");
+            total_expected += exp;
+            total_actual += rep.count;
+        }
+    }
+    assert_eq!(total_expected, total_actual);
+    // Roughly one Luhn pass in ten per four-digit window: a handful, not thousands.
+    assert!(total_actual < 4000, "{total_actual}");
+}

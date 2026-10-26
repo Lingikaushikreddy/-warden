@@ -19,30 +19,46 @@
 //!   redacts only `correct`; quote the value and the whole value is caught);
 //! - escaped-quote JSON inside a string (`{\"password\":\"x\"}` from doubly
 //!   serialized text), because the key is followed by `\"`, not `"`;
-//! - card numbers embedded in a longer digit run (a 25-digit order number), or
-//!   spaced cards whose groups are shorter than 4 digits (to avoid redacting
-//!   ordinary lists of numbers); a spaced card needs every group of 4+ digits
-//!   (the last may have 3), an unspaced one 13-19 digits, a leading 2-6 and a
-//!   valid Luhn checksum;
+//! - card numbers embedded in a longer digit run (a 25-digit order number).
+//!   A spaced or hyphenated card must have a real shape (4-4-4-4, 4-4-4-4-3,
+//!   4-6-5, 4-6-4, 4-4-4-3, one separator kind throughout) and a plausible
+//!   issuer prefix (4, 51-59, 2221-2720, 30/34-39, 6x); an unspaced one is 13-19
+//!   digits starting 2-6. All need a valid Luhn checksum. Other layouts, such
+//!   as `4111-111111-111111`, are not caught;
 //! - bare numbers under a secret key in text (`password = 1234 5678` redacts
 //!   only the first group; valid card numbers are caught by the card rule).
 //!
 //! Remaining false positives (over-redaction costs model context but leaks
 //! nothing): key/value redaction fires on code that assigns to a secret-named
 //! identifier (`token = request.headers["x"]`, `self.token = token`,
-//! `const token: string = ...`, `pub token: String`). Text keys may carry any
-//! identifier prefix (`DB_PASSWORD`, `auth_token`) but only a `key`, `token`,
-//! `secret` or `password` suffix, so `tokens`, `tokenizer`, `secretary`,
-//! `password_hash`, `token_count` and `max_tokens` are left alone. To keep
-//! source code intact, unquoted values that start with `& ( { [ : =`, end with
-//! `(` or `)`, or are shorter than 4 characters are left alone.
-//! In JSON, plural keys (`tokens`, `credentials`, `api_keys`) are secret only
-//! when their value is an array or object, and `auth`, `pass`, `passphrase`
+//! `const token: string = ...`, `pub token: String`). A secret keyword may
+//! carry any identifier prefix and any suffix (`DB_PASSWORD`,
+//! `SECRET_KEY_BASE`, `OPENAI_API_KEY_2`, `password1`), except a short deny
+//! list of known non-secrets: `s`, `izer`/`ize`/`ized`/`izing`, `ary`,
+//! `_hash`, `_count`, `_path`, `_file`, `_id(s)`, `_type`, `_length`, `_len`,
+//! `_limit`, `_expiry`, `_confirmation`, `_policy`, `_ttl`, `_url`, `_name`
+//! (so `tokens`, `tokenizer`, `secretary`, `password_hash`, `token_count`,
+//! `max_tokens` are left alone; `tokens_used: 12345` is not). To keep source
+//! code intact, unquoted values that start with `& ( { [ : =`, end with `(`
+//! or `)`, or are shorter than 4 characters are left alone.
+//! In JSON the same keyword/deny-list rule applies to keys; plural keys
+//! (`tokens`, `api_keys`) are secret only when their value is an array or
+//! object, `credential(s)` is always secret, and `auth`, `pass`, `passphrase`
 //! count as secret keys only as a whole key or `_`/`-` delimited word. Every
 //! string and number leaf under a secret JSON key is replaced. Card numbers
 //! are matched by checksum, so an unlucky Luhn-valid number is redacted.
 //! `Basic <x>` outside an `Authorization:` header is redacted only when `x`
 //! is 12+ base64 characters containing a digit or `+/=`.
+//!
+//! Fixed-prefix tokens (`AKIA`, `ASIA`, `sk-`, `sk_live_`, `ghp_`, `github_pat_`,
+//! `glpat-`, `hf_`, `xox?-`, `xapp-`, `AIza`) are matched anywhere, even in the
+//! middle of a word, so chains of keys are caught in one pass; this can
+//! over-redact ordinary text such as `risk-assessment-for-the-quarter`.
+//!
+//! Fail closed: `redact` repeats its passes until the text stops changing
+//! (a placeholder can create a new boundary for a later pattern). If it has
+//! not converged after 8 passes, it returns the single string
+//! `[REDACTED:overflow]` (kind `overflow`) instead of partially redacted text.
 //!
 //! All matching uses the `regex` crate (finite automata, linear time in the
 //! input). Inputs are never logged.
@@ -118,7 +134,7 @@ fn placeholder(kind: &str) -> String {
 
 const KEY_SUFFIX: &str = "(?:[_-]?(?:key|token|secret|password))?";
 const KEYWORDS: &str =
-    "password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credential";
+    "password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credentials?";
 
 struct Patterns {
     pem: Regex,
@@ -143,16 +159,16 @@ fn patterns() -> &'static Patterns {
         .unwrap(),
         jwt: Regex::new(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap(),
         api_key: Regex::new(concat!(
-            r"\bsk-[A-Za-z0-9_-]{20,}",
+            r"sk-[A-Za-z0-9_-]{20,}",
             r"|gh[pousr]_[A-Za-z0-9]{36}",
             r"|github_pat_[A-Za-z0-9_]{22,}",
             r"|xox[abprs]-[A-Za-z0-9-]{10,}",
-            r"|\bxapp-[A-Za-z0-9-]{10,}",
-            r"|\b(?:AKIA|ASIA)[0-9A-Z]{16}",
+            r"|xapp-[A-Za-z0-9-]{10,}",
+            r"|(?:AKIA|ASIA)[0-9A-Z]{16}",
             r"|AIza[0-9A-Za-z_-]{35}",
-            r"|\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}",
-            r"|\bhf_[A-Za-z0-9]{30,}",
-            r"|\bglpat-[A-Za-z0-9_-]{20,}",
+            r"|[sr]k_(?:live|test)_[A-Za-z0-9]{16,}",
+            r"|hf_[A-Za-z0-9]{30,}",
+            r"|glpat-[A-Za-z0-9_-]{20,}",
         ))
         .unwrap(),
         url_userinfo: Regex::new(
@@ -165,13 +181,13 @@ fn patterns() -> &'static Patterns {
         )
         .unwrap(),
         kv: Regex::new(&format!(
-            r#"(?i)(?P<pre>(?:{KEYWORDS}){KEY_SUFFIX}["']?[ \t]*[=:][ \t]*)(?:"(?P<dq>(?:[^"\\\n]|\\[^\n])*)(?P<dqc>"?)|'(?P<sq>(?:[^'\\\n]|\\[^\n])*)(?P<sqc>'?)|(?P<bare>[^\s"',;]+))"#
+            r#"(?i)(?P<pre>(?:{KEYWORDS})(?P<suffix>[A-Za-z0-9_-]*)["']?[ \t]*[=:][ \t]*)(?:"(?P<dq>(?:[^"\\\n]|\\[^\n])*)(?P<dqc>"?)|'(?P<sq>(?:[^'\\\n]|\\[^\n])*)(?P<sqc>'?)|(?P<bare>[^\s"',;]+))"#
         ))
         .unwrap(),
         // Maximal runs of digit groups joined by single spaces or hyphens;
         // card windows are searched inside each run.
         card: Regex::new(r"\b[0-9]+(?:[ -][0-9]+)*\b").unwrap(),
-        secret_key_name: Regex::new(&format!("(?i)(?:{KEYWORDS}){KEY_SUFFIX}$")).unwrap(),
+        secret_key_name: Regex::new(&format!("(?i)(?:{KEYWORDS})(?P<suffix>[A-Za-z0-9_-]*)$")).unwrap(),
         word_key_name: Regex::new(&format!(
             "(?i)(?:^|[_-])(?:auth|passphrase|pass){KEY_SUFFIX}$"
         ))
@@ -219,11 +235,50 @@ fn window_luhn(bytes: &[u8], groups: &[(usize, usize)]) -> bool {
     ok
 }
 
-/// Find card numbers inside a run of digit groups. A window is a single group
-/// of 13-19 digits, or several groups of which every one but the last has 4+
-/// digits (the last has 3+), totalling 13-19 digits. It must start with 2-6
-/// and pass Luhn; the longest passing window wins. Each start tries at most
-/// five groups, so the scan is linear in the run and allocation-free per window.
+/// Digit-group lengths of real multi-group card layouts.
+const CARD_SHAPES: &[&[usize]] = &[
+    &[4, 4, 4, 4],
+    &[4, 4, 4, 4, 3],
+    &[4, 6, 5],
+    &[4, 6, 4],
+    &[4, 4, 4, 3],
+];
+
+/// Plausible issuer prefix for a multi-group card (first four digits).
+fn iin_plausible(b: &[u8]) -> bool {
+    match b[0] {
+        b'4' | b'5' | b'6' => true,
+        b'2' => {
+            let n = (u32::from(b[0] - b'0') * 1000)
+                + (u32::from(b[1] - b'0') * 100)
+                + (u32::from(b[2] - b'0') * 10)
+                + u32::from(b[3] - b'0');
+            (2221..=2720).contains(&n)
+        }
+        b'3' => matches!(b[1], b'0' | b'4'..=b'9'),
+        _ => false,
+    }
+}
+
+fn window_shape_ok(bytes: &[u8], groups: &[(usize, usize)]) -> bool {
+    if groups.len() == 1 {
+        let len = groups[0].1 - groups[0].0;
+        return (13..=19).contains(&len) && (b'2'..=b'6').contains(&bytes[groups[0].0]);
+    }
+    let shape_ok = CARD_SHAPES
+        .iter()
+        .any(|s| s.len() == groups.len() && s.iter().zip(groups).all(|(l, g)| g.1 - g.0 == *l));
+    let sep = bytes[groups[1].0 - 1];
+    shape_ok
+        && groups[1..].iter().all(|g| bytes[g.0 - 1] == sep)
+        && iin_plausible(&bytes[groups[0].0..groups[0].0 + 4])
+}
+
+/// Find card numbers inside a run of digit groups: a single group of 13-19
+/// digits starting 2-6, or a window of groups with a real card layout (see
+/// [`CARD_SHAPES`]), one separator kind and a plausible issuer prefix. Every
+/// window must pass Luhn; the longest passing window wins. Each start tries at
+/// most five windows, so the scan is linear and allocation-free per window.
 fn card_spans(run: &str, base: usize) -> Vec<(usize, usize)> {
     let bytes = run.as_bytes();
     let mut groups: Vec<(usize, usize)> = Vec::new();
@@ -242,23 +297,13 @@ fn card_spans(run: &str, base: usize) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut i = 0;
     while i < groups.len() {
-        let len0 = groups[i].1 - groups[i].0;
         let mut found = None;
-        if (b'2'..=b'6').contains(&bytes[groups[i].0]) && len0 >= 4 {
-            let mut total = 0;
-            for j in i..groups.len() {
-                let len = groups[j].1 - groups[j].0;
-                total += len;
-                if total > 19 {
-                    break;
-                }
-                let eligible = if j == i { total >= 13 } else { len >= 3 };
-                if (13..=19).contains(&total) && eligible && window_luhn(bytes, &groups[i..=j]) {
-                    found = Some(j);
-                }
-                if len < 4 {
-                    break;
-                }
+        let last = (i + 4).min(groups.len() - 1);
+        for j in (i..=last).rev() {
+            let w = &groups[i..=j];
+            if window_shape_ok(bytes, w) && window_luhn(bytes, w) {
+                found = Some(j);
+                break;
             }
         }
         match found {
@@ -296,6 +341,38 @@ fn is_placeholder(v: &str) -> bool {
         .is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
 }
 
+/// Suffixes after a secret keyword that mark a known non-secret
+/// (`tokens`, `tokenizer`, `password_hash`, `token_count`, ...).
+fn suffix_denied(suffix: &str) -> bool {
+    let l = suffix.to_ascii_lowercase().replace('-', "_");
+    matches!(
+        l.as_str(),
+        "s" | "izer"
+            | "ize"
+            | "ized"
+            | "izing"
+            | "ary"
+            | "_hash"
+            | "hash"
+            | "_count"
+            | "count"
+            | "_path"
+            | "_file"
+            | "_id"
+            | "_ids"
+            | "_type"
+            | "_length"
+            | "_len"
+            | "_limit"
+            | "_expiry"
+            | "_confirmation"
+            | "_policy"
+            | "_ttl"
+            | "_url"
+            | "_name"
+    )
+}
+
 fn bare_looks_like_code(v: &str) -> bool {
     v.chars().count() < 4
         || v.starts_with(['&', '(', '{', '[', ':', '='])
@@ -311,19 +388,26 @@ fn looks_like_base64_credential(w: &str) -> bool {
 /// after `password =` is caught whole), so earlier placeholders are never
 /// re-matched.
 pub fn redact(input: &str) -> (Redacted, RedactionReport) {
+    redact_with_max_passes(input, MAX_PASSES)
+}
+
+const MAX_PASSES: usize = 8;
+
+/// Runs passes until one changes nothing (a placeholder can create a new word
+/// boundary for a later pattern). If that does not happen within `max_passes`,
+/// fails closed with `[REDACTED:overflow]`.
+fn redact_with_max_passes(input: &str, max_passes: usize) -> (Redacted, RedactionReport) {
     let mut report = RedactionReport::default();
-    let mut text = redact_pass(input, &mut report);
-    // A placeholder can create a word boundary that was not there before
-    // (`...KEYxapp-...`), so repeat until nothing changes. This makes the
-    // result a fixed point: redacting the output again is a no-op.
-    for _ in 0..8 {
+    let mut text = input.to_string();
+    for _ in 0..max_passes {
         let next = redact_pass(&text, &mut report);
         if next == text {
-            break;
+            return (Redacted(text), report);
         }
         text = next;
     }
-    (Redacted(text), report)
+    report.record("overflow", 1);
+    (Redacted(placeholder("overflow")), report)
 }
 
 fn redact_pass(input: &str, report: &mut RedactionReport) -> String {
@@ -370,6 +454,9 @@ fn redact_pass(input: &str, report: &mut RedactionReport) -> String {
     let mut n = 0;
     let s =
         p.kv.replace_all(&s, |c: &Captures| {
+            if suffix_denied(&c["suffix"]) {
+                return c[0].to_string();
+            }
             let pre = &c["pre"];
             let (open, value, close) = if let Some(v) = c.name("dq") {
                 ("\"", v.as_str(), c.name("dqc").map_or("", |m| m.as_str()))
@@ -409,7 +496,9 @@ pub fn redact_json(value: &Value) -> (Value, RedactionReport) {
 
 fn is_secret_key(key: &str, value: &Value) -> bool {
     let p = patterns();
-    p.secret_key_name.is_match(key)
+    p.secret_key_name
+        .captures(key)
+        .is_some_and(|c| !suffix_denied(&c["suffix"]))
         || p.word_key_name.is_match(key)
         || (matches!(value, Value::Array(_) | Value::Object(_)) && p.plural_key_name.is_match(key))
 }
@@ -441,5 +530,24 @@ fn walk(value: &Value, secret: bool, report: &mut RedactionReport) -> Value {
             Value::Object(m)
         }
         other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonconvergence_fails_closed_with_overflow() {
+        // One pass changes the text and no pass is left to confirm a fixed point.
+        let (r, rep) = redact_with_max_passes("key AKIAIOSFODNN7EXAMPLE", 1);
+        assert_eq!(r.as_str(), "[REDACTED:overflow]");
+        assert!(rep.kinds.contains(&"overflow"));
+        assert!(rep.count >= 1);
+        // The overflow output is itself stable.
+        assert_eq!(redact(r.as_str()).0.as_str(), "[REDACTED:overflow]");
+        // With one more pass it converges normally.
+        let (r, _) = redact_with_max_passes("key AKIAIOSFODNN7EXAMPLE", 2);
+        assert_eq!(r.as_str(), "key [REDACTED:api_key]");
     }
 }
