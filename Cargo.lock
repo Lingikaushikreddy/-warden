@@ -713,6 +713,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
+ "libc",
  "rand",
  "regex",
  "serde",
@@ -721,6 +722,7 @@ dependencies = [
  "tempfile",
  "warden-agent",
  "warden-core",
+ "zeroize",
 ]
 
 [[package]]

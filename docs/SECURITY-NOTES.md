@@ -57,7 +57,8 @@ approvals do not verify under v2.
 so output is deterministic) and `Approver::from_signing_key_with_spent(key,
 spent)` restores it. `warden-core` itself does not write the set anywhere;
 persisting it next to the signing key, and loading it before any redeem, is
-done by the agent crate (Plan 2, Task 5). `Approver::from_signing_key` still
+done by `warden_agent::authorize::ApproverStore` (see "Agent approver store"
+below). `Approver::from_signing_key` still
 starts with an empty set: reloading a key that way lets an already redeemed,
 unexpired approval be redeemed once more, so the replay window after a restart
 is bounded by `MAX_SKEW_MS + MAX_TTL_MS` but is not zero.
@@ -78,13 +79,55 @@ complete: a redeemed nonce missing from it can be replayed while unexpired.
 
 Remaining items:
 
-- The spent-nonce set grows with every legitimate redemption (rejected
-  approvals never add to it). Nonces whose approvals have expired could be
-  pruned, but `spent()` exports bare nonces without their expiry, so pruning
-  needs the persisting caller to track expiry alongside them.
+- `Approver::spent()` exports bare nonces, so the in-memory set inside one
+  `Approver` grows with every legitimate redemption (rejected approvals never
+  add to it). Pruning happens in `ApproverStore`, which records each nonce's
+  expiry next to it and drops expired records when it is opened.
 - **The standalone CLI still uses flags.** `warden run`/`undo` approve with
   `--yes` and the PIN (see "CLI PIN"); they do not create or redeem signed
   approvals. Signed approvals are used by the agent engine only.
+
+## Agent approver store
+
+`warden_agent::authorize::ApproverStore` implements the contract above. It is
+Unix-only (the crate fails to compile elsewhere) and its `home` directory must
+be on a local filesystem, because the single-owner guarantee is an advisory
+`flock` on `approver.lock`, which network filesystems may not honour.
+
+- **`authorize` does NOT verify consent.** It classifies the action, grants
+  and redeems an approval at that tier, persists the nonce and returns an
+  `Authorized` token. The caller must collect consent matching the tier first:
+  a yes for `Yes`, a yes plus the PIN for `YesPin`. `Blocked` is always
+  refused; `authorize_auto` issues tokens only for `Auto` actions.
+- **Tokens are time-limited, not policy-bound.** `Authorized` carries the
+  action hash, the tier and `expires_at_ms` (`now_ms + ttl_ms`, same TTL rules
+  as `grant`); the executor checks the expiry. A token is not bound to the
+  `PolicyConfig`: the executor must act under the same policy the caller
+  passed to `authorize`.
+- **Files.** `approver.key` (32 bytes, 0600, created atomically via temp file
+  + `hard_link`), `spent-nonces` (24-byte records `nonce || expires_at_ms BE`,
+  0600), `approver.lock` (0600). All are opened with `O_NOFOLLOW |
+  O_NONBLOCK` and checked through the handle: regular file, no group/other
+  bits. A wrong-size key or a log whose length is not a multiple of 24 is
+  `InvalidData` and is never repaired.
+- **A missing log is fatal.** `spent-nonces` is created only together with a
+  new key. If the key exists and the log does not, `open` fails `NotFound`:
+  silently starting an empty log would re-enable replays.
+- **Persist before execute, poison on failure.** After `redeem`, the record is
+  appended and `sync_data`'d before the token is returned. If the append or
+  sync fails, no token is issued, the nonce stays spent in memory, the log is
+  truncated back to its previous length (best effort) and the store is
+  poisoned: `authorize` returns `Poisoned` until the store is reopened, which
+  re-validates the log.
+- **Pruning.** On open, a record is dropped only when
+  `expires_at_ms + MAX_SKEW_MS <= now_ms`, so the pruning tolerance matches
+  `redeem`'s. Pruning trusts `now_ms`: a clock that jumps forward on open
+  prunes early, and if it then goes back those approvals could be replayed
+  within their window.
+
+Deferred (Plan 3): persist a high-water mark of the largest `now_ms` seen
+(next to the log) and refuse to open or prune with an earlier clock, closing
+the clock-rollback replay above.
 
 ## Snapshots and restore
 
