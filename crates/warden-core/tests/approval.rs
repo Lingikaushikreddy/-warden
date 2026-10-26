@@ -3,8 +3,28 @@ use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use warden_core::{
-    approval_message, tier_byte, Action, Approval, ApprovalError, Approver, Capability, Tier,
+    approval_message, classify, tier_byte, Action, Approval, ApprovalError, Approver, Capability,
+    PolicyConfig, Tier,
 };
+
+fn cfg() -> PolicyConfig {
+    PolicyConfig {
+        allowed_roots: vec![PathBuf::from("/tmp")],
+    }
+}
+
+fn action_with(cap: Capability) -> Action {
+    Action {
+        id: "a1".into(),
+        summary: "test action".into(),
+        capabilities: vec![cap],
+    }
+}
+
+/// Classified `YesPin`.
+fn delete_action(path: &str) -> Action {
+    action_with(Capability::DeletePath(PathBuf::from(path)))
+}
 
 fn write_action(path: &str) -> Action {
     Action {
@@ -36,7 +56,7 @@ fn valid_approval_redeems_once() {
     let mut ap = Approver::generate();
     let a = write_action("/tmp/a");
     let approval = ap.grant(&a, Tier::Yes).unwrap();
-    assert_eq!(ap.redeem(&a, Tier::Yes, &approval), Ok(()));
+    assert_eq!(ap.redeem(&a, &cfg(), &approval), Ok(()));
 }
 
 #[test]
@@ -44,9 +64,9 @@ fn second_redeem_is_already_used() {
     let mut ap = Approver::generate();
     let a = write_action("/tmp/a");
     let approval = ap.grant(&a, Tier::Yes).unwrap();
-    ap.redeem(&a, Tier::Yes, &approval).unwrap();
+    ap.redeem(&a, &cfg(), &approval).unwrap();
     assert_eq!(
-        ap.redeem(&a, Tier::Yes, &approval),
+        ap.redeem(&a, &cfg(), &approval),
         Err(ApprovalError::AlreadyUsed)
     );
 }
@@ -58,7 +78,7 @@ fn approval_for_other_action_is_wrong_action() {
     let b = write_action("/tmp/b");
     let approval = ap.grant(&a, Tier::Yes).unwrap();
     assert_eq!(
-        ap.redeem(&b, Tier::Yes, &approval),
+        ap.redeem(&b, &cfg(), &approval),
         Err(ApprovalError::WrongAction)
     );
 }
@@ -72,7 +92,7 @@ fn tampered_signature_is_bad_signature() {
     sig[0] ^= 0x01;
     approval.signature = ed25519_dalek::Signature::from_bytes(&sig);
     assert_eq!(
-        ap.redeem(&a, Tier::Yes, &approval),
+        ap.redeem(&a, &cfg(), &approval),
         Err(ApprovalError::BadSignature)
     );
 }
@@ -80,12 +100,12 @@ fn tampered_signature_is_bad_signature() {
 #[test]
 fn tampered_tier_is_bad_signature() {
     let mut ap = Approver::generate();
-    let a = write_action("/tmp/a");
+    let a = delete_action("/tmp/a");
     // Granted Yes, attacker bumps to YesPin to cover a YesPin action.
     let mut approval = ap.grant(&a, Tier::Yes).unwrap();
     approval.tier = Tier::YesPin;
     assert_eq!(
-        ap.redeem(&a, Tier::YesPin, &approval),
+        ap.redeem(&a, &cfg(), &approval),
         Err(ApprovalError::BadSignature)
     );
 }
@@ -97,7 +117,7 @@ fn tampered_nonce_is_bad_signature() {
     let mut approval = ap.grant(&a, Tier::Yes).unwrap();
     approval.nonce[0] ^= 0x01;
     assert_eq!(
-        ap.redeem(&a, Tier::Yes, &approval),
+        ap.redeem(&a, &cfg(), &approval),
         Err(ApprovalError::BadSignature)
     );
 }
@@ -116,35 +136,75 @@ fn blocked_tier_cannot_be_granted() {
 fn blocked_cannot_be_redeemed_even_with_valid_signature() {
     let key = SigningKey::generate(&mut OsRng);
     let mut ap = Approver::from_signing_key(key.clone());
-    let a = write_action("/tmp/a");
 
-    // Approval tier Blocked, validly signed by this Approver's own key.
-    let forged = hand_sign(&key, &a, Tier::Blocked, [7u8; 16]);
-    for required in [Tier::Auto, Tier::Yes, Tier::YesPin, Tier::Blocked] {
+    // Approval tier Blocked, validly signed by this Approver's own key, for
+    // actions of every non-Blocked tier.
+    let actions = [
+        action_with(Capability::ReadPath(PathBuf::from("/tmp/a"))),
+        write_action("/tmp/a"),
+        delete_action("/tmp/a"),
+    ];
+    for (i, a) in actions.iter().enumerate() {
+        let forged = hand_sign(&key, a, Tier::Blocked, [i as u8; 16]);
         assert_eq!(
-            ap.redeem(&a, required, &forged),
+            ap.redeem(a, &cfg(), &forged),
             Err(ApprovalError::Blocked),
-            "required {required:?}"
+            "{a:?}"
         );
     }
 
-    // Required tier Blocked: even a validly signed YesPin approval fails.
-    let pin = hand_sign(&key, &a, Tier::YesPin, [8u8; 16]);
-    assert_eq!(
-        ap.redeem(&a, Tier::Blocked, &pin),
-        Err(ApprovalError::Blocked)
-    );
+    // A Blocked action: even a validly signed YesPin approval fails,
+    // whatever the approval says.
+    for cap in [Capability::FormatDisk, Capability::EditRegistry] {
+        let a = action_with(cap);
+        assert_eq!(classify(&a, &cfg()), Tier::Blocked);
+        for (j, tier) in [Tier::Auto, Tier::Yes, Tier::YesPin]
+            .into_iter()
+            .enumerate()
+        {
+            let approval = hand_sign(&key, &a, tier, [0x40 + j as u8; 16]);
+            assert_eq!(
+                ap.redeem(&a, &cfg(), &approval),
+                Err(ApprovalError::Blocked),
+                "{tier:?}"
+            );
+        }
+    }
 }
 
 #[test]
 fn yes_approval_cannot_cover_yespin_action() {
     let mut ap = Approver::generate();
-    let a = write_action("/tmp/a");
+    let a = delete_action("/tmp/a");
     let approval = ap.grant(&a, Tier::Yes).unwrap();
     assert_eq!(
-        ap.redeem(&a, Tier::YesPin, &approval),
+        ap.redeem(&a, &cfg(), &approval),
         Err(ApprovalError::InsufficientTier)
     );
+}
+
+#[test]
+fn caller_view_of_tier_cannot_downgrade() {
+    // A caller with a stale or lower view of the action (it believes a
+    // write+delete action is only Yes) grants Yes. redeem classifies the
+    // action itself and still requires YesPin.
+    let mut ap = Approver::generate();
+    let a = Action {
+        id: "a2".into(),
+        summary: "write then delete".into(),
+        capabilities: vec![
+            Capability::WritePath(PathBuf::from("/tmp/a")),
+            Capability::DeletePath(PathBuf::from("/tmp/a")),
+        ],
+    };
+    assert_eq!(classify(&a, &cfg()), Tier::YesPin);
+    let stale = ap.grant(&a, Tier::Yes).unwrap();
+    assert_eq!(
+        ap.redeem(&a, &cfg(), &stale),
+        Err(ApprovalError::InsufficientTier)
+    );
+    let ok = ap.grant(&a, Tier::YesPin).unwrap();
+    assert_eq!(ap.redeem(&a, &cfg(), &ok), Ok(()));
 }
 
 #[test]
@@ -152,24 +212,29 @@ fn higher_tier_approval_covers_lower_requirement() {
     let mut ap = Approver::generate();
     let a = write_action("/tmp/a");
     let approval = ap.grant(&a, Tier::YesPin).unwrap();
-    assert_eq!(ap.redeem(&a, Tier::Yes, &approval), Ok(()));
+    assert_eq!(ap.redeem(&a, &cfg(), &approval), Ok(()));
 }
 
 #[test]
 fn failed_redeem_does_not_burn_nonce() {
     let mut ap = Approver::generate();
-    let a = write_action("/tmp/a");
-    let b = write_action("/tmp/b");
-    let approval = ap.grant(&a, Tier::Yes).unwrap();
+    // A read is Auto inside the allowed roots and Yes outside them.
+    let a = action_with(Capability::ReadPath(PathBuf::from("/srv/data")));
+    let b = action_with(Capability::ReadPath(PathBuf::from("/srv/other")));
+    let outside = cfg();
+    let inside = PolicyConfig {
+        allowed_roots: vec![PathBuf::from("/srv")],
+    };
+    let approval = ap.grant(&a, Tier::Auto).unwrap();
     assert_eq!(
-        ap.redeem(&b, Tier::Yes, &approval),
+        ap.redeem(&b, &inside, &approval),
         Err(ApprovalError::WrongAction)
     );
     assert_eq!(
-        ap.redeem(&a, Tier::YesPin, &approval),
+        ap.redeem(&a, &outside, &approval),
         Err(ApprovalError::InsufficientTier)
     );
-    assert_eq!(ap.redeem(&a, Tier::Yes, &approval), Ok(()));
+    assert_eq!(ap.redeem(&a, &inside, &approval), Ok(()));
 }
 
 #[test]
@@ -182,10 +247,10 @@ fn bad_signature_copy_does_not_burn_original_nonce() {
     sig[10] ^= 0x80;
     copy.signature = ed25519_dalek::Signature::from_bytes(&sig);
     assert_eq!(
-        ap.redeem(&a, Tier::Yes, &copy),
+        ap.redeem(&a, &cfg(), &copy),
         Err(ApprovalError::BadSignature)
     );
-    assert_eq!(ap.redeem(&a, Tier::Yes, &original), Ok(()));
+    assert_eq!(ap.redeem(&a, &cfg(), &original), Ok(()));
 }
 
 #[test]
@@ -196,10 +261,10 @@ fn tampered_tier_copy_does_not_burn_original_nonce() {
     let mut copy = original.clone();
     copy.tier = Tier::Yes;
     assert_eq!(
-        ap.redeem(&a, Tier::Yes, &copy),
+        ap.redeem(&a, &cfg(), &copy),
         Err(ApprovalError::BadSignature)
     );
-    assert_eq!(ap.redeem(&a, Tier::Yes, &original), Ok(()));
+    assert_eq!(ap.redeem(&a, &cfg(), &original), Ok(()));
 }
 
 #[test]
@@ -209,7 +274,7 @@ fn approval_from_other_approver_is_bad_signature() {
     let a = write_action("/tmp/a");
     let approval = other.grant(&a, Tier::Yes).unwrap();
     assert_eq!(
-        ap.redeem(&a, Tier::Yes, &approval),
+        ap.redeem(&a, &cfg(), &approval),
         Err(ApprovalError::BadSignature)
     );
 }

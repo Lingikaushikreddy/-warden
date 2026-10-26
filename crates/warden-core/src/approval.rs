@@ -8,9 +8,12 @@
 //! b"warden/approval/v1\0" || action_hash (32) || tier byte (1) || nonce (16)
 //! ```
 //!
-//! [`Approver::redeem`] accepts an approval at most once. `Blocked` actions can
-//! never be approved: [`Approver::grant`] refuses them, and `redeem` rejects
-//! them even when the approval carries a valid signature.
+//! [`Approver::redeem`] accepts an approval at most once. It classifies the
+//! action itself (with [`classify`] and the caller's [`PolicyConfig`]) to get
+//! the required tier; there is no caller-supplied tier to get wrong.
+//! `Blocked` actions can never be approved: [`Approver::grant`] refuses them,
+//! and `redeem` rejects them even when the approval carries a valid
+//! signature.
 //!
 //! The spent-nonce set is held in memory only. A restarted `Approver` forgets
 //! which nonces were spent; persisting it across restarts is Plan 2.
@@ -18,7 +21,7 @@
 //! after every other check has passed, so rejected approvals never add to it.
 
 use crate::action::Action;
-use crate::policy::Tier;
+use crate::policy::{classify, PolicyConfig, Tier};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -148,17 +151,22 @@ impl Approver {
         })
     }
 
-    /// Accept `approval` for `action`, whose classifier-computed tier is
-    /// `required`. Checks, in order: neither tier is `Blocked`; the action
-    /// hash matches; the signature verifies (strict); the granted tier covers
-    /// `required`; the nonce is unspent. Only after all pass is the nonce
-    /// marked spent, so a failed redeem never burns it.
+    /// Accept `approval` for `action` under policy `cfg`.
+    ///
+    /// The required tier is computed here with [`classify`]; callers cannot
+    /// supply it, so a stale or lower view of the action can never downgrade
+    /// what the approval must cover. Checks, in order: neither the required
+    /// tier nor the approval's tier is `Blocked`; the action hash matches;
+    /// the signature verifies (strict); the granted tier covers the required
+    /// tier; the nonce is unspent. Only after all pass is the nonce marked
+    /// spent, so a failed redeem never burns it.
     pub fn redeem(
         &mut self,
         action: &Action,
-        required: Tier,
+        cfg: &PolicyConfig,
         approval: &Approval,
     ) -> Result<(), ApprovalError> {
+        let required = classify(action, cfg);
         if required == Tier::Blocked || approval.tier == Tier::Blocked {
             return Err(ApprovalError::Blocked);
         }

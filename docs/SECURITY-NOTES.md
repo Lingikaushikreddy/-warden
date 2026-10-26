@@ -14,6 +14,14 @@ check belongs to the executor.
 
 ## Approvals: expiry and persisted nonces
 
+`Approver::redeem(action, cfg, approval)` computes the required tier itself
+with `classify(action, cfg)`; callers cannot pass a tier. A caller holding a
+stale or lower view of an action therefore cannot downgrade it: a `YesPin`
+action is never redeemed with a `Yes` approval, and a `Blocked` action is
+refused whatever the approval says. Check order: `Blocked` → action hash →
+signature → tier floor → nonce insert. The caller must pass the same
+`PolicyConfig` the executor will act under.
+
 `Approver` keeps its spent-nonce set in memory only, and an `Approval` is valid
 for as long as the key that signed it. `Approver::from_signing_key` starts with
 an empty spent set, so reloading a key after a restart lets every approval that
