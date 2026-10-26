@@ -72,8 +72,9 @@ log, stdout or stderr. Known weaknesses of this version:
   file can brute-force a short PIN offline in seconds. The 6-character
   minimum does not change that. argon2 (or similar) was out of scope here.
 - **`--pin` is visible in process lists.** Command-line arguments can be read
-  by other local users (`ps`). Prefer the `WARDEN_PIN` environment variable.
-  If both are given, `--pin` wins.
+  by other local users (`ps`). This applies equally to the positional
+  `warden init-pin <pin>` argument. Prefer the `WARDEN_PIN` environment
+  variable for both `run` and `init-pin`. If both are given, the argument wins.
 - **No attempt rate-limit.** Wrong PINs are audited as `refused: bad pin`, but
   nothing slows or locks out repeated guesses.
 - **Approvals are flags, not signed approvals.** `--yes` and the PIN are
@@ -90,6 +91,11 @@ Every command that writes (`run`, `undo`, `prune`, `init-pin`) opens the audit
 log first and refuses with exit code 1 if it cannot (including a broken hash
 chain), so nothing happens unaudited. `run` appends `approved` before taking
 the snapshot and acting, then `executed snapshot=<id>` or `failed: <reason>`.
-The audit summary names the kind and target only, never write content. The
+The audit summary names the kind and target only, never write content. `undo` needs no `--yes` in this version; it is audited as `requested` and
+then its outcome. Once a write/delete has been attempted, `run` prints
+`snapshot <id>` before the final audit append, so the id is never lost; if
+that append fails, it warns and exits 1, and the change can still be undone.
+Debug builds honour `WARDEN_TEST_FAIL_AUDIT_APPEND=<n>` (fail the n-th
+append) for tests; it can only make a command fail. The
 `write`/`delete` executor relies on the snapshot module's symlink checks; it
 inherits the same TOCTOU gap described under "Snapshots and restore".

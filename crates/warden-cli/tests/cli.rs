@@ -546,6 +546,15 @@ fn classify_only_kinds_are_not_executed() {
     assert_eq!(out.status.code(), Some(0));
     assert!(stdout(&out).contains("Auto"));
     assert!(stdout(&out).contains("not executed (classify-only in this version)"));
+    let d = e.decisions();
+    assert_eq!(
+        &d[d.len() - 2..],
+        &[
+            "approved".to_owned(),
+            "not executed: classify-only".to_owned()
+        ],
+        "an Auto run is audited too"
+    );
 
     e.cmd()
         .args(["run", "--root"])
@@ -570,4 +579,152 @@ fn prune_prints_count() {
     let out = e.cmd().args(["prune", "--days", "30"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(stdout(&out), "pruned 0\n");
+}
+
+fn snapshot_id_of(out: &std::process::Output) -> Option<String> {
+    stdout(out)
+        .lines()
+        .find_map(|l| l.strip_prefix("snapshot "))
+        .map(str::to_owned)
+}
+
+#[test]
+fn audit_failure_after_action_still_prints_snapshot_and_undo_works() {
+    let e = Env::new();
+    let f = e.file("a.txt");
+    fs::write(&f, "original").unwrap();
+    // Appends in `run write --yes`: 1 = approved, 2 = executed. Fail the 2nd.
+    let out = e
+        .cmd()
+        .env("WARDEN_TEST_FAIL_AUDIT_APPEND", "2")
+        .args(["run", "--root"])
+        .arg(e.root())
+        .args(["--yes", "write"])
+        .arg(&f)
+        .arg("changed")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&f).unwrap(), "changed");
+    let id = snapshot_id_of(&out).expect("snapshot id printed");
+    assert!(
+        stderr(&out).contains("audit append failed after the action"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(stderr(&out).contains(&id));
+    e.cmd()
+        .args(["undo", &id, "--root"])
+        .arg(e.root())
+        .assert()
+        .success();
+    assert_eq!(fs::read_to_string(&f).unwrap(), "original");
+}
+
+#[test]
+fn action_failure_still_prints_snapshot_id() {
+    let e = Env::new();
+    e.init_pin();
+    let f = e.file("missing.txt");
+    let out = e
+        .cmd()
+        .args(["run", "--root"])
+        .arg(e.root())
+        .args(["--yes", "--pin", PIN, "delete"])
+        .arg(&f)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(snapshot_id_of(&out).is_some(), "{}", stdout(&out));
+    assert_eq!(
+        e.decisions().last().map(String::as_str),
+        Some("failed: NotFound")
+    );
+}
+
+#[test]
+fn undo_is_audited_as_requested() {
+    let e = Env::new();
+    let f = e.file("a.txt");
+    fs::write(&f, "v1").unwrap();
+    let out = e
+        .cmd()
+        .args(["run", "--root"])
+        .arg(e.root())
+        .args(["--yes", "write"])
+        .arg(&f)
+        .arg("v2")
+        .output()
+        .unwrap();
+    let id = snapshot_id_of(&out).unwrap();
+    e.cmd()
+        .args(["undo", &id, "--root"])
+        .arg(e.root())
+        .assert()
+        .success();
+    let d = e.decisions();
+    assert_eq!(
+        &d[d.len() - 2..],
+        &["requested".to_owned(), "restored files=1".to_owned()]
+    );
+}
+
+#[test]
+fn held_audit_lock_makes_run_refuse() {
+    let e = Env::new();
+    let f = e.file("a.txt");
+    fs::write(&f, "old").unwrap();
+    let _held = warden_core::AuditLog::open(&e.audit_path()).unwrap();
+    let out = e
+        .cmd()
+        .args(["run", "--root"])
+        .arg(e.root())
+        .args(["--yes", "write"])
+        .arg(&f)
+        .arg("new")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&f).unwrap(), "old");
+}
+
+#[test]
+fn delete_of_a_directory_exits_1_and_leaves_it() {
+    let e = Env::new();
+    e.init_pin();
+    let d = e.file("dir");
+    fs::create_dir(&d).unwrap();
+    fs::write(d.join("inner.txt"), "keep").unwrap();
+    let out = e
+        .cmd()
+        .args(["run", "--root"])
+        .arg(e.root())
+        .args(["--yes", "--pin", PIN, "delete"])
+        .arg(&d)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(d.join("inner.txt")).unwrap(), "keep");
+}
+
+#[cfg(unix)]
+#[test]
+fn write_through_symlink_exits_1_and_leaves_target() {
+    let e = Env::new();
+    let other = tempfile::tempdir().unwrap();
+    let target = other.path().join("target.txt");
+    fs::write(&target, "untouched").unwrap();
+    let link = e.file("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let out = e
+        .cmd()
+        .args(["run", "--root"])
+        .arg(e.root())
+        .args(["--yes", "write"])
+        .arg(&link)
+        .arg("pwned")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
 }

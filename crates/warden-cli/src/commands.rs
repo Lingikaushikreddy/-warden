@@ -22,13 +22,47 @@ use warden_core::{
 const PIN_ENV: &str = "WARDEN_PIN";
 const NOT_EXECUTED: &str = "not executed (classify-only in this version)";
 
+/// Print a line to stdout, ignoring write errors (for example EPIPE), so a
+/// closed pipe can never turn a completed action into a panic (exit 101).
+macro_rules! out {
+    ($($t:tt)*) => {{
+        let _ = writeln!(std::io::stdout(), $($t)*);
+    }};
+}
+
+/// Like `out!`, for stderr.
+macro_rules! err {
+    ($($t:tt)*) => {{
+        let _ = writeln!(std::io::stderr(), $($t)*);
+    }};
+}
+
+/// Test-only fault injection, compiled into debug builds only: when
+/// `WARDEN_TEST_FAIL_AUDIT_APPEND=<n>` is set, the n-th audit append of this
+/// process fails. It can only make a command fail, never let one through.
+fn injected_append_failure() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static APPENDS: AtomicU64 = AtomicU64::new(0);
+        let n = APPENDS.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(k) = std::env::var("WARDEN_TEST_FAIL_AUDIT_APPEND")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            return n == k;
+        }
+    }
+    false
+}
+
 pub fn dispatch(cli: Cli) -> u8 {
     let home = match cli.home {
         Some(h) => absolute(&h),
         None => match std::env::var_os("HOME") {
             Some(h) => PathBuf::from(h).join(".warden"),
             None => {
-                eprintln!("error: HOME is not set; pass --home <dir>");
+                err!("error: HOME is not set; pass --home <dir>");
                 return EXIT_ERROR;
             }
         },
@@ -111,7 +145,7 @@ fn ensure_home(home: &Path) -> io::Result<()> {
 /// is reported and the caller must stop without changing anything.
 fn open_audit(home: &Path) -> Result<AuditLog, u8> {
     if let Err(e) = ensure_home(home) {
-        eprintln!("error: cannot create data dir {}: {e}", home.display());
+        err!("error: cannot create data dir {}: {e}", home.display());
         return Err(EXIT_ERROR);
     }
     let path = home.join("audit.jsonl");
@@ -127,7 +161,7 @@ fn open_audit(home: &Path) -> Result<AuditLog, u8> {
             .open(&path);
     }
     AuditLog::open(&path).map_err(|e| {
-        eprintln!(
+        err!(
             "error: cannot open audit log {}: {e}\nrefusing to act without a working audit log; run `warden audit verify`",
             path.display()
         );
@@ -143,10 +177,14 @@ fn audit(
     tier: Tier,
     decision: &str,
 ) -> Result<(), u8> {
+    if injected_append_failure() {
+        err!("error: cannot append to audit log: injected test failure");
+        return Err(EXIT_ERROR);
+    }
     log.append(id, summary, tier, decision)
         .map(drop)
         .map_err(|e| {
-            eprintln!("error: cannot append to audit log: {e}");
+            err!("error: cannot append to audit log: {e}");
             EXIT_ERROR
         })
 }
@@ -283,14 +321,14 @@ fn cmd_classify(root: &Path, kind: Kind, args: Vec<OsString>) -> u8 {
     let target = match parse_target(kind, args, false) {
         Ok(t) => t,
         Err(msg) => {
-            eprintln!("error: {msg}");
+            err!("error: {msg}");
             return EXIT_DENIED;
         }
     };
     let cfg = PolicyConfig {
         allowed_roots: roots(root),
     };
-    println!("{:?}", classify(&build_action(kind, &target), &cfg));
+    out!("{:?}", classify(&build_action(kind, &target), &cfg));
     EXIT_OK
 }
 
@@ -316,11 +354,11 @@ fn run_inner(
     args: Vec<OsString>,
 ) -> Result<u8, u8> {
     let target = parse_target(kind, args, true).map_err(|msg| {
-        eprintln!("error: {msg}");
+        err!("error: {msg}");
         EXIT_DENIED
     })?;
     if !root.is_dir() {
-        eprintln!("error: --root {} is not a directory", root.display());
+        err!("error: --root {} is not a directory", root.display());
         return Err(EXIT_DENIED);
     }
     let mut log = open_audit(home)?;
@@ -339,14 +377,14 @@ fn run_inner(
     // 1. Blocked never runs.
     if tier == Tier::Blocked {
         record("refused: blocked")?;
-        eprintln!("blocked: `{sum}` is never allowed (tier Blocked)");
+        err!("blocked: `{sum}` is never allowed (tier Blocked)");
         return Ok(EXIT_BLOCKED);
     }
 
     // 2. Approval.
     if tier >= Tier::Yes && !yes {
         record("refused: missing approval")?;
-        eprintln!("refused: `{sum}` needs approval (tier {tier:?}); pass --yes");
+        err!("refused: `{sum}` needs approval (tier {tier:?}); pass --yes");
         return Ok(EXIT_DENIED);
     }
     if tier == Tier::YesPin {
@@ -356,7 +394,7 @@ fn run_inner(
             None if fs::symlink_metadata(&pin_path).is_err() => PinCheck::NotSet,
             None => {
                 record("refused: missing approval")?;
-                eprintln!(
+                err!(
                     "refused: `{sum}` needs --yes and a PIN (tier YesPin); set {PIN_ENV} or pass --pin"
                 );
                 return Ok(EXIT_DENIED);
@@ -365,7 +403,7 @@ fn run_inner(
                 Ok(c) => c,
                 Err(e) => {
                     record("failed: pin file unreadable")?;
-                    eprintln!("error: cannot read PIN file {}: {e}", pin_path.display());
+                    err!("error: cannot read PIN file {}: {e}", pin_path.display());
                     return Ok(EXIT_ERROR);
                 }
             },
@@ -374,14 +412,14 @@ fn run_inner(
             PinCheck::Match => {}
             PinCheck::NotSet => {
                 record("refused: no pin set")?;
-                eprintln!(
+                err!(
                     "refused: `{sum}` needs a PIN (tier YesPin) but none is set; run `warden init-pin` first"
                 );
                 return Ok(EXIT_DENIED);
             }
             PinCheck::Mismatch => {
                 record("refused: bad pin")?;
-                eprintln!("refused: wrong PIN");
+                err!("refused: wrong PIN");
                 return Ok(EXIT_DENIED);
             }
         }
@@ -393,7 +431,7 @@ fn run_inner(
         let path = target.path().unwrap_or(Path::new(""));
         if !inside(path, &roots) {
             record("refused: outside root")?;
-            eprintln!(
+            err!(
                 "refused: {} is outside --root {}",
                 path.display(),
                 root.display()
@@ -406,8 +444,8 @@ fn run_inner(
     record("approved")?;
     if !executes {
         record("not executed: classify-only")?;
-        println!("{tier:?}");
-        println!("{NOT_EXECUTED}");
+        out!("{tier:?}");
+        out!("{NOT_EXECUTED}");
         return Ok(EXIT_OK);
     }
 
@@ -415,19 +453,19 @@ fn run_inner(
     let path = target.path().unwrap_or(Path::new("")).to_path_buf();
     let store = SnapshotStore::open(&home.join("snapshots")).map_err(|e| {
         let _ = record(&format!("failed: {:?}", e.kind()));
-        eprintln!("error: cannot open snapshot store: {e}");
+        err!("error: cannot open snapshot store: {e}");
         EXIT_ERROR
     })?;
     let snap = match store.snapshot(std::slice::from_ref(&path), root) {
         Ok(s) => s,
         Err(SnapshotError::OutsideRoot(_)) => {
             record("refused: outside root")?;
-            eprintln!("refused: {} is outside --root", path.display());
+            err!("refused: {} is outside --root", path.display());
             return Ok(EXIT_DENIED);
         }
         Err(e) => {
             record(&format!("failed: snapshot {}", snapshot_err_label(&e)))?;
-            eprintln!("error: snapshot failed, nothing changed: {e}");
+            err!("error: snapshot failed, nothing changed: {e}");
             return Ok(EXIT_ERROR);
         }
     };
@@ -437,34 +475,39 @@ fn run_inner(
         Target::Delete { .. } => fs::remove_file(&path),
         _ => unreachable!("only write and delete execute"),
     };
-    if let Err(e) = result {
-        record(&format!("failed: {:?}", e.kind()))?;
-        eprintln!(
-            "error: {} failed: {e} (snapshot {} taken before the attempt)",
-            kind.name(),
+    // From here on the filesystem may have changed: print the snapshot id
+    // BEFORE any further audit append, so it is never lost.
+    out!("snapshot {}", snap.0);
+    let (decision, code) = match result {
+        Err(e) => {
+            err!(
+                "error: {} failed: {e} (snapshot {} taken before the attempt)",
+                kind.name(),
+                snap.0
+            );
+            (format!("failed: {:?}", e.kind()), EXIT_ERROR)
+        }
+        Ok(()) => match store.record_after(&snap, root) {
+            Ok(()) => (format!("executed snapshot={}", snap.0), EXIT_OK),
+            Err(e) => {
+                err!(
+                    "warning: action done but its after-state was not recorded ({e}); undo will not detect later changes"
+                );
+                (
+                    format!("executed snapshot={} after-state=unrecorded", snap.0),
+                    EXIT_ERROR,
+                )
+            }
+        },
+    };
+    if record(&decision).is_err() {
+        err!(
+            "warning: audit append failed after the action; snapshot {} can be undone with warden undo",
             snap.0
         );
         return Ok(EXIT_ERROR);
     }
-    let after = store.record_after(&snap, root);
-    match after {
-        Ok(()) => {
-            record(&format!("executed snapshot={}", snap.0))?;
-            println!("snapshot {}", snap.0);
-            Ok(EXIT_OK)
-        }
-        Err(e) => {
-            record(&format!(
-                "executed snapshot={} after-state=unrecorded",
-                snap.0
-            ))?;
-            println!("snapshot {}", snap.0);
-            eprintln!(
-                "warning: action done but its after-state was not recorded ({e}); undo will not detect later changes"
-            );
-            Ok(EXIT_ERROR)
-        }
-    }
+    Ok(code)
 }
 
 fn snapshot_err_label(e: &SnapshotError) -> String {
@@ -505,21 +548,22 @@ fn cmd_undo(home: &Path, snapshot_id: &str, root: &Path, force: bool) -> u8 {
         sum
     };
     let mut record = |d: &str| audit(&mut log, &id, &sum, Tier::Yes, d);
-    if let Err(c) = record("approved") {
+    // Undo needs no --yes in this version; it is audited as `requested`.
+    if let Err(c) = record("requested") {
         return c;
     }
     let store = match SnapshotStore::open(&home.join("snapshots")) {
         Ok(s) => s,
         Err(e) => {
             let _ = record(&format!("failed: {:?}", e.kind()));
-            eprintln!("error: cannot open snapshot store: {e}");
+            err!("error: cannot open snapshot store: {e}");
             return EXIT_ERROR;
         }
     };
     let (decision, code, msg) =
         match store.restore(&SnapshotId(snapshot_id.to_owned()), root, force) {
             Ok(paths) => {
-                println!("restored {}", paths.len());
+                out!("restored {}", paths.len());
                 (format!("restored files={}", paths.len()), EXIT_OK, None)
             }
             Err(SnapshotError::OutsideRoot(p)) => (
@@ -545,7 +589,7 @@ fn cmd_undo(home: &Path, snapshot_id: &str, root: &Path, force: bool) -> u8 {
         return c;
     }
     if let Some(m) = msg {
-        eprintln!("{m}");
+        err!("{m}");
     }
     code
 }
@@ -554,22 +598,22 @@ fn cmd_audit_verify(home: &Path) -> u8 {
     let path = home.join("audit.jsonl");
     match AuditLog::verify(&path) {
         Ok(VerifyReport::Ok { entries }) => {
-            println!("ok {entries}");
+            out!("ok {entries}");
             EXIT_OK
         }
         Ok(VerifyReport::Broken {
             first_bad_index,
             reason,
         }) => {
-            println!("broken {first_bad_index}: {reason}");
+            out!("broken {first_bad_index}: {reason}");
             EXIT_ERROR
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            println!("ok 0");
+            out!("ok 0");
             EXIT_OK
         }
         Err(e) => {
-            eprintln!("error: cannot read audit log {}: {e}", path.display());
+            err!("error: cannot read audit log {}: {e}", path.display());
             EXIT_ERROR
         }
     }
@@ -577,7 +621,7 @@ fn cmd_audit_verify(home: &Path) -> u8 {
 
 fn cmd_prune(home: &Path, days: u64) -> u8 {
     let Some(secs) = days.checked_mul(86_400) else {
-        eprintln!("error: --days is too large");
+        err!("error: --days is too large");
         return EXIT_DENIED;
     };
     let mut log = match open_audit(home) {
@@ -589,7 +633,7 @@ fn cmd_prune(home: &Path, days: u64) -> u8 {
     let store = match SnapshotStore::open(&home.join("snapshots")) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("error: cannot open snapshot store: {e}");
+            err!("error: cannot open snapshot store: {e}");
             return EXIT_ERROR;
         }
     };
@@ -598,7 +642,7 @@ fn cmd_prune(home: &Path, days: u64) -> u8 {
             if let Err(c) = audit(&mut log, &id, &sum, Tier::Auto, &format!("pruned {n}")) {
                 return c;
             }
-            println!("pruned {n}");
+            out!("pruned {n}");
             EXIT_OK
         }
         Err(e) => {
@@ -609,7 +653,7 @@ fn cmd_prune(home: &Path, days: u64) -> u8 {
                 Tier::Auto,
                 &format!("failed: {:?}", e.kind()),
             );
-            eprintln!("error: prune failed: {e}");
+            err!("error: prune failed: {e}");
             EXIT_ERROR
         }
     }
@@ -617,7 +661,7 @@ fn cmd_prune(home: &Path, days: u64) -> u8 {
 
 fn cmd_init_pin(home: &Path, pin_arg: Option<String>, force: bool) -> u8 {
     let Some(pin) = pin_arg.or_else(|| std::env::var(PIN_ENV).ok()) else {
-        eprintln!("error: give the PIN as an argument or in {PIN_ENV}");
+        err!("error: give the PIN as an argument or in {PIN_ENV}");
         return EXIT_DENIED;
     };
     let mut log = match open_audit(home) {
@@ -627,22 +671,22 @@ fn cmd_init_pin(home: &Path, pin_arg: Option<String>, force: bool) -> u8 {
     let id = random_hex16();
     let decision = match pin::set_pin(&home.join("pin"), &pin, force) {
         Ok(()) => {
-            println!("pin set");
+            out!("pin set");
             Ok("pin set")
         }
         Err(SetPinError::TooShort) => {
-            eprintln!(
+            err!(
                 "error: PIN must be at least {} characters",
                 pin::MIN_PIN_LEN
             );
             Err((EXIT_DENIED, "refused: pin too short"))
         }
         Err(SetPinError::Exists) => {
-            eprintln!("error: a PIN is already set; pass --force to replace it");
+            err!("error: a PIN is already set; pass --force to replace it");
             Err((EXIT_DENIED, "refused: pin exists"))
         }
         Err(SetPinError::Io(e)) => {
-            eprintln!("error: cannot write PIN file: {e}");
+            err!("error: cannot write PIN file: {e}");
             Err((EXIT_ERROR, "failed: pin file write"))
         }
     };
