@@ -11,10 +11,13 @@
 //!
 //! The v1 domain had no expiry; v1 approvals never verify under v2.
 //! [`Approver::grant`] sets `expires_at_ms = issued_at_ms + ttl_ms` with
-//! `0 < ttl_ms <= MAX_TTL_MS`. [`Approver::redeem`] refuses an approval once
-//! `now_ms >= expires_at_ms`. A `now_ms` before `issued_at_ms` (clock skew)
-//! is allowed. Times are caller-supplied milliseconds since the Unix epoch;
-//! this crate does not read the clock.
+//! `0 < ttl_ms <= MAX_TTL_MS`. [`Approver::redeem`] re-checks the signed
+//! window (`0 < expires_at_ms - issued_at_ms <= MAX_TTL_MS`, else `BadTtl`),
+//! refuses `issued_at_ms > now_ms + MAX_SKEW_MS` (`NotYetValid`) and refuses
+//! `now_ms >= expires_at_ms` (`Expired`). So an approval is redeemable for at
+//! most `MAX_SKEW_MS + MAX_TTL_MS` of the caller's clock. That bound holds
+//! only if `now_ms` is milliseconds since the Unix epoch from a sane clock:
+//! this crate does not read the clock, and a wrong `now_ms` defeats expiry.
 //!
 //! [`Approver::redeem`] accepts an approval at most once. It classifies the
 //! action itself (with [`classify`] and the caller's [`PolicyConfig`]) to get
@@ -44,6 +47,9 @@ pub const APPROVAL_DOMAIN: &[u8] = b"warden/approval/v2\0";
 
 /// The longest lifetime [`Approver::grant`] accepts, in milliseconds (10 min).
 pub const MAX_TTL_MS: u64 = 600_000;
+
+/// How far `issued_at_ms` may be ahead of the redeemer's `now_ms` (30 s).
+pub const MAX_SKEW_MS: u64 = 30_000;
 
 /// The byte that encodes `tier` in the signed message.
 ///
@@ -95,7 +101,9 @@ pub enum ApprovalError {
     InsufficientTier,
     #[error("approval has expired")]
     Expired,
-    #[error("approval ttl must be between 1 ms and MAX_TTL_MS, without overflow")]
+    #[error("approval is not valid yet (issued in the future beyond the allowed skew)")]
+    NotYetValid,
+    #[error("approval ttl must be between 1 and 600000 ms (MAX_TTL_MS), without overflow")]
     BadTtl,
 }
 
@@ -147,7 +155,8 @@ impl Approver {
     /// a key this way (for example after a restart) re-enables every
     /// unexpired approval that key signed, including ones already redeemed:
     /// they can be replayed once more within their window (at most
-    /// [`MAX_TTL_MS`]). For a reloaded key, use
+    /// [`MAX_SKEW_MS`] + [`MAX_TTL_MS`] of a sane millisecond clock). For a
+    /// reloaded key, use
     /// [`Approver::from_signing_key_with_spent`] with the persisted set. See
     /// docs/SECURITY-NOTES.md, "Approvals: expiry and persisted nonces".
     pub fn from_signing_key(key: SigningKey) -> Approver {
@@ -156,6 +165,13 @@ impl Approver {
 
     /// An approver using an existing key and a previously exported
     /// spent-nonce set (see [`Approver::spent`]).
+    ///
+    /// # Security
+    ///
+    /// Replay protection is only as good as the completeness of `spent`. Any
+    /// nonce redeemed but missing from the persisted set (lost write, stale
+    /// copy, rolled-back file) can be redeemed again while its approval is
+    /// unexpired. Persist the set durably after each redeem and before acting.
     pub fn from_signing_key_with_spent(
         key: SigningKey,
         spent: impl IntoIterator<Item = [u8; 16]>,
@@ -218,9 +234,15 @@ impl Approver {
     /// supply it, so a stale or lower view of the action can never downgrade
     /// what the approval must cover. Checks, in order: neither the required
     /// tier nor the approval's tier is `Blocked`; the action hash matches;
-    /// the signature verifies (strict); `now_ms < expires_at_ms`; the granted
-    /// tier covers the required tier; the nonce is unspent. Only after all
-    /// pass is the nonce marked spent, so a failed redeem never burns it.
+    /// the signature verifies (strict); the signed window is valid
+    /// (`0 < expires_at_ms - issued_at_ms <= MAX_TTL_MS`, else `BadTtl`);
+    /// `issued_at_ms <= now_ms + MAX_SKEW_MS` (else `NotYetValid`);
+    /// `now_ms < expires_at_ms` (else `Expired`); the granted tier covers the
+    /// required tier; the nonce is unspent. Only after all pass is the nonce
+    /// marked spent, so a failed redeem never burns it.
+    ///
+    /// `now_ms` must be milliseconds since the Unix epoch from a sane clock;
+    /// the expiry bound is only as good as that value.
     pub fn redeem(
         &mut self,
         action: &Action,
@@ -248,8 +270,17 @@ impl Approver {
             .verifying_key()
             .verify_strict(&msg, &approval.signature)
             .map_err(|_| ApprovalError::BadSignature)?;
-        // The window is signed, so it is trusted only after verify_strict.
-        if now_ms >= approval.expires_at_ms {
+        // The window is signed, so it is checked only after verify_strict.
+        // Defense in depth: only the key holder can sign a bad window, but
+        // redeem must not rely on grant having been the signer.
+        let (issued, expires) = (approval.issued_at_ms, approval.expires_at_ms);
+        if expires <= issued || expires - issued > MAX_TTL_MS {
+            return Err(ApprovalError::BadTtl);
+        }
+        if issued > now_ms.saturating_add(MAX_SKEW_MS) {
+            return Err(ApprovalError::NotYetValid);
+        }
+        if now_ms >= expires {
             return Err(ApprovalError::Expired);
         }
         if approval.tier < required {

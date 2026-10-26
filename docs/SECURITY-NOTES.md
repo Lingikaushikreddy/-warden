@@ -19,7 +19,8 @@ itself with `classify(action, cfg)`; callers cannot pass a tier. A caller
 holding a stale or lower view of an action therefore cannot downgrade it: a
 `YesPin` action is never redeemed with a `Yes` approval, and a `Blocked` action
 is refused whatever the approval says. Check order: `Blocked` → action hash →
-signature (`verify_strict`) → expiry → tier floor → nonce insert. The nonce is
+signature (`verify_strict`) → window checks (`BadTtl`, `NotYetValid`,
+`Expired`) → tier floor → nonce insert. The nonce is
 inserted last, so a failed redeem never burns it. The caller must pass the same
 `PolicyConfig` the executor will act under.
 
@@ -32,12 +33,25 @@ b"warden/approval/v2\0" || action_hash (32) || tier byte (1)
 
 `Approver::grant(action, tier, issued_at_ms, ttl_ms)` sets
 `expires_at_ms = issued_at_ms + ttl_ms` and refuses (`BadTtl`) a TTL of 0,
-above `MAX_TTL_MS` (600 000 ms, 10 minutes), or one that overflows. `redeem`
-returns `Expired` when `now_ms >= expires_at_ms`; a `now_ms` earlier than
-`issued_at_ms` is accepted (clock skew). Both times are inside the signature,
-so changing either is `BadSignature`. v1 approvals do not verify under v2.
-`warden-core` does not read the clock: the caller supplies milliseconds since
-the Unix epoch, and a caller that passes a wrong `now_ms` defeats expiry.
+above `MAX_TTL_MS` (600 000 ms, 10 minutes), or one that overflows. Both
+times are inside the signature, so changing either is `BadSignature`. After the
+signature verifies, `redeem` checks the signed window again and refuses:
+
+- `BadTtl` if `expires_at_ms <= issued_at_ms` or
+  `expires_at_ms - issued_at_ms > MAX_TTL_MS` (defense in depth: only the key
+  holder can sign such a window, but `redeem` does not trust `grant` to have
+  been the signer);
+- `NotYetValid` if `issued_at_ms > now_ms + MAX_SKEW_MS` (`MAX_SKEW_MS` =
+  30 000 ms, saturating add). This also catches a caller that passed
+  microseconds or another unit to `grant`;
+- `Expired` if `now_ms >= expires_at_ms`.
+
+Together these bound how long an approval is redeemable to at most
+`MAX_SKEW_MS + MAX_TTL_MS` (10.5 minutes) of the redeemer's clock. **The bound
+holds only if `now_ms` is milliseconds since the Unix epoch from a sane
+clock.** `warden-core` does not read the clock; a caller that passes a wrong
+`now_ms` (wrong unit, frozen or rolled-back clock) defeats expiry. v1
+approvals do not verify under v2.
 
 **Persisted nonces.** `Approver::spent()` exports the spent-nonce set (sorted,
 so output is deterministic) and `Approver::from_signing_key_with_spent(key,
@@ -46,7 +60,21 @@ persisting it next to the signing key, and loading it before any redeem, is
 done by the agent crate (Plan 2, Task 5). `Approver::from_signing_key` still
 starts with an empty set: reloading a key that way lets an already redeemed,
 unexpired approval be redeemed once more, so the replay window after a restart
-is bounded by `MAX_TTL_MS` but is not zero.
+is bounded by `MAX_SKEW_MS + MAX_TTL_MS` but is not zero.
+`from_signing_key_with_spent` protects only as well as the persisted set is
+complete: a redeemed nonce missing from it can be replayed while unexpired.
+
+**Contract for the agent crate** (the caller that persists the set):
+
+1. Load the persisted spent set and build the `Approver` with
+   `from_signing_key_with_spent` before any `redeem`. If the set cannot be
+   loaded, do not redeem (fail closed).
+2. After a successful `redeem`, persist the new nonce durably (append and
+   sync, e.g. `fsync`) BEFORE executing the action. If persisting fails, do
+   not execute the action.
+3. A crash between persist and execute therefore burns that approval (the
+   user must approve again) rather than allowing a replay. This is the
+   intended fail-closed behavior.
 
 Remaining items:
 

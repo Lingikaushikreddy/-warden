@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use warden_core::{
     approval_message, classify, tier_byte, Action, Approval, ApprovalError, Approver, Capability,
-    PolicyConfig, Tier, APPROVAL_DOMAIN, MAX_TTL_MS,
+    PolicyConfig, Tier, APPROVAL_DOMAIN, MAX_SKEW_MS, MAX_TTL_MS,
 };
 
 /// Fixed clock for tests: approvals are issued at `T0` and live `TTL` ms.
@@ -47,8 +47,19 @@ fn hash(action: &Action) -> [u8; 32] {
 /// Test helper: sign an arbitrary (action, tier, nonce) with a raw key,
 /// bypassing `grant` (which refuses Blocked).
 fn hand_sign(key: &SigningKey, action: &Action, tier: Tier, nonce: [u8; 16]) -> Approval {
+    hand_sign_window(key, action, tier, T0, T0 + TTL, nonce)
+}
+
+/// Test helper: sign with an arbitrary window, bypassing `grant`'s checks.
+fn hand_sign_window(
+    key: &SigningKey,
+    action: &Action,
+    tier: Tier,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+    nonce: [u8; 16],
+) -> Approval {
     let action_hash = hash(action);
-    let (issued_at_ms, expires_at_ms) = (T0, T0 + TTL);
     let msg = approval_message(&action_hash, tier, issued_at_ms, expires_at_ms, &nonce);
     Approval {
         action_hash,
@@ -393,9 +404,103 @@ fn approval_valid_just_before_expiry() {
     let approval = ap.grant(&a, Tier::Yes, T0, TTL).unwrap();
     assert_eq!(ap.redeem(&a, &cfg(), &approval, T0 + TTL - 1), Ok(()));
 
-    // A clock behind issued_at (skew) is allowed.
+    // A clock up to MAX_SKEW_MS behind issued_at is allowed (boundary).
     let early = ap.grant(&a, Tier::Yes, T0, TTL).unwrap();
-    assert_eq!(ap.redeem(&a, &cfg(), &early, 0), Ok(()));
+    assert_eq!(ap.redeem(&a, &cfg(), &early, T0 - MAX_SKEW_MS), Ok(()));
+}
+
+#[test]
+fn future_issued_at_beyond_skew_is_not_yet_valid_and_does_not_burn_nonce() {
+    assert_eq!(MAX_SKEW_MS, 30_000);
+    let mut ap = Approver::generate();
+    let a = write_action("/tmp/a");
+    let approval = ap.grant(&a, Tier::Yes, T0, TTL).unwrap();
+    for now in [0, T0 - MAX_SKEW_MS - 1] {
+        assert_eq!(
+            ap.redeem(&a, &cfg(), &approval, now),
+            Err(ApprovalError::NotYetValid),
+            "now={now}"
+        );
+    }
+    assert!(ap.spent().is_empty());
+    assert_eq!(ap.redeem(&a, &cfg(), &approval, NOW), Ok(()));
+}
+
+#[test]
+fn hand_signed_ten_year_window_is_bad_ttl() {
+    let key = SigningKey::generate(&mut OsRng);
+    let mut ap = Approver::from_signing_key(key.clone());
+    let a = write_action("/tmp/a");
+    let ten_years_ms = 10 * 365 * 24 * 60 * 60 * 1000u64;
+    let long = hand_sign_window(&key, &a, Tier::Yes, T0, T0 + ten_years_ms, [1; 16]);
+    assert_eq!(
+        ap.redeem(&a, &cfg(), &long, NOW),
+        Err(ApprovalError::BadTtl)
+    );
+    // Just over the max is also refused; exactly the max is accepted.
+    let over = hand_sign_window(&key, &a, Tier::Yes, T0, T0 + MAX_TTL_MS + 1, [2; 16]);
+    assert_eq!(
+        ap.redeem(&a, &cfg(), &over, NOW),
+        Err(ApprovalError::BadTtl)
+    );
+    // Empty or inverted windows are refused.
+    for (i, (iss, exp)) in [(T0, T0), (T0, T0 - 1)].into_iter().enumerate() {
+        let bad = hand_sign_window(&key, &a, Tier::Yes, iss, exp, [3 + i as u8; 16]);
+        assert_eq!(ap.redeem(&a, &cfg(), &bad, NOW), Err(ApprovalError::BadTtl));
+    }
+    assert!(ap.spent().is_empty());
+    let max = hand_sign_window(&key, &a, Tier::Yes, T0, T0 + MAX_TTL_MS, [9; 16]);
+    assert_eq!(ap.redeem(&a, &cfg(), &max, NOW), Ok(()));
+}
+
+#[test]
+fn microsecond_issued_at_is_refused_at_redeem() {
+    // A caller passing microseconds to grant gets a window ~1000x in the
+    // future; redeem with a real millisecond clock refuses it.
+    let mut ap = Approver::generate();
+    let a = write_action("/tmp/a");
+    let approval = ap.grant(&a, Tier::Yes, T0 * 1000, TTL).unwrap();
+    assert_eq!(
+        ap.redeem(&a, &cfg(), &approval, NOW),
+        Err(ApprovalError::NotYetValid)
+    );
+    assert!(ap.spent().is_empty());
+}
+
+#[test]
+fn u64_max_extremes_do_not_panic() {
+    let key = SigningKey::generate(&mut OsRng);
+    let mut ap = Approver::from_signing_key(key.clone());
+    let a = write_action("/tmp/a");
+    let cases = [
+        // (issued, expires, now, expected)
+        (u64::MAX, u64::MAX, u64::MAX, Err(ApprovalError::BadTtl)),
+        (0, u64::MAX, 0, Err(ApprovalError::BadTtl)),
+        (u64::MAX, 0, 0, Err(ApprovalError::BadTtl)),
+        (u64::MAX - TTL, u64::MAX, 0, Err(ApprovalError::NotYetValid)),
+        (
+            u64::MAX - TTL,
+            u64::MAX,
+            u64::MAX,
+            Err(ApprovalError::Expired),
+        ),
+        (u64::MAX - TTL, u64::MAX, u64::MAX - 1, Ok(())),
+    ];
+    for (i, (iss, exp, now, want)) in cases.into_iter().enumerate() {
+        let x = hand_sign_window(&key, &a, Tier::Yes, iss, exp, [0x80 + i as u8; 16]);
+        assert_eq!(ap.redeem(&a, &cfg(), &x, now), want, "case {i}");
+    }
+    // A granted approval redeemed at u64::MAX is just Expired.
+    let g = ap.grant(&a, Tier::Yes, T0, TTL).unwrap();
+    assert_eq!(
+        ap.redeem(&a, &cfg(), &g, u64::MAX),
+        Err(ApprovalError::Expired)
+    );
+}
+
+#[test]
+fn bad_ttl_message_shows_the_numeric_max() {
+    assert!(ApprovalError::BadTtl.to_string().contains("600000"));
 }
 
 #[test]
