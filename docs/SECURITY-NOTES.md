@@ -33,21 +33,37 @@ the tool maps to exactly that action (`TokenMismatch`); then the path rules.
   refused (`Symlink`), even when it points inside the root. `list_dir` shows
   symlinks with a trailing `@` and never follows them.
 - **Protected paths.** Paths equal to or inside a `protected` directory are
-  refused (`Protected`), checked on the lexical and the canonical form. The
-  snapshot store and the approver home MUST live outside the root or be
-  listed in `protected`; otherwise an authorized write could edit the
-  approver key, the spent-nonce log or snapshot manifests.
+  refused (`Protected`). Every protected path must exist when the executor
+  is built (`Executor::new` fails `NotFound` otherwise), so create the
+  approver home and the snapshot directory first. Protected paths are
+  resolved again on every call and compared with both the lexical and the
+  canonical form of the tool path, so case or Unicode-normalization
+  variants (case- and normalization-insensitive filesystems such as APFS),
+  `/tmp` vs `/private/tmp` spellings, and a protected directory that was
+  removed and re-created are all still refused. The snapshot store and the
+  approver home MUST live outside the root or be listed in `protected`;
+  otherwise an authorized write could edit the approver key, the
+  spent-nonce log or snapshot manifests.
 - **Writes and deletes** require a regular file with link count 1 (`NotAFile`,
   `HardLink`), and an existing parent (parents are never created). The
   snapshot is taken first (a new file is recorded as absent), then the write
   goes through a temp file with an unpredictable name (8 random bytes from
   the OS RNG), created `0o600` with `O_NOFOLLOW`, given its final mode (an
-  existing file's mode masked to `0o777`, else `0o600`), synced, renamed over
-  the target, and the directory is fsynced; then `record_after`. A failure
-  after the snapshot still returns the snapshot id (`ExecFailure::snapshot`)
-  and removes the temp file.
+  existing file's mode masked to `0o777`, else `0o600`), synced and renamed
+  over the target; then `record_after`, then the directory is fsynced. A
+  failed directory fsync is reported in the output (`wrote <n> bytes
+  (directory sync failed)`) rather than failing the run, since the change is
+  already visible and recorded. A failure after the snapshot and before the
+  rename completes returns the snapshot id (`ExecFailure::snapshot`) and
+  removes the temp file.
 - **Reads** are capped at `max_bytes` through the opened handle and converted
   lossily to UTF-8; a FIFO or device is `NotAFile` and does not block.
+  Reads do NOT check link counts: a file inside the root that is hard-linked
+  to a file elsewhere is readable (an inode shared with an outside file is
+  exposed through the inside name).
+- **Listings** escape control and invisible characters, a name's trailing
+  `@` and leading `[`, so names cannot imitate the symlink marker or the
+  overflow line.
 - Error messages never contain file contents.
 
 Remaining: the parent-swap TOCTOU window described under "Auto reads and

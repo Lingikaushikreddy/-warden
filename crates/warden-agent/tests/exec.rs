@@ -24,6 +24,16 @@ struct Env {
 }
 
 fn env_with(protected_in_root: bool) -> Env {
+    env_custom(protected_in_root, None, |_, _| Vec::new())
+}
+
+/// `extra(tmp, root)` runs before `Executor::new` and returns more protected
+/// paths. `snap_cap` sets the snapshot store's per-file size cap.
+fn env_custom(
+    protected_in_root: bool,
+    snap_cap: Option<u64>,
+    extra: impl FnOnce(&Path, &Path) -> Vec<PathBuf>,
+) -> Env {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("root");
     let outside = tmp.path().join("outside");
@@ -36,12 +46,13 @@ fn env_with(protected_in_root: bool) -> Env {
         tmp.path().join("home")
     };
     let store = ApproverStore::open(&home, NOW).unwrap();
-    let exec = Executor::new(
-        &root,
-        vec![home.clone(), snaps.clone()],
-        SnapshotStore::open(&snaps).unwrap(),
-    )
-    .unwrap();
+    let mut snapshots = SnapshotStore::open(&snaps).unwrap();
+    if let Some(cap) = snap_cap {
+        snapshots = snapshots.with_max_file_size(cap);
+    }
+    let mut protected = vec![home.clone(), snaps.clone()];
+    protected.extend(extra(tmp.path(), &root));
+    let exec = Executor::new(&root, protected, snapshots).unwrap();
     Env {
         cfg: PolicyConfig {
             allowed_roots: vec![root.clone()],
@@ -186,10 +197,11 @@ fn expired_token_is_refused_and_nothing_is_written() {
     assert_eq!(before, (tree(&e.root), tree(&e.snaps)));
 }
 
+/// Single use is enforced at compile time by the `compile_fail` doctest on
+/// `Executor::run`; this only pins the by-value signature so a change to
+/// `&Authorized` breaks the build here too.
 #[test]
-fn token_is_consumed_by_value() {
-    // `run` takes the token by value, so a second use of the same token does
-    // not compile (see the compile_fail doctest on `Executor::run`).
+fn run_signature_takes_token_by_value() {
     let _f: fn(&Executor, &Action, &Tool, Authorized, u64) -> Result<ToolOutput, ExecFailure> =
         Executor::run;
 }
@@ -643,13 +655,277 @@ fn writing_the_root_itself_is_refused() {
 
 #[test]
 fn errors_do_not_echo_file_contents() {
-    let mut e = env();
-    fs::write(e.outside.join("s"), "TOPSECRET").unwrap();
+    const S: &str = "TOPSECRET";
+    // Snapshot cap of 4 bytes so the Snapshot variant can be triggered.
+    let mut e = env_custom(true, Some(4), |_, _| Vec::new());
+    let home = e.p(".warden-home");
+    fs::write(e.p("plain"), S).unwrap();
+    fs::write(e.outside.join("s"), S).unwrap();
     fs::hard_link(e.outside.join("s"), e.p("hl")).unwrap();
-    let f = e.run(write(e.p("hl"), "PAYLOAD")).unwrap_err();
-    let msg = f.to_string();
-    assert!(
-        !msg.contains("TOPSECRET") && !msg.contains("PAYLOAD"),
-        "{msg}"
+    symlink(e.outside.join("s"), e.p("sl")).unwrap();
+    fs::create_dir(e.p("d")).unwrap();
+    fs::write(e.p("d/inner"), S).unwrap();
+
+    let mut failures: Vec<ExecFailure> = Vec::new();
+    // TokenExpired
+    let t = write(e.p("plain"), S);
+    let (a, tok) = e.auth(&t, "a1");
+    let exp = tok.expires_at_ms();
+    failures.push(e.exec.run(&a, &t, tok, exp).unwrap_err());
+    // TokenMismatch
+    let (a, tok) = e.auth(&t, "a1");
+    failures.push(
+        e.exec
+            .run(&a, &write(e.p("plain"), "TOPSECRET2"), tok, NOW)
+            .unwrap_err(),
+    );
+    // OutsideRoot, Protected, Symlink, NotAFile, TooLarge, HardLink, Snapshot, Io
+    failures.push(e.run(read(e.outside.join("s"), 100)).unwrap_err());
+    failures.push(e.run(write(home.join("approver.key"), S)).unwrap_err());
+    failures.push(e.run(read(e.p("sl"), 100)).unwrap_err());
+    failures.push(e.run(read(e.p("d"), 100)).unwrap_err());
+    let big = S.repeat(200_000);
+    failures.push(e.run(write(e.p("big"), &big)).unwrap_err());
+    failures.push(e.run(write(e.p("hl"), S)).unwrap_err());
+    failures.push(e.run(write(e.p("plain"), S)).unwrap_err());
+    failures.push(e.run(write(e.p("missing/x"), S)).unwrap_err());
+
+    let kinds: Vec<&str> = failures
+        .iter()
+        .map(|f| match f.error {
+            ExecError::TokenExpired => "TokenExpired",
+            ExecError::TokenMismatch => "TokenMismatch",
+            ExecError::OutsideRoot => "OutsideRoot",
+            ExecError::Protected => "Protected",
+            ExecError::Symlink => "Symlink",
+            ExecError::NotAFile => "NotAFile",
+            ExecError::TooLarge => "TooLarge",
+            ExecError::HardLink => "HardLink",
+            ExecError::Snapshot(_) => "Snapshot",
+            ExecError::Io(_) => "Io",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "TokenExpired",
+            "TokenMismatch",
+            "OutsideRoot",
+            "Protected",
+            "Symlink",
+            "NotAFile",
+            "TooLarge",
+            "HardLink",
+            "Snapshot",
+            "Io"
+        ]
+    );
+    for f in &failures {
+        for msg in [f.to_string(), f.error.to_string(), format!("{f:?}")] {
+            assert!(!msg.contains(S), "{msg}");
+        }
+    }
+}
+
+// ---- review round 1: protected paths ----
+
+/// True if `dir` on this filesystem treats `variant` as the name `real`.
+fn same_entry(dir: &Path, real: &str, variant: &str) -> bool {
+    fs::create_dir(dir.join(real)).unwrap();
+    let ok = dir.join(variant).exists();
+    fs::remove_dir(dir.join(real)).unwrap();
+    ok
+}
+
+/// Protected dir `real` inside the root, created before `new()`, reached
+/// through `variant`.
+fn protected_variant_is_refused(real: &str, variant: &str) {
+    let probe = tempfile::tempdir().unwrap();
+    if !same_entry(probe.path(), real, variant) {
+        eprintln!("filesystem treats {variant:?} and {real:?} as different names; skipping");
+        return;
+    }
+    let mut e = env_custom(false, None, |_, root| {
+        let p = root.join(real);
+        fs::create_dir(&p).unwrap();
+        fs::write(p.join("k"), "TOPSECRET").unwrap();
+        vec![p]
+    });
+    let via = e.p(variant).join("k");
+    assert!(via.exists());
+    assert!(matches!(
+        err(e.run(read(via.clone(), 100))),
+        ExecError::Protected
+    ));
+    assert!(matches!(err(e.run(write(via, "x"))), ExecError::Protected));
+    assert!(matches!(
+        err(e.run(Tool::ListDir { path: e.p(variant) })),
+        ExecError::Protected
+    ));
+    assert_eq!(
+        fs::read_to_string(e.p(real).join("k")).unwrap(),
+        "TOPSECRET"
+    );
+}
+
+#[test]
+fn protected_dir_case_variant_is_refused() {
+    protected_variant_is_refused(".later", ".LATER");
+}
+
+#[test]
+fn protected_dir_nfd_variant_is_refused() {
+    protected_variant_is_refused("caf\u{e9}", "cafe\u{301}");
+}
+
+#[test]
+fn protected_dir_other_prefix_spelling_is_refused() {
+    // macOS: tempdirs live under /var -> /private/var. Elsewhere the
+    // lexical and canonical spellings are usually identical.
+    let mut e = env_with(true);
+    let canon_root = fs::canonicalize(&e.root).unwrap();
+    if canon_root == e.root {
+        eprintln!("root has no symlinked prefix on this platform; skipping");
+        return;
+    }
+    let canon_home = canon_root.join(".warden-home");
+    for p in [
+        canon_home.join("approver.key"),
+        e.p(".warden-home/approver.key"),
+    ] {
+        assert!(matches!(err(e.run(read(p, 100))), ExecError::Protected));
+    }
+    // Protected given in canonical spelling, tool path lexical.
+    let mut e = env_custom(false, None, |_, root| {
+        let p = root.join("prot");
+        fs::create_dir(&p).unwrap();
+        vec![fs::canonicalize(&p).unwrap()]
+    });
+    fs::write(e.p("prot/k"), "x").unwrap();
+    assert!(matches!(
+        err(e.run(read(e.p("prot/k"), 100))),
+        ExecError::Protected
+    ));
+}
+
+#[test]
+fn protected_dir_removed_and_recreated_is_still_refused() {
+    let mut e = env_custom(false, None, |_, root| {
+        let p = root.join("prot");
+        fs::create_dir(&p).unwrap();
+        vec![p]
+    });
+    fs::remove_dir(e.p("prot")).unwrap();
+    fs::create_dir(e.p("prot")).unwrap();
+    fs::write(e.p("prot/k"), "TOPSECRET").unwrap();
+    assert!(matches!(
+        err(e.run(read(e.p("prot/k"), 100))),
+        ExecError::Protected
+    ));
+    assert!(matches!(
+        err(e.run(write(e.p("prot/new"), "x"))),
+        ExecError::Protected
+    ));
+    assert!(!e.p("prot/new").exists());
+}
+
+#[test]
+fn protected_path_is_re_resolved_at_check_time() {
+    // The protected path is given through an alias outside the root. After
+    // `new()` the alias is pointed at another directory inside the root: the
+    // name it now denotes must be protected (resolved per call), not only
+    // what it denoted when `new()` ran.
+    let mut e = env_custom(false, None, |tmp, root| {
+        fs::create_dir_all(root.join("one/prot")).unwrap();
+        fs::create_dir_all(root.join("two/prot")).unwrap();
+        symlink(root.join("one"), tmp.join("alias")).unwrap();
+        vec![tmp.join("alias/prot")]
+    });
+    let alias = e._tmp.path().join("alias");
+    fs::remove_file(&alias).unwrap();
+    symlink(e.p("two"), &alias).unwrap();
+    fs::write(e.p("two/prot/k"), "TOPSECRET").unwrap();
+    assert!(matches!(
+        err(e.run(read(e.p("two/prot/k"), 100))),
+        ExecError::Protected
+    ));
+}
+
+#[test]
+fn new_with_missing_protected_path_is_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let snaps = SnapshotStore::open(&tmp.path().join("snaps")).unwrap();
+    let r = Executor::new(&root, vec![root.join(".not-yet")], snaps);
+    assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+}
+
+// ---- review round 1: cleanup and rename failures (test hooks) ----
+
+#[test]
+fn write_is_atomic_when_rename_target_is_a_directory() {
+    let mut e = env();
+    fs::write(e.p("a.txt"), "original").unwrap();
+    e.exec
+        .before_rename_hook_for_test(Box::new(|target: &Path| {
+            fs::remove_file(target).unwrap();
+            fs::create_dir(target).unwrap();
+            fs::write(target.join("inside"), "keep").unwrap();
+        }));
+    let f = e.run(write(e.p("a.txt"), "changed")).unwrap_err();
+    assert!(matches!(f.error, ExecError::Io(_)), "{:?}", f.error);
+    assert!(f.snapshot.is_some(), "snapshot id must be reported");
+    assert!(e.p("a.txt").is_dir());
+    assert_eq!(fs::read_to_string(e.p("a.txt/inside")).unwrap(), "keep");
+    assert!(no_temp_files(&e.root));
+}
+
+#[test]
+fn failure_during_write_leaves_no_temp_file() {
+    let mut e = env();
+    fs::write(e.p("a.txt"), "original").unwrap();
+    e.exec.fail_write_after_for_test(3);
+    let f = e.run(write(e.p("a.txt"), "changed content")).unwrap_err();
+    assert!(matches!(f.error, ExecError::Io(_)), "{:?}", f.error);
+    assert!(f.snapshot.is_some());
+    assert_eq!(fs::read_to_string(e.p("a.txt")).unwrap(), "original");
+    assert!(no_temp_files(&e.root));
+    // The hook fires once; the next write goes through.
+    e.run(write(e.p("a.txt"), "ok")).unwrap();
+    assert_eq!(fs::read_to_string(e.p("a.txt")).unwrap(), "ok");
+}
+
+#[test]
+fn directory_sync_failure_after_rename_is_success_with_warning() {
+    let mut e = env();
+    e.exec.fail_dir_sync_for_test();
+    let out = e.run(write(e.p("a.txt"), "abc")).unwrap();
+    assert_eq!(out.text, "wrote 3 bytes (directory sync failed)");
+    assert_eq!(fs::read_to_string(e.p("a.txt")).unwrap(), "abc");
+    // record_after ran: restore with force=false succeeds (after-state known).
+    let store = SnapshotStore::open(&e.snaps).unwrap();
+    store
+        .restore(&out.snapshot.unwrap(), &e.root, false)
+        .unwrap();
+    assert!(!e.p("a.txt").exists());
+}
+
+// ---- review round 1: listing ambiguity ----
+
+#[test]
+fn list_dir_escapes_trailing_at_and_leading_bracket() {
+    let mut e = env();
+    fs::write(e.p("x@"), "").unwrap();
+    fs::write(e.p("[3 more entries not shown]"), "").unwrap();
+    fs::write(e.p("a[b@c"), "").unwrap();
+    let out = e
+        .run(Tool::ListDir {
+            path: e.root.clone(),
+        })
+        .unwrap();
+    assert_eq!(
+        out.text,
+        "\\u{5b}3 more entries not shown]\na[b@c\nx\\u{40}"
     );
 }

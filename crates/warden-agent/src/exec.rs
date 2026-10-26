@@ -23,8 +23,13 @@
 //!      (`symlink_metadata`, [`ExecError::Symlink`]); symlinks are never
 //!      followed, not even to targets inside the root;
 //!    - a path equal to or inside a `protected` directory is
-//!      [`ExecError::Protected`], checked on both the lexical and the
-//!      canonical form;
+//!      [`ExecError::Protected`]. Protected paths must exist when the
+//!      executor is built ([`Executor::new`] fails with `NotFound`
+//!      otherwise) and are resolved again on every call (deepest existing
+//!      ancestor canonicalized), so a protected directory that was removed
+//!      and re-created, or whose spelling differs (case, Unicode
+//!      normalization, `/tmp` vs `/private/tmp`), is still matched. The
+//!      tool path is compared in its lexical and its canonical form;
 //!    - the root itself is never written or deleted ([`ExecError::Protected`]).
 //! 4. The operation. No filesystem write happens before steps 1-3 pass.
 //!
@@ -36,16 +41,22 @@
 //!   UTF-8; a longer file gets a trailing `\n[truncated at <n> bytes]`.
 //! - `list_dir`: at most [`MAX_LIST_ENTRIES`] names, sorted by raw bytes,
 //!   with control and invisible/format characters escaped as `\u{..}`, a
-//!   trailing `/` for directories and `@` for symlinks (never followed).
+//!   trailing `/` for directories and `@` for symlinks (never followed). A
+//!   name's own trailing `@` and leading `[` are escaped (`\u{40}`,
+//!   `\u{5b}`) so a name cannot imitate a marker or the overflow line. Only
+//!   the smallest names are kept in memory (bounded heap).
 //! - `write_file` / `delete_file`: the target must be a regular file with
 //!   link count 1 (or absent, for a write into an existing parent). The
 //!   snapshot is taken first (it records absence for a new file); a write
 //!   then goes through a randomly named temp file in the same directory
 //!   (`create_new`, `0o600`, `O_NOFOLLOW`), gets its final mode (an existing
 //!   file's mode masked with `0o777`, else `0o600`), is synced, renamed over
-//!   the target and the directory is fsynced; then `record_after`. Any
-//!   failure after the snapshot still reports the snapshot id
-//!   ([`ExecFailure::snapshot`]), and the temp file is removed.
+//!   the target; then `record_after`, then the directory is fsynced. A
+//!   failed directory fsync does not fail the run (the change is already
+//!   visible and recorded): the output says `(directory sync failed)`. Any
+//!   failure after the snapshot and before the rename completes still
+//!   reports the snapshot id ([`ExecFailure::snapshot`]), and the temp file
+//!   is removed.
 //!
 //! Error messages never contain file contents.
 //!
@@ -59,8 +70,14 @@
 //!   and redirect one read, write or delete outside the root. This window is
 //!   NOT closed: closing it needs an `openat`-style walk from a root
 //!   directory handle (for example `rustix` or `cap-std`), a later item.
-//! - **Hard links** are checked by link count before the snapshot; a link
-//!   created concurrently is not caught (same TOCTOU class).
+//! - **Hard links** are checked by link count before the snapshot of a
+//!   write or delete; a link created concurrently is not caught (same
+//!   TOCTOU class). Reads do not check link counts: a hard-linked file
+//!   inside the root is readable.
+//! - **Test hooks.** With the `test-hooks` feature, `*_for_test` methods can
+//!   inject a write failure, a directory-sync failure or a callback right
+//!   before the rename. They run after every check and the snapshot, and
+//!   cannot create tokens. Never enable the feature in a shipped build.
 //! - **Where state lives.** The snapshot store and the approver home must be
 //!   outside the root, or listed in `protected`; otherwise an authorized
 //!   write could edit the approver key, the spent-nonce log or snapshot
@@ -70,6 +87,7 @@ use crate::authorize::{action_hash, Authorized};
 use crate::tools::{is_forbidden_path_char, to_action, Tool, MAX_READ_BYTES, MAX_WRITE_BYTES};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use std::collections::BinaryHeap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -201,23 +219,52 @@ struct Checked {
     meta: Option<Metadata>,
 }
 
+/// Called with the target path right before the rename (test-hooks only).
+#[cfg(feature = "test-hooks")]
+pub type RenameHook = Box<dyn Fn(&Path) + Send + Sync>;
+
 /// Runs authorized tools under one root.
-#[derive(Debug)]
 pub struct Executor {
     /// Canonical.
     root: PathBuf,
     /// The root as given, lexically normalized.
     root_lexical: PathBuf,
-    /// Canonical form of each protected path that exists, plus the lexically
-    /// normalized form of every protected path.
+    /// Each protected path lexically normalized, as given. Re-resolved on
+    /// every check.
+    protected_lexical: Vec<PathBuf>,
+    /// The lexical forms plus their canonical forms at `new()`.
     protected: Vec<PathBuf>,
     snapshots: SnapshotStore,
+    #[cfg(feature = "test-hooks")]
+    hooks: TestHooks,
+}
+
+#[cfg(feature = "test-hooks")]
+#[derive(Default)]
+struct TestHooks {
+    before_rename: Option<RenameHook>,
+    fail_write_after: std::sync::Mutex<Option<usize>>,
+    fail_dir_sync: std::sync::atomic::AtomicBool,
+}
+
+impl fmt::Debug for Executor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Executor")
+            .field("root", &self.root)
+            .field("root_lexical", &self.root_lexical)
+            .field("protected", &self.protected)
+            .field("protected_lexical", &self.protected_lexical)
+            .field("snapshots", &self.snapshots)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Executor {
     /// `root` is canonicalized and must be a directory. Each `protected`
-    /// path must be absolute; it is kept lexically normalized and, if it
-    /// exists, also in canonical form.
+    /// path must be absolute and must already exist (`NotFound` otherwise):
+    /// create the approver home and the snapshot directory before building
+    /// the executor. Protected paths are kept lexically normalized and in
+    /// canonical form, and are resolved again on every call.
     pub fn new(
         root: &Path,
         protected: Vec<PathBuf>,
@@ -232,6 +279,7 @@ impl Executor {
         }
         let root_lexical = normalize(root).unwrap_or_else(|| canon.clone());
         let mut prot = Vec::with_capacity(protected.len() * 2);
+        let mut prot_lex = Vec::with_capacity(protected.len());
         for p in protected {
             let lex = normalize(&p).ok_or_else(|| {
                 io::Error::new(
@@ -239,18 +287,19 @@ impl Executor {
                     "protected paths must be absolute",
                 )
             })?;
-            match fs::canonicalize(&lex) {
-                Ok(c) => prot.push(c),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-            prot.push(lex);
+            // Fails with NotFound if the protected path does not exist.
+            prot.push(fs::canonicalize(&lex)?);
+            prot.push(lex.clone());
+            prot_lex.push(lex);
         }
         Ok(Executor {
             root: canon,
             root_lexical,
+            protected_lexical: prot_lex,
             protected: prot,
             snapshots,
+            #[cfg(feature = "test-hooks")]
+            hooks: TestHooks::default(),
         })
     }
 
@@ -308,14 +357,44 @@ impl Executor {
         }
     }
 
-    fn is_protected(&self, p: &Path) -> bool {
-        self.protected.iter().any(|base| within(p, base))
+    /// Run `hook` with the target path right before the rename of every
+    /// later write. It cannot create tokens or skip any check: it runs after
+    /// all checks and the snapshot.
+    #[cfg(feature = "test-hooks")]
+    pub fn before_rename_hook_for_test(&mut self, hook: RenameHook) {
+        self.hooks.before_rename = Some(hook);
+    }
+
+    /// Make the next write to a temp file write `n` bytes and then fail.
+    #[cfg(feature = "test-hooks")]
+    pub fn fail_write_after_for_test(&mut self, n: usize) {
+        *self.hooks.fail_write_after.get_mut().unwrap() = Some(n);
+    }
+
+    /// Make the directory fsync after the next rename fail.
+    #[cfg(feature = "test-hooks")]
+    pub fn fail_dir_sync_for_test(&mut self) {
+        *self.hooks.fail_dir_sync.get_mut() = true;
+    }
+
+    /// Every form a protected path has right now: as given, canonical at
+    /// `new()`, and canonical now (deepest existing ancestor re-resolved), so
+    /// a protected directory that was replaced or re-created is still
+    /// matched.
+    fn protected_now(&self) -> Result<Vec<PathBuf>, ExecError> {
+        let mut out = self.protected.clone();
+        for p in &self.protected_lexical {
+            out.push(resolve_deepest(p).map_err(|e| io_err(&e))?);
+        }
+        Ok(out)
     }
 
     /// Path checks shared by every tool (see the module docs).
     fn check(&self, raw: &Path) -> Result<Checked, ExecError> {
         let lex = normalize(raw).ok_or(ExecError::OutsideRoot)?;
-        if self.is_protected(&lex) {
+        let protected = self.protected_now()?;
+        let is_protected = |p: &Path| protected.iter().any(|base| within(p, base));
+        if is_protected(&lex) {
             return Err(ExecError::Protected);
         }
         let rel = lex
@@ -349,23 +428,11 @@ impl Executor {
 
         // Canonical containment of the deepest existing ancestor.
         let full = self.root.join(&rel);
-        let mut existing = full.as_path();
-        let mut rest: Vec<&OsStr> = Vec::new();
-        let canon = loop {
-            match fs::canonicalize(existing) {
-                Ok(c) => break c,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    rest.push(existing.file_name().ok_or(ExecError::OutsideRoot)?);
-                    existing = existing.parent().ok_or(ExecError::OutsideRoot)?;
-                }
-                Err(e) => return Err(io_err(&e)),
-            }
-        };
-        let canon_full = rest.iter().rev().fold(canon, |acc, n| acc.join(n));
+        let canon_full = resolve_deepest(&full).map_err(|e| io_err(&e))?;
         if !within(&canon_full, &self.root) {
             return Err(ExecError::OutsideRoot);
         }
-        if self.is_protected(&canon_full) || self.is_protected(&full) {
+        if is_protected(&canon_full) || is_protected(&full) {
             return Err(ExecError::Protected);
         }
         Ok(Checked { path: full, meta })
@@ -394,8 +461,10 @@ impl Executor {
             return Err(ExecError::TooLarge);
         }
         let c = self.check(raw)?;
-        if c.meta.is_none() {
-            return Err(ExecError::Io(io::ErrorKind::NotFound));
+        match &c.meta {
+            Some(m) if m.is_file() => {}
+            Some(_) => return Err(ExecError::NotAFile),
+            None => return Err(ExecError::Io(io::ErrorKind::NotFound)),
         }
         let f = OpenOptions::new()
             .read(true)
@@ -431,7 +500,9 @@ impl Executor {
             None if c.path == self.root => {}
             None => return Err(ExecError::Io(io::ErrorKind::NotFound)),
         }
-        let mut entries = Vec::new();
+        // Max-heap of the MAX_LIST_ENTRIES smallest names, plus a count.
+        let mut heap: BinaryHeap<(Vec<u8>, &'static str)> = BinaryHeap::new();
+        let mut total = 0usize;
         for e in fs::read_dir(&c.path).map_err(|e| io_err(&e))? {
             let e = e.map_err(|e| io_err(&e))?;
             let ft = e.file_type().map_err(|e| io_err(&e))?;
@@ -442,18 +513,21 @@ impl Executor {
             } else {
                 ""
             };
-            entries.push((e.file_name(), mark));
+            total += 1;
+            heap.push((e.file_name().as_bytes().to_vec(), mark));
+            if heap.len() > MAX_LIST_ENTRIES {
+                heap.pop();
+            }
         }
-        entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        let mut lines: Vec<String> = entries
-            .iter()
-            .take(MAX_LIST_ENTRIES)
-            .map(|(name, mark)| format!("{}{mark}", escape_name(name)))
+        let mut lines: Vec<String> = heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|(name, mark)| format!("{}{mark}", escape_name(OsStr::from_bytes(&name))))
             .collect();
-        if entries.len() > MAX_LIST_ENTRIES {
+        if total > MAX_LIST_ENTRIES {
             lines.push(format!(
                 "[{} more entries not shown]",
-                entries.len() - MAX_LIST_ENTRIES
+                total - MAX_LIST_ENTRIES
             ));
         }
         Ok(ToolOutput {
@@ -489,15 +563,21 @@ impl Executor {
         };
 
         let tmp = parent.join(format!("{TMP_PREFIX}{}", random_hex()));
-        if let Err(e) = write_atomic(&tmp, &c.path, parent, content.as_bytes(), mode) {
+        if let Err(e) = self.write_and_rename(&tmp, &c.path, content.as_bytes(), mode) {
             let _ = fs::remove_file(&tmp);
             return Err(fail(io_err(&e)));
         }
+        // The rename happened: record the after-state before anything else
+        // can fail.
         self.snapshots
             .record_after(&id, &self.root)
             .map_err(|e| fail(ExecError::Snapshot(e)))?;
+        let mut text = format!("wrote {} bytes", content.len());
+        if self.sync_dir(parent).is_err() {
+            text.push_str(" (directory sync failed)");
+        }
         Ok(ToolOutput {
-            text: format!("wrote {} bytes", content.len()),
+            text,
             snapshot: Some(id),
         })
     }
@@ -517,34 +597,93 @@ impl Executor {
             snapshot: Some(id.clone()),
         };
         fs::remove_file(&c.path).map_err(|e| fail(io_err(&e)))?;
-        File::open(parent)
-            .and_then(|d| d.sync_all())
-            .map_err(|e| fail(io_err(&e)))?;
         self.snapshots
             .record_after(&id, &self.root)
             .map_err(|e| fail(ExecError::Snapshot(e)))?;
+        let mut text = String::from("deleted");
+        if self.sync_dir(parent).is_err() {
+            text.push_str(" (directory sync failed)");
+        }
         Ok(ToolOutput {
-            text: "deleted".into(),
+            text,
             snapshot: Some(id),
         })
     }
+
+    /// Temp file (create_new, 0600, O_NOFOLLOW), write, final mode, sync,
+    /// rename over `target`. The caller removes `tmp` on error.
+    fn write_and_rename(
+        &self,
+        tmp: &Path,
+        target: &Path,
+        bytes: &[u8],
+        mode: u32,
+    ) -> io::Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(tmp)?;
+        self.write_bytes(&mut f, bytes)?;
+        f.set_permissions(fs::Permissions::from_mode(mode))?;
+        f.sync_all()?;
+        drop(f);
+        #[cfg(feature = "test-hooks")]
+        if let Some(hook) = &self.hooks.before_rename {
+            hook(target);
+        }
+        fs::rename(tmp, target)
+    }
+
+    #[cfg(not(feature = "test-hooks"))]
+    fn write_bytes(&self, f: &mut File, bytes: &[u8]) -> io::Result<()> {
+        f.write_all(bytes)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn write_bytes(&self, f: &mut File, bytes: &[u8]) -> io::Result<()> {
+        let fail = self.hooks.fail_write_after.lock().unwrap().take();
+        if let Some(n) = fail {
+            f.write_all(&bytes[..n.min(bytes.len())])?;
+            return Err(io::Error::other("injected write failure (test hook)"));
+        }
+        f.write_all(bytes)
+    }
+
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        #[cfg(feature = "test-hooks")]
+        if self
+            .hooks
+            .fail_dir_sync
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(io::Error::other(
+                "injected directory sync failure (test hook)",
+            ));
+        }
+        File::open(dir)?.sync_all()
+    }
 }
 
-/// Temp file (create_new, 0600, O_NOFOLLOW), write, final mode, sync,
-/// rename over `target`, fsync the directory.
-fn write_atomic(tmp: &Path, target: &Path, dir: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(tmp)?;
-    f.write_all(bytes)?;
-    f.set_permissions(fs::Permissions::from_mode(mode))?;
-    f.sync_all()?;
-    drop(f);
-    fs::rename(tmp, target)?;
-    File::open(dir)?.sync_all()
+/// Canonicalize the deepest existing ancestor of `p` and append the rest.
+fn resolve_deepest(p: &Path) -> io::Result<PathBuf> {
+    let mut existing = p;
+    let mut rest: Vec<&OsStr> = Vec::new();
+    let canon = loop {
+        match fs::canonicalize(existing) {
+            Ok(c) => break c,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let (Some(name), Some(parent)) = (existing.file_name(), existing.parent()) else {
+                    return Err(e);
+                };
+                rest.push(name);
+                existing = parent;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    Ok(rest.iter().rev().fold(canon, |acc, n| acc.join(n)))
 }
 
 /// 8 random bytes from the OS RNG, hex-encoded.
@@ -555,13 +694,17 @@ fn random_hex() -> String {
 }
 
 /// A file name for display: lossy UTF-8, with `\`, control and
-/// invisible/format characters escaped as `\u{..}`.
+/// invisible/format characters escaped as `\u{..}`. A trailing `@` (the
+/// symlink marker) and a leading `[` (the overflow line) are escaped too, so
+/// a name cannot imitate either.
 fn escape_name(name: &OsStr) -> String {
+    let lossy = name.to_string_lossy();
+    let last = lossy.chars().count().saturating_sub(1);
     let mut out = String::new();
-    for ch in name.to_string_lossy().chars() {
+    for (i, ch) in lossy.chars().enumerate() {
         if ch == '\\' {
             out.push_str("\\\\");
-        } else if is_forbidden_path_char(ch) {
+        } else if is_forbidden_path_char(ch) || (i == 0 && ch == '[') || (i == last && ch == '@') {
             out.push_str(&format!("\\u{{{:x}}}", ch as u32));
         } else {
             out.push(ch);
