@@ -105,6 +105,12 @@ fn ascii_corpus_never_leaks_what_round_3_redacted() {
         (seed >> 33) as usize % m
     };
     let mut redacted_cases = 0;
+    // Cases where the guard below actually fired: input has V, old removed V.
+    let mut guard_hits = 0usize;
+    let mut per_value = vec![0usize; VALUES.len()];
+    // Span-count comparison on inputs with no newly added secret word.
+    let mut span_cases = 0usize;
+    let mut span_deficit = 0usize;
     for _ in 0..60_000 {
         let mut s = String::new();
         for _ in 0..10 {
@@ -115,9 +121,25 @@ fn ascii_corpus_never_leaks_what_round_3_redacted() {
         let old = old::redact(&s).0.into_string();
         // A value present in the input and removed by the old redactor must
         // be absent from the new output (new redacts a superset).
-        for v in VALUES {
+        for (i, v) in VALUES.iter().enumerate() {
             if s.contains(v) && !old.contains(v) {
+                guard_hits += 1;
+                per_value[i] += 1;
                 assert!(!new.contains(v), "leaked {v:?} in {s:?}");
+            }
+        }
+        let lower = s.to_ascii_lowercase();
+        if !["credentials", "private", "jwt"]
+            .iter()
+            .any(|w| lower.contains(w))
+        {
+            span_cases += 1;
+            let (n, o) = (
+                new.matches("[REDACTED:").count(),
+                old.matches("[REDACTED:").count(),
+            );
+            if n < o {
+                span_deficit += o - n;
             }
         }
         assert_eq!(redact(&new).0.as_str(), new, "{s:?}");
@@ -127,4 +149,14 @@ fn ascii_corpus_never_leaks_what_round_3_redacted() {
     }
     // The corpus really exercises the redactor.
     assert!(redacted_cases > 50_000, "{redacted_cases}");
+    // The one-sided guard is really exercised, for every value.
+    assert!(guard_hits > 1000, "guard fired only {guard_hits} times");
+    for (v, n) in VALUES.iter().zip(&per_value) {
+        assert!(*n >= 5, "value {v:?} exercised only {n} times");
+    }
+    assert!(span_cases > 1000, "{span_cases}");
+    assert_eq!(
+        span_deficit, 0,
+        "new redactor has {span_deficit} fewer [REDACTED: spans than the old one over {span_cases} cases"
+    );
 }

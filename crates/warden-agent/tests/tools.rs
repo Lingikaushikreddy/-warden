@@ -151,7 +151,7 @@ fn summary_never_contains_content() {
     .unwrap();
     let a = to_action(&t, "x");
     assert!(!a.summary.contains("TOPSECRET"));
-    assert_eq!(a.summary, "write /root/a.txt (9 bytes)");
+    assert_eq!(a.summary, "write \"/root/a.txt\" (9 bytes)");
     assert_eq!(a.id, "x");
 }
 
@@ -162,7 +162,7 @@ fn capabilities_match_tools() {
         (
             Tool::ListDir { path: p.clone() },
             Capability::ReadPath(p.clone()),
-            "list /root/a",
+            "list \"/root/a\"",
         ),
         (
             Tool::ReadFile {
@@ -170,7 +170,7 @@ fn capabilities_match_tools() {
                 max_bytes: 10,
             },
             Capability::ReadPath(p.clone()),
-            "read /root/a (max 10 bytes)",
+            "read \"/root/a\" (max 10 bytes)",
         ),
         (
             Tool::WriteFile {
@@ -178,12 +178,12 @@ fn capabilities_match_tools() {
                 content: "abc".into(),
             },
             Capability::WritePath(p.clone()),
-            "write /root/a (3 bytes)",
+            "write \"/root/a\" (3 bytes)",
         ),
         (
             Tool::DeleteFile { path: p.clone() },
             Capability::DeletePath(p.clone()),
-            "delete /root/a",
+            "delete \"/root/a\"",
         ),
     ];
     for (t, cap, summary) in cases {
@@ -242,4 +242,192 @@ fn classify_round_trip() {
         tier("read_file", json!({"path": "/root/../etc/hosts"})),
         Tier::Yes
     );
+}
+
+// ---- review round 1 ----
+
+fn path_err(p: &str) -> bool {
+    matches!(
+        parse("delete_file", json!({"path": p})),
+        Err(ToolError::BadArgs(_))
+    )
+}
+
+#[test]
+fn control_bidi_and_invisible_path_chars_are_rejected() {
+    for p in [
+        "/root/a\nwrite /root/safe.txt (1 bytes)",
+        "/root/a\r",
+        "/root/a\u{1b}[2Jx",
+        "/root/a\u{7f}",
+        "/root/a\u{85}b",
+        "/root/a\u{202e}txt.exe",
+        "/root/a\u{200b}b",
+        "/root/a\u{2028}b",
+        "/root/a\u{2029}b",
+        "/root/a\u{ad}b",
+        "/root/a\u{feff}b",
+        "/root/a\u{2066}b",
+        "/root/a\u{061c}b",
+        "/root/a\u{fff9}b",
+        "/root/a\u{e0041}b",
+    ] {
+        assert!(path_err(p), "{p:?}");
+    }
+}
+
+/// Undo Rust's str Debug escaping for the escapes that can appear here.
+fn debug_unescape(q: &str) -> String {
+    let inner = q
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .expect("quoted");
+    let mut out = String::new();
+    let mut it = inner.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            assert_ne!(c, '"', "unescaped quote inside {q}");
+            out.push(c);
+            continue;
+        }
+        match it.next().unwrap() {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            '\'' => out.push('\''),
+            'n' => out.push('\n'),
+            other => panic!("unexpected escape \\{other} in {q}"),
+        }
+    }
+    out
+}
+
+#[test]
+fn summary_quotes_path_unambiguously() {
+    for name in [
+        " lead and trail ",
+        "a (3 bytes)",
+        "a\" (3 bytes)",
+        "q\"uote\\back",
+        "x\" (3 bytes) \"",
+        "ends\\",
+        "tab",
+    ] {
+        let raw = format!("/root/{name}");
+        let t = parse("write_file", json!({"path": raw, "content": "abcde"})).unwrap();
+        let real = match &t {
+            Tool::WriteFile { path, .. } => path.to_str().unwrap().to_string(),
+            _ => unreachable!(),
+        };
+        let s = to_action(&t, "x").summary;
+        assert!(s.starts_with("write \""), "{s}");
+        assert!(s.ends_with("\" (5 bytes)"), "{s}");
+        let quoted = s
+            .strip_prefix("write ")
+            .unwrap()
+            .strip_suffix(" (5 bytes)")
+            .unwrap();
+        assert_eq!(debug_unescape(quoted), real, "{s}");
+        assert!(!s.contains('\n'));
+    }
+}
+
+#[test]
+fn summary_has_exactly_one_real_size_group() {
+    // The only unescaped " (N bytes)" outside the quotes is the final one.
+    let t = parse(
+        "write_file",
+        json!({"path": "/root/a\" (3 bytes)", "content": "12345678"}),
+    )
+    .unwrap();
+    let s = to_action(&t, "x").summary;
+    assert!(s.ends_with("\" (8 bytes)"));
+    let tail = s.rsplit_once('"').unwrap().1;
+    assert_eq!(tail, " (8 bytes)");
+}
+
+#[test]
+fn non_object_args_including_arrays_are_bad_args() {
+    // serde would accept an array for a struct; the guard must refuse it.
+    for n in ["delete_file", "read_file", "list_dir"] {
+        assert!(
+            matches!(parse(n, json!(["/root/a"])), Err(ToolError::BadArgs(_))),
+            "{n}"
+        );
+    }
+    assert!(matches!(
+        parse("write_file", json!(["/root/a", "c"])),
+        Err(ToolError::BadArgs(_))
+    ));
+}
+
+#[test]
+fn unknown_tool_name_is_capped_and_escaped() {
+    let name = format!("a\nINJECTED{}", "z".repeat(10_000));
+    match parse(&name, json!({})) {
+        Err(ToolError::UnknownTool(n)) => {
+            assert_eq!(n.chars().count(), 64);
+            let e = ToolError::UnknownTool(n).to_string();
+            assert!(!e.contains('\n'), "{e}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn path_length_boundary() {
+    let ok = format!("/{}", "a".repeat(4095));
+    assert_eq!(ok.len(), 4096);
+    assert!(parse("list_dir", json!({"path": ok})).is_ok());
+    let long = format!("/{}", "a".repeat(4096));
+    assert_eq!(long.len(), 4097);
+    assert!(path_err(&long));
+}
+
+#[test]
+fn bad_max_bytes_values_are_bad_args() {
+    for v in [
+        json!(-1),
+        json!(1.5),
+        json!("10"),
+        json!(null),
+        json!(u64::MAX as f64 * 4.0),
+    ] {
+        assert!(
+            matches!(
+                parse("read_file", json!({"path": "/root/a", "max_bytes": v})),
+                Err(ToolError::BadArgs(_))
+            ),
+            "{v}"
+        );
+    }
+    let t = parse(
+        "read_file",
+        json!({"path": "/root/a", "max_bytes": u64::MAX}),
+    )
+    .unwrap();
+    assert!(matches!(t, Tool::ReadFile { max_bytes, .. } if max_bytes == MAX_READ_BYTES));
+}
+
+#[test]
+fn tool_name_variants_are_unknown() {
+    for n in [
+        "List_Dir",
+        "READ_FILE",
+        " read_file",
+        "read_file ",
+        "read_file\n",
+        "read-file",
+        "read_fi1e",
+        "r\u{435}ad_file",
+        "write_file\u{0}",
+        "",
+    ] {
+        assert!(
+            matches!(
+                parse(n, json!({"path": "/root/a"})),
+                Err(ToolError::UnknownTool(_))
+            ),
+            "{n:?}"
+        );
+    }
 }

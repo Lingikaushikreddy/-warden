@@ -66,7 +66,8 @@ pub enum ToolError {
 impl fmt::Display for ToolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ToolError::UnknownTool(n) => write!(f, "unknown tool: {n}"),
+            // Debug-escaped so a model-chosen name cannot inject log lines.
+            ToolError::UnknownTool(n) => write!(f, "unknown tool: {n:?}"),
             ToolError::BadArgs(m) => write!(f, "bad arguments: {m}"),
             ToolError::TooLarge => write!(f, "content too large"),
         }
@@ -110,8 +111,23 @@ fn parse_args<T: serde::de::DeserializeOwned>(call: &ToolCall) -> Result<T, Tool
     serde_json::from_value(call.args.clone()).map_err(|_| bad(&call.name))
 }
 
+/// Characters that could make a displayed path misleading: controls, and
+/// Unicode format, bidi and invisible characters.
+fn is_forbidden_path_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{00AD}' | '\u{061C}' | '\u{0085}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}' | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E007F}')
+}
+
 fn resolve(tool: &str, raw: &str, cwd: &Path) -> Result<PathBuf, ToolError> {
-    if raw.is_empty() || raw.len() > MAX_PATH_BYTES || raw.contains('\0') {
+    if raw.is_empty() || raw.len() > MAX_PATH_BYTES || raw.chars().any(is_forbidden_path_char) {
         return Err(ToolError::BadArgs(format!("invalid path for {tool}")));
     }
     normalize(&cwd.join(raw))
@@ -130,6 +146,10 @@ pub fn parse_call(call: &ToolCall, cwd: &Path) -> Result<Tool, ToolError> {
         }
         "read_file" => {
             let a: ReadArgs = parse_args(call)?;
+            // Explicit null is refused rather than treated as "absent".
+            if call.args.get("max_bytes").is_some_and(Value::is_null) {
+                return Err(bad("read_file"));
+            }
             let max_bytes = match a.max_bytes {
                 None => DEFAULT_READ_BYTES,
                 Some(0) => return Err(bad("read_file")),
@@ -156,28 +176,31 @@ pub fn parse_call(call: &ToolCall, cwd: &Path) -> Result<Tool, ToolError> {
                 path: resolve("delete_file", &a.path, cwd)?,
             })
         }
-        other => Err(ToolError::UnknownTool(other.to_string())),
+        other => Err(ToolError::UnknownTool(other.chars().take(64).collect())),
     }
 }
 
 /// Map a validated tool to the [`Action`] that `classify` tiers. The summary
 /// uses only validated fields: never model prose or file content.
 pub fn to_action(tool: &Tool, action_id: &str) -> Action {
+    // Quoted with Debug escaping, so `"` and `\` cannot close the quote and
+    // the path cannot fake the trailing size group.
+    let q = |p: &Path| format!("{:?}", p.to_string_lossy());
     let (summary, cap) = match tool {
         Tool::ListDir { path } => (
-            format!("list {}", path.display()),
+            format!("list {}", q(path)),
             Capability::ReadPath(path.clone()),
         ),
         Tool::ReadFile { path, max_bytes } => (
-            format!("read {} (max {max_bytes} bytes)", path.display()),
+            format!("read {} (max {max_bytes} bytes)", q(path)),
             Capability::ReadPath(path.clone()),
         ),
         Tool::WriteFile { path, content } => (
-            format!("write {} ({} bytes)", path.display(), content.len()),
+            format!("write {} ({} bytes)", q(path), content.len()),
             Capability::WritePath(path.clone()),
         ),
         Tool::DeleteFile { path } => (
-            format!("delete {}", path.display()),
+            format!("delete {}", q(path)),
             Capability::DeletePath(path.clone()),
         ),
     };

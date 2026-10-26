@@ -1252,3 +1252,19 @@ fn non_secret_names_stay_unredacted() {
         assert_eq!(out(line), line, "{line}");
     }
 }
+
+/// Pinned behavior (documented, not necessarily ideal): SECRET_WORDS contain
+/// `pass`, `clear`, so these deny-word names become secret again and ARE
+/// redacted, while names with no secret word after the deny word stay clear.
+#[test]
+fn new_secret_words_false_positive_guards() {
+    // `max` is a deny word and `pass` a secret word: redacted (pinned).
+    assert!(!out("token_max_pass: xyz123456").contains("xyz123456"));
+    // `field` deny, `clear` secret: redacted (pinned).
+    assert!(!out("password_field_clear: xyz123456").contains("xyz123456"));
+    // No secret word in the suffix: unredacted.
+    assert_eq!(out("token_budget_total: 4096"), "token_budget_total: 4096");
+    assert_eq!(out("password_min_length: 12"), "password_min_length: 12");
+    // `pass` only as a glued fragment is not a word.
+    assert_eq!(out("token_bypass_count: 3"), "token_bypass_count: 3");
+}
