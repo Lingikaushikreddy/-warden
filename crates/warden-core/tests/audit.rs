@@ -465,3 +465,14 @@ fn rechained_forged_suffix_passes_verify_documented_limit() {
     assert_eq!(forged_head.0, anchored_head.0);
     assert_ne!(forged_head.1, anchored_head.1);
 }
+
+#[cfg(unix)]
+#[test]
+fn new_log_is_created_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_d, path) = tmp_log();
+    let log = AuditLog::open(&path).unwrap();
+    drop(log);
+    let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "{mode:o}");
+}

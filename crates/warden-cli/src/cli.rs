@@ -128,6 +128,7 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum AuditCommand {
-    /// Check the hash chain: prints `ok <n>` or `broken <index>: <reason>`.
+    /// Check the hash chain: prints `ok <n>`, `broken <index>: <reason>`, or
+    /// `no audit log` if none exists yet.
     Verify,
 }

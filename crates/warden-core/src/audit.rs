@@ -159,18 +159,23 @@ impl AuditLog {
         Self::open_with_clock(path, Box::new(system_clock_ms))
     }
 
-    /// Open (or create) the log at `path` with an injected clock.
+    /// Open (or create) the log at `path` with an injected clock. A new file
+    /// is created with mode `0o600` on Unix.
     ///
     /// Takes an advisory exclusive lock (fails with `WouldBlock` if another
     /// handle holds it), then verifies the existing content through the
     /// locked handle; a broken log fails with `InvalidData` and is left
     /// untouched.
     pub fn open_with_clock(path: &Path, clock: Clock) -> io::Result<AuditLog> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(path)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).append(true).create(true);
+        // A newly created log is owner-only; an existing file keeps its mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(path)?;
         match file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {

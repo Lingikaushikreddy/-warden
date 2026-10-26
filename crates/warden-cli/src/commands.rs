@@ -158,17 +158,7 @@ fn open_audit(home: &Path) -> Result<AuditLog, u8> {
         return Err(EXIT_ERROR);
     }
     let path = home.join("audit.jsonl");
-    // Pre-create the log owner-only; warden-core would create it with the
-    // default umask. An existing file is left as it is.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let _ = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path);
-    }
+    // warden-core creates a new log with mode 0o600.
     AuditLog::open(&path).map_err(|e| {
         err!(
             "error: cannot open audit log {}: {e}\nrefusing to act without a working audit log; run `warden audit verify`",
@@ -496,6 +486,22 @@ fn run_inner(
             err!("refused: {} is outside --root", path.display());
             return Ok(EXIT_DENIED);
         }
+        Err(SnapshotError::Symlink(p)) => {
+            record("refused: symlink")?;
+            err!(
+                "refused: {} is or passes through a symlink; nothing changed",
+                p.display()
+            );
+            return Ok(EXIT_DENIED);
+        }
+        Err(SnapshotError::NotAFile(p)) => {
+            record("refused: not a file")?;
+            err!(
+                "refused: {} is not a regular file (or a parent is not a directory); nothing changed",
+                p.display()
+            );
+            return Ok(EXIT_DENIED);
+        }
         Err(e) => {
             record(&format!("failed: snapshot {}", snapshot_err_label(&e)))?;
             err!("error: snapshot failed, nothing changed: {e}");
@@ -669,7 +675,7 @@ fn cmd_audit_verify(home: &Path) -> u8 {
             EXIT_ERROR
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            out!("ok 0");
+            out!("no audit log");
             EXIT_OK
         }
         Err(e) => {
@@ -690,9 +696,11 @@ fn cmd_prune(home: &Path, days: u64) -> u8 {
     };
     let id = random_hex16();
     let sum = format!("prune --days {days}");
+    // prune is not a tiered action. AuditEntry requires a tier, so it is
+    // recorded as Tier::Auto; the decision text carries a non-tier label.
     let mut record = |d: &str| audit(&mut log, &id, &sum, Tier::Auto, d);
     // Audit before anything is deleted.
-    if let Err(c) = record("requested") {
+    if let Err(c) = record("prune requested") {
         return c;
     }
     let store = match SnapshotStore::open(&home.join("snapshots")) {
@@ -734,9 +742,11 @@ fn cmd_init_pin(
         Err(c) => return c,
     };
     let id = random_hex16();
+    // init-pin is not a tiered action. AuditEntry requires a tier, so it is
+    // recorded as Tier::Auto; the decision text carries a non-tier label.
     let mut record = |d: &str| audit(&mut log, &id, "init-pin", Tier::Auto, d);
     // Audit before the PIN file is touched.
-    if let Err(c) = record("requested") {
+    if let Err(c) = record("init-pin requested") {
         return c;
     }
     let pin_path = home.join("pin");

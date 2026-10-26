@@ -148,6 +148,36 @@ fn symlinked_parent_is_rejected_at_snapshot() {
     assert!(matches!(err, SnapshotError::Symlink(_)), "{err:?}");
 }
 
+#[cfg(unix)]
+#[test]
+fn symlink_to_outside_root_is_rejected() {
+    let f = fixture();
+    let other = TempDir::new().unwrap();
+    let outside = other.path().join("outside.txt");
+    fs::write(&outside, "outside").unwrap();
+    let link = f.root().join("link.txt");
+    symlink(&outside, &link).unwrap();
+    let err = f.store.snapshot(&[link], f.root()).unwrap_err();
+    assert!(matches!(err, SnapshotError::Symlink(_)), "{err:?}");
+    assert_eq!(read(&outside), "outside");
+}
+
+#[test]
+fn missing_parent_is_recorded_absent_and_restore_does_not_create_it() {
+    let f = fixture();
+    let p = f.root().join("nodir").join("x.txt");
+    let id = f
+        .store
+        .snapshot(std::slice::from_ref(&p), f.root())
+        .unwrap();
+    let m = f.manifest(&id);
+    assert_eq!(m["entries"][0]["existed"], serde_json::Value::Bool(false));
+    f.store.record_after(&id, f.root()).unwrap();
+    let restored = f.store.restore(&id, f.root(), false).unwrap();
+    assert!(restored.is_empty(), "{restored:?}");
+    assert!(!f.root().join("nodir").exists());
+}
+
 #[test]
 fn path_outside_root_is_rejected() {
     let f = fixture();

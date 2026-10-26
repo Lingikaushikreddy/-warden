@@ -105,7 +105,8 @@ keychain-backed storage.
 Every command that writes (`run`, `undo`, `prune`, `init-pin`) opens the audit
 log first and refuses with exit code 1 if it cannot (including a broken hash
 chain or a log held by another process). Each one appends an entry before it
-changes anything (`run`: `approved`; `undo`, `prune`, `init-pin`: `requested`)
+changes anything (`run`: `approved`; `undo`: `requested`; `prune`: `prune
+requested`; `init-pin`: `init-pin requested`)
 and stops if that append fails, so no change is made without a prior audit
 record. What is **not** guaranteed is the outcome record: if the append after
 the change fails (disk full, I/O error), the change has happened but its final
@@ -126,8 +127,19 @@ and fail-closed behaviour as `run`, exit 2 on refusal). It is audited at tier
 `YesPin` as `refused: <reason>`, or `requested` and then its outcome.
 
 `prune` and `init-pin` are not tiered actions. Their audit entries carry
-`Tier::Auto` only because `AuditEntry` requires a tier; the decision text says
-what happened.
+`Tier::Auto` only because `AuditEntry` requires a tier; the decision text uses
+a non-tier label (`prune requested`, `init-pin requested`, `pruned N`,
+`pin set`) rather than implying an Auto approval.
+
+The audit log is created `0o600` by `warden-core` (`AuditLog::open`); an
+existing log keeps its mode. `warden audit verify` prints `no audit log`
+(exit 0) when the home has no log yet.
+
+During `run`, a target that is (or passes through) a symlink, or is not a
+regular file, is a refusal: exit 2, audited `refused: symlink` or
+`refused: not a file`. These are detected by the snapshot step, which runs
+after `approved` is appended, so such an entry reads `approved` then
+`refused: <reason>`, and nothing is changed.
 
 Fault injection for tests (`WARDEN_TEST_FAIL_AUDIT_APPEND=<n>`, fail the n-th
 append of the process) exists only when `warden-cli` is built with the

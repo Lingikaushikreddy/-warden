@@ -229,11 +229,11 @@ fn audit_verify_detects_tampering() {
 }
 
 #[test]
-fn audit_verify_on_empty_home_is_ok_0() {
+fn audit_verify_on_empty_home_says_no_audit_log() {
     let e = Env::new();
     let out = e.cmd().args(["audit", "verify"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(stdout(&out), "ok 0\n");
+    assert_eq!(stdout(&out), "no audit log\n");
 }
 
 #[test]
@@ -585,6 +585,8 @@ fn prune_prints_count() {
     let out = e.cmd().args(["prune", "--days", "30"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(stdout(&out), "pruned 0\n");
+    // A non-tier label: prune is not an approved Auto action.
+    assert_eq!(e.decisions(), vec!["prune requested", "pruned 0"]);
 }
 
 fn snapshot_id_of(out: &std::process::Output) -> Option<String> {
@@ -783,7 +785,7 @@ fn held_audit_lock_makes_run_refuse() {
 }
 
 #[test]
-fn delete_of_a_directory_exits_1_and_leaves_it() {
+fn delete_of_a_directory_is_refused_and_leaves_it() {
     let e = Env::new();
     e.init_pin();
     let d = e.file("dir");
@@ -797,13 +799,17 @@ fn delete_of_a_directory_exits_1_and_leaves_it() {
         .arg(&d)
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     assert_eq!(fs::read_to_string(d.join("inner.txt")).unwrap(), "keep");
+    assert_eq!(
+        e.decisions().last().map(String::as_str),
+        Some("refused: not a file")
+    );
 }
 
 #[cfg(unix)]
 #[test]
-fn write_through_symlink_exits_1_and_leaves_target() {
+fn write_through_symlink_is_refused_and_leaves_target() {
     let e = Env::new();
     let other = tempfile::tempdir().unwrap();
     let target = other.path().join("target.txt");
@@ -819,15 +825,19 @@ fn write_through_symlink_exits_1_and_leaves_target() {
         .arg("pwned")
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+    assert_eq!(
+        e.decisions().last().map(String::as_str),
+        Some("refused: symlink")
+    );
 }
 
 #[test]
 fn init_pin_audits_requested_before_writing() {
     let e = Env::new();
     e.init_pin();
-    assert_eq!(e.decisions(), vec!["requested", "pin set"]);
+    assert_eq!(e.decisions(), vec!["init-pin requested", "pin set"]);
 }
 
 #[test]
