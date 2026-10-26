@@ -34,7 +34,13 @@
 //!   checksum. Other layouts are not caught: `4111-111111-111111`, a spaced
 //!   13-digit Visa as 4-4-4-1, and mixed separators (`4111 1111-1111 1111`);
 //! - bare numbers under a secret key in text (`password = 1234 5678` redacts
-//!   only the first group; valid card numbers are caught by the card rule).
+//!   only the first group; valid card numbers are caught by the card rule);
+//! - keywords spelled with other look-alike chars: only the two Unicode case
+//!   folds of ASCII letters are matched (`ſ` U+017F for `s`, the Kelvin sign
+//!   U+212A for `k`, so `ſecret=` and `to\u{212A}en=` are redacted);
+//!   homoglyphs such as Cyrillic `а`/`е`/`о` or fullwidth letters are not;
+//! - a compound name whose secret word sits before the keyword match only
+//!   (`DB_KEY_TOKEN_ID` is read as `TOKEN` + `_ID`, a non-secret).
 //!
 //! Remaining false positives (over-redaction costs model context but leaks
 //! nothing): key/value redaction fires on code that assigns to a secret-named
@@ -53,7 +59,12 @@
 //! `_index`, `_field`, `_min(_length)`, `_max(_length)` (so `token_budget`,
 //! `token_budget_total`, `password_min_length`, `api_key_header` are left
 //! alone, while `SECRET_KEY_FILE`, `secret_value`, `PASSWORD_SALT` are
-//! secret: the deny word must come right after the keyword). To keep source
+//! secret: the deny word must come right after the keyword). A deny word
+//! only counts when no word of the suffix is `secret`, `token`, `password`,
+//! `passwd`, `pwd`, `key`, `value`, `contents`, `content`, `data` or `salt`
+//! (words split at `_`, `-` and camelCase), so `TOKEN_HASH_SECRET`,
+//! `PASSWORD_FIELD_VALUE`, `TOKEN_URL_WITH_KEY` are secret while
+//! `API_KEY_ID`, `PASSWORD_FILE`, `token_budget` are not. To keep source
 //! code intact, unquoted values that start with `& ( { [ : =`, end with `(`
 //! or `)`, or are shorter than 4 characters are left alone.
 //! In JSON the same keyword/deny-list rule applies to keys; plural keys
@@ -66,7 +77,8 @@
 //! is 12+ base64 characters containing a digit or `+/=`.
 //!
 //! Token prefixes: fixed-length or distinctive ones (`AKIA`, `ASIA`,
-//! `gh[pousr]_`, `AIza`, `sk-ant-`) match anywhere, even mid-word, so chains
+//! `gh[pousr]_`, `AIza`, and `sk-ant-` only in its real layout
+//! `sk-ant-<letters><2 digits>-...`) match anywhere, even mid-word, so chains
 //! of keys are caught. The variable-length ones that also occur inside
 //! ordinary words (`sk-`, `sk_/rk_live_/test_`, `hf_`, `glpat-`, `xapp-`,
 //! `xox?-`, `github_pat_`) need a left boundary: start of text or a char that
@@ -74,8 +86,10 @@
 //! `risk-assessment-for-the-quarter` and `network_test_connectivitycheck`
 //! are left alone. A bounded key glued to an unbounded one
 //! (`AKIA...EXAMPLEsk-...`) is caught on the next pass, after the first
-//! key's placeholder gives it a boundary. A word that itself starts with
-//! `sk-` and runs 20+ chars (`sk-learn-...`) is still over-redacted.
+//! key's placeholder gives it a boundary. Because `-` is a boundary, a
+//! kebab name with an `sk-` word followed by 20+ chars is still
+//! over-redacted (`use-sk-learn-pipeline-configuration-v2` becomes
+//! `use-[REDACTED:api_key]`); it is not special-cased.
 //!
 //! Fail closed: `redact` repeats its passes until the text stops changing
 //! (a placeholder can create a new boundary for a later pattern). If it has
@@ -83,7 +97,12 @@
 //! `[REDACTED:overflow]` (kind `overflow`) instead of partially redacted text.
 //!
 //! All matching uses the `regex` crate (finite automata, linear time in the
-//! input). Inputs are never logged.
+//! input). Inputs are never logged, and no code path in `redact` or
+//! `redact_json` can panic with a message built from input: keyword regexes
+//! fold case explicitly (no `(?i)`), the key/value splitter steps over whole
+//! chars and slices only with `str::get` (falling back to the regex's own
+//! capture groups if it ever declines), and a failed internal slice makes
+//! `redact` fail closed with `[REDACTED:overflow]` instead of panicking.
 //!
 //! ```compile_fail
 //! let _ = warden_agent::redact::Redacted("x".to_string());
@@ -154,9 +173,41 @@ fn placeholder(kind: &str) -> String {
     format!("{PLACEHOLDER_PREFIX}{kind}]")
 }
 
-const KEY_SUFFIX: &str = "(?:[_-]?(?:key|token|secret|password))?";
-const KEYWORDS: &str =
-    "password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credentials?";
+/// Regex for `word` that matches ASCII letters case-insensitively, plus the
+/// only two non-ASCII chars that Unicode simple case folding maps to ASCII
+/// letters: `ſ` (U+017F, folds to `s`) and the Kelvin sign (U+212A, folds to
+/// `k`). Keyword regexes are built with this instead of `(?i)`, so the set of
+/// chars they can match is explicit and [`split_kv`] can mirror it.
+fn ascii_ci(word: &str) -> String {
+    let mut p = String::new();
+    for c in word.chars() {
+        match c.to_ascii_lowercase() {
+            's' => p.push_str("[sS\u{17F}]"),
+            'k' => p.push_str("[kK\u{212A}]"),
+            l if l.is_ascii_alphabetic() => {
+                p.push('[');
+                p.push(l);
+                p.push(l.to_ascii_uppercase());
+                p.push(']');
+            }
+            '-' => p.push_str(r"\-"),
+            other => p.push(other),
+        }
+    }
+    p
+}
+
+/// `[A-Za-z0-9_-]` plus the two non-ASCII case folds of ASCII letters.
+const SUFFIX_CLASS: &str = "[A-Za-z0-9_\\-\u{17F}\u{212A}]";
+
+/// The keyword alternation, in [`KEYWORD_FORMS`] preference order.
+fn keywords_re() -> String {
+    KEYWORD_FORMS
+        .iter()
+        .map(|f| ascii_ci(f))
+        .collect::<Vec<_>>()
+        .join("|")
+}
 
 struct Patterns {
     pem: Regex,
@@ -172,14 +223,37 @@ struct Patterns {
     plural_key_name: Regex,
 }
 
+/// Compiles a built-in pattern. The patterns are constants, so a failure is a
+/// bug in this file (caught by every test), never something an input causes.
+fn re(p: &str) -> Regex {
+    Regex::new(p).expect("built-in redaction pattern")
+}
+
 fn patterns() -> &'static Patterns {
     static P: OnceLock<Patterns> = OnceLock::new();
-    P.get_or_init(|| Patterns {
-        pem: Regex::new(
+    P.get_or_init(build_patterns)
+}
+
+fn build_patterns() -> Patterns {
+    let kw = keywords_re();
+    let key_suffix = format!(
+        "(?:[_-]?(?:{}|{}|{}|{}))?",
+        ascii_ci("key"),
+        ascii_ci("token"),
+        ascii_ci("secret"),
+        ascii_ci("password")
+    );
+    let word_keys = format!(
+        "{}|{}|{}",
+        ascii_ci("auth"),
+        ascii_ci("passphrase"),
+        ascii_ci("pass")
+    );
+    Patterns {
+        pem: re(
             r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----.*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|\z)",
-        )
-        .unwrap(),
-        jwt: Regex::new(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap(),
+        ),
+        jwt: re(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
         // Variable-length prefixes that also occur inside ordinary words
         // (`risk-assessment`, `network_test_...`) need a left boundary: start
         // of text or a char that is not a letter or digit. It is consumed as
@@ -187,7 +261,9 @@ fn patterns() -> &'static Patterns {
         // Fixed-length or distinctive prefixes match anywhere, so key chains
         // are caught; a bounded key glued to one of them is caught on the next
         // fixpoint pass, once the placeholder's `]` precedes it.
-        api_key: Regex::new(concat!(
+        // `sk-ant-` is boundary-free only in its real layout
+        // (`sk-ant-api03-...`), so `risk-ant-colony-...` is left alone.
+        api_key: re(concat!(
             r"(?P<lb>^|[^\p{L}\p{N}])(?:",
             r"sk-[A-Za-z0-9_-]{20,}",
             r"|[sr]k_(?:live|test)_[A-Za-z0-9]{16,}",
@@ -197,35 +273,31 @@ fn patterns() -> &'static Patterns {
             r"|xox[abprs]-[A-Za-z0-9-]{10,}",
             r"|github_pat_[A-Za-z0-9_]{22,}",
             r")",
-            r"|sk-ant-[A-Za-z0-9_-]{17,}",
+            r"|sk-ant-[a-z]+[0-9]{2}-[A-Za-z0-9_-]{16,}",
             r"|gh[pousr]_[A-Za-z0-9]{36}",
             r"|(?:AKIA|ASIA)[0-9A-Z]{16}",
             r"|AIza[0-9A-Za-z_-]{35}",
-        ))
-        .unwrap(),
-        url_userinfo: Regex::new(
-            r#"([A-Za-z][A-Za-z0-9+.-]*://[^\s/:@"'<>]*:)([^\s/@"'<>]+)@"#,
-        )
-        .unwrap(),
-        bearer: Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}").unwrap(),
-        basic: Regex::new(
-            r"(?i)(authorization[ \t]*:[ \t]*)?\bBasic[ \t]+([A-Za-z0-9+/]{8,}={0,2})",
-        )
-        .unwrap(),
-        kv: Regex::new(&format!(
-            r#"(?i)(?P<pre>(?:{KEYWORDS})(?P<suffix>[A-Za-z0-9_-]*)["']?[ \t]*[=:][ \t]*)(?:"(?P<dq>(?:[^"\\\n]|\\[^\n])*)(?P<dqc>"?)|'(?P<sq>(?:[^'\\\n]|\\[^\n])*)(?P<sqc>'?)|(?P<bare>[^\s"',;]+))"#
-        ))
-        .unwrap(),
+        )),
+        url_userinfo: re(r#"([A-Za-z][A-Za-z0-9+.-]*://[^\s/:@"'<>]*:)([^\s/@"'<>]+)@"#),
+        bearer: re(&format!(
+            r"\b{}\s+[A-Za-z0-9._~+/=-]{{16,}}",
+            ascii_ci("bearer")
+        )),
+        basic: re(&format!(
+            r"({}[ \t]*:[ \t]*)?\b{}[ \t]+([A-Za-z0-9+/]{{8,}}={{0,2}})",
+            ascii_ci("authorization"),
+            ascii_ci("basic")
+        )),
+        kv: re(&format!(
+            r#"(?P<pre>(?:{kw})(?P<suffix>{SUFFIX_CLASS}*)["']?[ \t]*[=:][ \t]*)(?:"(?P<dq>(?:[^"\\\n]|\\[^\n])*)(?P<dqc>"?)|'(?P<sq>(?:[^'\\\n]|\\[^\n])*)(?P<sqc>'?)|(?P<bare>[^\s"',;]+))"#
+        )),
         // Maximal runs of digit groups joined by single spaces or hyphens;
         // card windows are searched inside each run.
-        card: Regex::new(r"\b[0-9]+(?:[ -][0-9]+)*\b").unwrap(),
-        secret_key_name: Regex::new(&format!("(?i)(?:{KEYWORDS})(?P<suffix>[A-Za-z0-9_-]*)$")).unwrap(),
-        word_key_name: Regex::new(&format!(
-            "(?i)(?:^|[_-])(?:auth|passphrase|pass){KEY_SUFFIX}$"
-        ))
-        .unwrap(),
-        plural_key_name: Regex::new(&format!("(?i)(?:{KEYWORDS})s$")).unwrap(),
-    })
+        card: re(r"\b[0-9]+(?:[ -][0-9]+)*\b"),
+        secret_key_name: re(&format!("(?:{kw})(?P<suffix>{SUFFIX_CLASS}*)$")),
+        word_key_name: re(&format!("(?:^|[_-])(?:{word_keys}){key_suffix}$")),
+        plural_key_name: re(&format!("(?:{kw}){}$", ascii_ci("s"))),
+    }
 }
 
 fn push_placeholder(out: &mut String, kind: &str) {
@@ -236,8 +308,14 @@ fn push_placeholder(out: &mut String, kind: &str) {
 
 /// Span text of capture group `i`, or "" when it did not participate.
 fn cap<'t>(text: &'t str, locs: &CaptureLocations, i: usize) -> &'t str {
-    locs.get(i).map_or("", |(s, e)| &text[s..e])
+    locs.get(i).and_then(|(s, e)| text.get(s..e)).unwrap_or("")
 }
+
+// Panic policy: nothing on the `redact`/`redact_json` path indexes or slices
+// with a bare `[..]` on input-derived positions. Text slices use `str::get`;
+// a failed `get` (impossible for regex-reported match bounds, kept as a
+// guard) makes the pass return `None`, and `redact` then fails closed with
+// `[REDACTED:overflow]`. So no panic message can ever carry input text.
 
 /// Walks every match of `re` with one reused capture buffer and one output
 /// buffer (no allocation per match). `f` gets the text and the match's
@@ -249,7 +327,7 @@ fn rewrite(
     kind: &'static str,
     report: &mut RedactionReport,
     mut f: impl FnMut(&str, &CaptureLocations, &mut String) -> bool,
-) -> String {
+) -> Option<String> {
     let mut locs = re.capture_locations();
     let mut out = String::with_capacity(text.len() + text.len() / 8);
     let (mut last, mut at, mut n) = (0, 0, 0);
@@ -257,7 +335,7 @@ fn rewrite(
         let Some(m) = re.captures_read_at(&mut locs, text, at) else {
             break;
         };
-        out.push_str(&text[last..m.start()]);
+        out.push_str(text.get(last..m.start())?);
         if f(text, &locs, &mut out) {
             n += 1;
         } else {
@@ -266,14 +344,19 @@ fn rewrite(
         last = m.end();
         at = if m.is_empty() {
             // No pattern here matches empty; step one char to stay safe.
-            m.end() + text[m.end()..].chars().next().map_or(1, char::len_utf8)
+            let step = text
+                .get(m.end()..)?
+                .chars()
+                .next()
+                .map_or(1, char::len_utf8);
+            m.end() + step
         } else {
             m.end()
         };
     }
-    out.push_str(&text[last..]);
+    out.push_str(text.get(last..)?);
     report.record(kind, n);
-    out
+    Some(out)
 }
 
 /// Like [`rewrite`], but `f` gets only the matched text. Uses `find` (no
@@ -285,11 +368,11 @@ fn rewrite_found(
     kind: &'static str,
     report: &mut RedactionReport,
     mut f: impl FnMut(&str, &mut String) -> bool,
-) -> String {
+) -> Option<String> {
     let mut out = String::with_capacity(text.len() + text.len() / 8);
     let (mut last, mut n) = (0, 0);
     for m in re.find_iter(text) {
-        out.push_str(&text[last..m.start()]);
+        out.push_str(text.get(last..m.start())?);
         if f(m.as_str(), &mut out) {
             n += 1;
         } else {
@@ -297,9 +380,9 @@ fn rewrite_found(
         }
         last = m.end();
     }
-    out.push_str(&text[last..]);
+    out.push_str(text.get(last..)?);
     report.record(kind, n);
-    out
+    Some(out)
 }
 
 fn replace_simple(
@@ -307,15 +390,15 @@ fn replace_simple(
     re: &Regex,
     kind: &'static str,
     report: &mut RedactionReport,
-) -> String {
+) -> Option<String> {
     rewrite_found(text, re, kind, report, |_, out| {
         push_placeholder(out, kind);
         true
     })
 }
 
-/// The keyword alternatives of [`KEYWORDS`], expanded, in the regex's
-/// preference order (`credentials` before `credential`).
+/// The keyword alternatives, in the regex's preference order (`credentials`
+/// before `credential`). The `kv`/key-name regexes are built from this list.
 const KEYWORD_FORMS: &[&str] = &[
     "password",
     "passwd",
@@ -335,7 +418,7 @@ const KEYWORD_FORMS: &[&str] = &[
     "credential",
 ];
 
-/// The parts of one `kv` match, split without the capture engine.
+/// The parts of one `kv` match.
 #[derive(Debug, PartialEq, Eq)]
 struct KvParts<'a> {
     /// Keyword, suffix, optional quote, separator and blanks.
@@ -348,72 +431,138 @@ struct KvParts<'a> {
     close: &'a str,
 }
 
-/// Splits text matched by `patterns().kv` into its parts. This mirrors the
-/// regex exactly (checked against the capture groups in a unit test): the
-/// keyword is the first form in [`KEYWORD_FORMS`] that prefixes the match,
-/// the suffix is the following run of `[A-Za-z0-9_-]`, then an optional
-/// quote, blanks, `=` or `:`, blanks, and the value. A quoted value runs to
-/// the first unescaped quote or the end of the match.
-fn split_kv(m: &str) -> KvParts<'_> {
+/// The char at byte `i` of `b`, folded the way [`ascii_ci`] folds it: an
+/// ASCII byte as its lowercase form, `ſ` (C5 BF) as `s`, the Kelvin sign
+/// (E2 84 AA) as `k`, with its length in bytes. `None` for any other char or
+/// past the end. `i` must be on a char boundary; the result keeps it there.
+fn folded_at(b: &[u8], i: usize) -> Option<(u8, usize)> {
+    match *b.get(i)? {
+        c if c.is_ascii() => Some((c.to_ascii_lowercase(), 1)),
+        0xC5 if b.get(i + 1) == Some(&0xBF) => Some((b's', 2)),
+        0xE2 if b.get(i + 1..i + 3) == Some(&[0x84, 0xAA][..]) => Some((b'k', 3)),
+        _ => None,
+    }
+}
+
+/// Splits text matched by `patterns().kv` into its parts without the capture
+/// engine (several times faster). It mirrors the regex (checked against the
+/// capture groups in a unit test): the keyword is the first form in
+/// [`KEYWORD_FORMS`] that prefixes the match (folded per [`folded_at`]), the
+/// suffix is the following run of ASCII letters, digits, `_`, `-`, `ſ` and
+/// the Kelvin sign, then an optional quote, blanks, `=` or `:`, blanks, and
+/// the value. A quoted value runs to the first unescaped quote or the end of
+/// the match. It only steps over whole chars and slices only with `str::get`,
+/// so it cannot panic; `None` means "use the capture engine instead" (see
+/// [`kv_parts`]).
+fn split_kv(m: &str) -> Option<KvParts<'_>> {
     let b = m.as_bytes();
-    let kw = KEYWORD_FORMS
-        .iter()
-        .find(|k| b.len() >= k.len() && b[..k.len()].eq_ignore_ascii_case(k.as_bytes()))
-        .map_or(0, |k| k.len());
+    let kw = KEYWORD_FORMS.iter().find_map(|f| {
+        let mut i = 0;
+        for &p in f.as_bytes() {
+            match folded_at(b, i) {
+                Some((c, n)) if c == p => i += n,
+                _ => return None,
+            }
+        }
+        Some(i)
+    })?;
     let mut i = kw;
-    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'-') {
+    while let Some((c, n)) = folded_at(b, i) {
+        if !(c.is_ascii_alphanumeric() || c == b'_' || c == b'-') {
+            break;
+        }
+        i += n;
+    }
+    let suffix = m.get(kw..i)?;
+    // Everything from here to the value is ASCII: quote, blanks, separator.
+    if matches!(b.get(i), Some(b'"' | b'\'')) {
         i += 1;
     }
-    let suffix = &m[kw..i];
-    if i < b.len() && (b[i] == b'"' || b[i] == b'\'') {
+    while matches!(b.get(i), Some(b' ' | b'\t')) {
         i += 1;
     }
-    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+    if !matches!(b.get(i), Some(b'=' | b':')) {
+        return None;
+    }
+    i += 1;
+    while matches!(b.get(i), Some(b' ' | b'\t')) {
         i += 1;
     }
-    i += 1; // the `=` or `:`
-    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
-        i += 1;
-    }
-    let pre = &m[..i];
-    let rest = &m[i..];
-    let quote = match rest.as_bytes().first() {
+    let pre = m.get(..i)?;
+    let rest = m.get(i..)?;
+    let (open, q) = match rest.as_bytes().first() {
         Some(b'"') => ("\"", b'"'),
         Some(b'\'') => ("'", b'\''),
         _ => {
-            return KvParts {
+            return Some(KvParts {
                 pre,
                 suffix,
                 open: "",
                 value: rest,
                 close: "",
-            };
+            })
         }
     };
-    let body = &rest[1..];
+    let body = rest.get(1..)?;
     // Content: any char but the quote, `\` or newline, or `\` + a non-newline
-    // char. Escapes are ASCII `\`, so stepping by bytes and skipping one whole
-    // char after `\` keeps us on char boundaries.
+    // char. Those three are ASCII, so scanning bytes for them only ever stops
+    // on a char boundary; after `\` the whole next char is skipped.
     let bb = body.as_bytes();
+    let mut end = body.len();
     let mut j = 0;
-    while j < bb.len() {
-        match bb[j] {
-            c if c == quote.1 => break,
-            b'\n' => break,
-            b'\\' => match body[j + 1..].chars().next() {
-                Some(c) if c != '\n' => j += 1 + c.len_utf8(),
-                _ => break,
-            },
-            _ => j += 1,
+    while let Some(&c) = bb.get(j) {
+        if c == q || c == b'\n' {
+            end = j;
+            break;
+        }
+        if c == b'\\' {
+            match body.get(j + 1..).and_then(|r| r.chars().next()) {
+                Some(e) if e != '\n' => j += 1 + e.len_utf8(),
+                _ => {
+                    end = j;
+                    break;
+                }
+            }
+        } else {
+            j += 1;
         }
     }
-    KvParts {
+    Some(KvParts {
         pre,
         suffix,
-        open: quote.0,
-        value: &body[..j],
-        close: &body[j..],
-    }
+        open,
+        value: body.get(..end)?,
+        close: body.get(end..)?,
+    })
+}
+
+/// Parts of a `kv` match: the fast splitter, or the regex's own capture
+/// groups when the splitter declines. `None` only if both fail.
+fn kv_parts(m: &str) -> Option<KvParts<'_>> {
+    split_kv(m).or_else(|| {
+        let c = patterns().kv.captures(m)?;
+        let g = |n: &str| c.name(n).map_or("", |x| x.as_str());
+        let (open, value, close) = if c.name("dq").is_some() {
+            ("\"", g("dq"), g("dqc"))
+        } else if c.name("sq").is_some() {
+            ("'", g("sq"), g("sqc"))
+        } else {
+            ("", g("bare"), "")
+        };
+        Some(KvParts {
+            pre: g("pre"),
+            suffix: g("suffix"),
+            open,
+            value,
+            close,
+        })
+    })
+}
+
+/// Digit value of an ASCII digit byte (other bytes give a value > 9, never a
+/// panic; callers only pass digits).
+fn digit(b: u8) -> u32 {
+    u32::from(b.wrapping_sub(b'0'))
 }
 
 /// True when the digits of `groups[i..=j]` (read right to left) pass Luhn.
@@ -422,15 +571,15 @@ fn window_luhn(bytes: &[u8], groups: &[(usize, usize)]) -> bool {
     let mut sum = 0u32;
     let mut idx = 0usize;
     for g in groups.iter().rev() {
-        for b in bytes[g.0..g.1].iter().rev() {
-            let mut d = u32::from(b - b'0');
+        for b in bytes.get(g.0..g.1).unwrap_or(&[]).iter().rev() {
+            let mut d = digit(*b);
             if idx % 2 == 1 {
                 d *= 2;
                 if d > 9 {
                     d -= 9;
                 }
             }
-            sum += d;
+            sum = sum.wrapping_add(d);
             idx += 1;
         }
     }
@@ -451,33 +600,40 @@ const CARD_SHAPES: &[&[usize]] = &[
 
 /// Plausible issuer prefix for a multi-group card (first four digits).
 fn iin_plausible(b: &[u8]) -> bool {
-    match b[0] {
+    let &[b0, b1, b2, b3, ..] = b else {
+        return false;
+    };
+    match b0 {
         b'4' | b'5' | b'6' => true,
         b'2' => {
-            let n = (u32::from(b[0] - b'0') * 1000)
-                + (u32::from(b[1] - b'0') * 100)
-                + (u32::from(b[2] - b'0') * 10)
-                + u32::from(b[3] - b'0');
+            let n = digit(b0) * 1000 + digit(b1) * 100 + digit(b2) * 10 + digit(b3);
             // Mir 2200-2204, Mastercard 2221-2720.
             (2200..=2204).contains(&n) || (2221..=2720).contains(&n)
         }
-        b'3' => matches!(b[1], b'0' | b'4'..=b'9'),
+        b'3' => matches!(b1, b'0' | b'4'..=b'9'),
         _ => false,
     }
 }
 
 fn window_shape_ok(bytes: &[u8], groups: &[(usize, usize)]) -> bool {
-    if groups.len() == 1 {
-        let len = groups[0].1 - groups[0].0;
-        return (13..=19).contains(&len) && (b'2'..=b'6').contains(&bytes[groups[0].0]);
-    }
-    let shape_ok = CARD_SHAPES
-        .iter()
-        .any(|s| s.len() == groups.len() && s.iter().zip(groups).all(|(l, g)| g.1 - g.0 == *l));
-    let sep = bytes[groups[1].0 - 1];
+    let (Some(first), Some(second)) = (groups.first(), groups.get(1)) else {
+        return groups.first().is_some_and(|g| {
+            (13..=19).contains(&(g.1.saturating_sub(g.0)))
+                && bytes.get(g.0).is_some_and(|b| (b'2'..=b'6').contains(b))
+        });
+    };
+    let shape_ok = CARD_SHAPES.iter().any(|s| {
+        s.len() == groups.len()
+            && s.iter()
+                .zip(groups)
+                .all(|(l, g)| g.1.saturating_sub(g.0) == *l)
+    });
+    let sep_before = |g: &(usize, usize)| g.0.checked_sub(1).and_then(|i| bytes.get(i));
+    let sep = sep_before(second);
     shape_ok
-        && groups[1..].iter().all(|g| bytes[g.0 - 1] == sep)
-        && iin_plausible(&bytes[groups[0].0..groups[0].0 + 4])
+        && sep.is_some()
+        && groups.iter().skip(1).all(|g| sep_before(g) == sep)
+        && iin_plausible(bytes.get(first.0..).unwrap_or(&[]))
 }
 
 /// Find card numbers inside a run of digit groups: a single group of 13-19
@@ -502,19 +658,18 @@ fn card_spans(run: &str, base: usize) -> Vec<(usize, usize)> {
 
     let mut spans = Vec::new();
     let mut i = 0;
-    while i < groups.len() {
-        let mut found = None;
+    while let Some(gi) = groups.get(i) {
         let last = (i + 4).min(groups.len() - 1);
-        for j in (i..=last).rev() {
-            let w = &groups[i..=j];
-            if window_shape_ok(bytes, w) && window_luhn(bytes, w) {
-                found = Some(j);
-                break;
-            }
-        }
+        let found = (i..=last)
+            .rev()
+            .find(|&j| {
+                let w = groups.get(i..=j).unwrap_or(&[]);
+                window_shape_ok(bytes, w) && window_luhn(bytes, w)
+            })
+            .and_then(|j| groups.get(j).map(|gj| (j, gj.1)));
         match found {
-            Some(j) => {
-                spans.push((base + groups[i].0, base + groups[j].1));
+            Some((j, end)) => {
+                spans.push((base + gi.0, base + end));
                 i = j + 1;
             }
             None => i += 1,
@@ -523,21 +678,21 @@ fn card_spans(run: &str, base: usize) -> Vec<(usize, usize)> {
     spans
 }
 
-fn redact_cards(text: &str, report: &mut RedactionReport) -> String {
+fn redact_cards(text: &str, report: &mut RedactionReport) -> Option<String> {
     let mut out = String::with_capacity(text.len());
     let mut last = 0;
     let mut n = 0;
     for m in patterns().card.find_iter(text) {
         for (s, e) in card_spans(m.as_str(), m.start()) {
-            out.push_str(&text[last..s]);
+            out.push_str(text.get(last..s)?);
             push_placeholder(&mut out, "card");
             last = e;
             n += 1;
         }
     }
-    out.push_str(&text[last..]);
+    out.push_str(text.get(last..)?);
     report.record("card", n);
-    out
+    Some(out)
 }
 
 /// True when `v` is exactly one placeholder, like `[REDACTED:card]`.
@@ -554,7 +709,8 @@ const DENY_GLUED: &[&str] = &["s", "izer", "ize", "ized", "izing", "ary", "hash"
 
 /// Delimited words after the keyword that mark a non-secret
 /// (`password_hash`, `token_budget`). Matched as a prefix of the suffix, so
-/// more `_word` parts may follow (`token_budget_total`, `password_min_length`).
+/// more `_word` parts may follow (`token_budget_total`, `password_min_length`),
+/// unless one of those words is in [`SECRET_WORDS`].
 const DENY_WORDS: &[&str] = &[
     "hash",
     "count",
@@ -591,6 +747,13 @@ const DENY_WORDS: &[&str] = &[
     "max",
 ];
 
+/// Words that make a suffix secret again even after a deny word
+/// (`TOKEN_HASH_SECRET`, `PASSWORD_FIELD_VALUE`, `TOKEN_URL_WITH_KEY`).
+const SECRET_WORDS: &[&str] = &[
+    "secret", "token", "password", "passwd", "pwd", "key", "value", "contents", "content", "data",
+    "salt",
+];
+
 /// ASCII case-insensitive equality that treats `-` and `_` as the same.
 fn word_eq(a: &[u8], b: &[u8]) -> bool {
     let norm = |c: u8| {
@@ -603,9 +766,39 @@ fn word_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| norm(*x) == norm(*y))
 }
 
+/// True when any word of `s` is in [`SECRET_WORDS`]. Words are split at `_`,
+/// `-` and camelCase boundaries (`hashSecret`, `IDValue`).
+fn has_secret_word(s: &[u8]) -> bool {
+    let is_secret = |w: &[u8]| {
+        SECRET_WORDS
+            .iter()
+            .any(|e| w.eq_ignore_ascii_case(e.as_bytes()))
+    };
+    let mut start = 0;
+    for i in 0..=s.len() {
+        let c = s.get(i).copied();
+        let sep = matches!(c, None | Some(b'_' | b'-'));
+        let prev = i.checked_sub(1).and_then(|p| s.get(p)).copied();
+        let next = s.get(i + 1).copied();
+        let camel = c.is_some_and(|c| c.is_ascii_uppercase())
+            && i > start
+            && (prev.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit())
+                || (prev.is_some_and(|p| p.is_ascii_uppercase())
+                    && next.is_some_and(|n| n.is_ascii_lowercase())));
+        if sep || camel {
+            if s.get(start..i).is_some_and(is_secret) {
+                return true;
+            }
+            start = if sep { i + 1 } else { i };
+        }
+    }
+    false
+}
+
 /// True when the suffix after a secret keyword marks a known non-secret:
-/// `suffix == entry` for [`DENY_GLUED`], or `suffix == "_" + entry` or
-/// `suffix.starts_with("_" + entry + "_")` for [`DENY_WORDS`] (`-` = `_`).
+/// `suffix == entry` for [`DENY_GLUED`], or, for [`DENY_WORDS`],
+/// `suffix == "_" + entry` or `suffix.starts_with("_" + entry + "_")`
+/// (`-` = `_`) with no [`SECRET_WORDS`] word anywhere in the suffix.
 /// No allocation.
 fn suffix_denied(suffix: &str) -> bool {
     let s = suffix.as_bytes();
@@ -615,12 +808,12 @@ fn suffix_denied(suffix: &str) -> bool {
     let Some(rest) = s.strip_prefix(b"_").or_else(|| s.strip_prefix(b"-")) else {
         return false;
     };
-    DENY_WORDS.iter().any(|e| {
+    let deny = DENY_WORDS.iter().any(|e| {
         let e = e.as_bytes();
-        rest.len() >= e.len()
-            && word_eq(&rest[..e.len()], e)
-            && (rest.len() == e.len() || matches!(rest[e.len()], b'_' | b'-'))
-    })
+        rest.get(..e.len()).is_some_and(|h| word_eq(h, e))
+            && matches!(rest.get(e.len()), None | Some(b'_' | b'-'))
+    });
+    deny && !has_secret_word(s)
 }
 
 fn bare_looks_like_code(v: &str) -> bool {
@@ -645,12 +838,14 @@ const MAX_PASSES: usize = 8;
 
 /// Runs passes until one changes nothing (a placeholder can create a new word
 /// boundary for a later pattern). If that does not happen within `max_passes`,
-/// fails closed with `[REDACTED:overflow]`.
+/// or a pass hits an internal guard, fails closed with `[REDACTED:overflow]`.
 fn redact_with_max_passes(input: &str, max_passes: usize) -> (Redacted, RedactionReport) {
     let mut report = RedactionReport::default();
     let mut text = input.to_string();
     for _ in 0..max_passes {
-        let next = redact_pass(&text, &mut report);
+        let Some(next) = redact_pass(&text, &mut report) else {
+            break;
+        };
         if next == text {
             return (Redacted(text), report);
         }
@@ -660,11 +855,11 @@ fn redact_with_max_passes(input: &str, max_passes: usize) -> (Redacted, Redactio
     (Redacted(placeholder("overflow")), report)
 }
 
-fn redact_pass(input: &str, report: &mut RedactionReport) -> String {
+fn redact_pass(input: &str, report: &mut RedactionReport) -> Option<String> {
     let p = patterns();
 
-    let s = replace_simple(input, &p.pem, "private_key", report);
-    let s = replace_simple(&s, &p.jwt, "jwt", report);
+    let s = replace_simple(input, &p.pem, "private_key", report)?;
+    let s = replace_simple(&s, &p.jwt, "jwt", report)?;
     // Every key starts with an ASCII letter and the boundary char `lb` never
     // is one, so a match that starts with anything else carries `lb` first.
     let s = rewrite_found(&s, &p.api_key, "api_key", report, |m, out| {
@@ -673,8 +868,8 @@ fn redact_pass(input: &str, report: &mut RedactionReport) -> String {
         }
         push_placeholder(out, "api_key");
         true
-    });
-    let s = replace_simple(&s, &p.bearer, "bearer", report);
+    })?;
+    let s = replace_simple(&s, &p.bearer, "bearer", report)?;
 
     let s = rewrite(&s, &p.basic, "bearer", report, |t, l, out| {
         let prefix = cap(t, l, 1);
@@ -684,9 +879,9 @@ fn redact_pass(input: &str, report: &mut RedactionReport) -> String {
         out.push_str(prefix);
         push_placeholder(out, "bearer");
         true
-    });
+    })?;
 
-    let s = redact_cards(&s, report);
+    let s = redact_cards(&s, report)?;
 
     // After cards: a card inside a URL password becomes a placeholder first,
     // so the second pass sees the same text and the result is idempotent.
@@ -698,10 +893,14 @@ fn redact_pass(input: &str, report: &mut RedactionReport) -> String {
         push_placeholder(out, "kv_secret");
         out.push('@');
         true
-    });
+    })?;
 
     rewrite_found(&s, &p.kv, "kv_secret", report, |m, out| {
-        let k = split_kv(m);
+        let Some(k) = kv_parts(m) else {
+            // Cannot happen (the regex matched `m`); fail closed anyway.
+            push_placeholder(out, "kv_secret");
+            return true;
+        };
         if suffix_denied(k.suffix) {
             return false;
         }
@@ -736,7 +935,7 @@ fn is_secret_key(key: &str, value: &Value) -> bool {
     let p = patterns();
     p.secret_key_name
         .captures(key)
-        .is_some_and(|c| !suffix_denied(&c["suffix"]))
+        .is_some_and(|c| !suffix_denied(c.name("suffix").map_or("", |m| m.as_str())))
         || p.word_key_name.is_match(key)
         || (matches!(value, Value::Array(_) | Value::Object(_)) && p.plural_key_name.is_match(key))
 }
@@ -826,6 +1025,12 @@ mod tests {
             "x y",
             "[REDACTED:kv_secret]",
             "🚀",
+            "\u{17F}",
+            "\u{212A}",
+            "\u{17F}ecret",
+            "to\u{212A}en",
+            "pa\u{17F}\u{17F}word",
+            "api_\u{212A}ey",
         ];
         let kv = &patterns().kv;
         let mut seed: u64 = 42;
@@ -854,7 +1059,7 @@ mod tests {
                     value,
                     close,
                 };
-                assert_eq!(split_kv(&c[0]), want, "{s:?}");
+                assert_eq!(split_kv(&c[0]), Some(want), "{s:?}");
                 checked += 1;
             }
         }
@@ -872,6 +1077,9 @@ mod tests {
             "_min_length",
             "_MAX",
             "_id",
+            "_ID",
+            "_file",
+            "_name_display",
         ] {
             assert!(suffix_denied(s), "{s}");
         }
@@ -885,6 +1093,13 @@ mod tests {
             "_value",
             "_budgets",
             "1",
+            "_hash_secret",
+            "_url_with_key",
+            "_field_value",
+            "_id_Value",
+            "_name_password",
+            "_min_dataSalt",
+            "_ref_myToken",
         ] {
             assert!(!suffix_denied(s), "{s}");
         }

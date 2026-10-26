@@ -658,11 +658,9 @@ fn adversarial_key_chain_with_digit_spam_is_linear() {
     s.push_str(&"5 4 ".repeat(250_000));
     let start = Instant::now();
     let (r, _) = redact(&s);
-    assert!(
-        start.elapsed() < Duration::from_secs(2),
-        "{:?}",
-        start.elapsed()
-    );
+    let t = start.elapsed();
+    eprintln!("AKIA chain + digit spam x {}: {t:?}", s.len());
+    assert!(t < Duration::from_secs(2), "{t:?}");
     assert!(!r.as_str().contains("AKIA"));
 }
 
@@ -979,4 +977,238 @@ fn many_short_kv_matches_are_fast() {
         assert_eq!(rep.count, 2_000_000 / unit.len());
         assert!(!r.as_str().contains("abcd") && !r.as_str().contains("\"x\""));
     }
+}
+
+fn no_panic(s: &str) -> String {
+    let r = std::panic::catch_unwind(|| redact(s).0.into_string());
+    match r {
+        Ok(o) => o,
+        Err(_) => panic!("redact panicked on a generated input (len {})", s.len()),
+    }
+}
+
+#[test]
+fn unicode_case_folded_keywords_do_not_panic_and_are_redacted() {
+    for (input, secret) in [
+        ("ſecret=hunter22", "hunter22"),
+        ("to\u{212A}en=hunter22", "hunter22"),
+        ("password\u{212A}=hunter22", "hunter22"),
+        ("tokenſ: hunter22", "hunter22"),
+        ("paſſword: \"x y\"", "x y"),
+        ("api_\u{212A}ey=abcd1234", "abcd1234"),
+        ("secret_\u{212A}=abcd1234", "abcd1234"),
+        ("ſecret=hunter22-REAL-SECRET-VALUE", "REAL-SECRET"),
+    ] {
+        let o = no_panic(input);
+        assert!(o.contains("[REDACTED:kv_secret]"), "{input} -> {o}");
+        assert!(!o.contains(secret), "{input} -> {o}");
+        assert_eq!(no_panic(&o), o);
+    }
+    let v = json!({"ſecret": "hunter22", "to\u{212A}en": 5, "paſſ": "x"});
+    let (r, _) = std::panic::catch_unwind(|| redact_json(&v)).expect("no panic");
+    let ph = "[REDACTED:kv_secret]";
+    assert_eq!(r, json!({"ſecret": ph, "to\u{212A}en": ph, "paſſ": ph}));
+}
+
+#[test]
+fn generated_unicode_corpus_never_panics() {
+    let frags = [
+        "password",
+        "PASSWD",
+        "pwd",
+        "secret",
+        "Token",
+        "api_key",
+        "api-key",
+        "apikey",
+        "access_key",
+        "private-key",
+        "credentials",
+        "auth",
+        "pass",
+        "passphrase",
+        "ſ",
+        "\u{212A}",
+        "\u{212B}",
+        "é",
+        "日本",
+        "🚀",
+        "\u{0301}",
+        "İ",
+        "ı",
+        "ß",
+        "=",
+        ":",
+        "\"",
+        "'",
+        "\\",
+        " ",
+        "\t",
+        "\n",
+        "_",
+        "-",
+        "s",
+        "k",
+        "sk-",
+        "sk_l\x69ve_",
+        "rk_t\x65st_",
+        "hf_",
+        "glpat-",
+        "xapp-",
+        "xoxb-",
+        "github_pat_",
+        "AKIA",
+        "ghp_",
+        "AIza",
+        "sk-ant-api03-",
+        "Bearer ",
+        "Basic ",
+        "://u:",
+        "@h",
+        "4111 1111",
+        "2200",
+        "[REDACTED:kv_secret]",
+        "[REDACTED:",
+        "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "-----BEGIN PRIVATE KEY-----",
+        "eyJa.b.c",
+        "{",
+        "}",
+    ];
+    let mut seed: u64 = 0xDEADBEEF;
+    let mut next = |m: usize| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as usize % m
+    };
+    for _ in 0..10_000 {
+        let mut s = String::new();
+        for _ in 0..12 {
+            s.push_str(frags[next(frags.len())]);
+        }
+        // A truncated copy at a random char boundary.
+        let cut = s
+            .char_indices()
+            .map(|(i, _)| i)
+            .nth(next(s.chars().count().max(1)))
+            .unwrap_or(0);
+        for t in [s.as_str(), &s[..cut], &s[cut..]] {
+            let once = no_panic(t);
+            assert_eq!(no_panic(&once), once, "{t:?}");
+            let v = json!({ t: t, "k": [t, {"password": t}] });
+            assert!(
+                std::panic::catch_unwind(|| redact_json(&v)).is_ok(),
+                "redact_json panicked (len {})",
+                t.len()
+            );
+        }
+    }
+}
+
+const COMPOUND_SECRET_NAMES: [&str; 16] = [
+    "TOKEN_HASH_SECRET",
+    "SECRET_NAME_PASSWORD",
+    "SECRET_FILE_PASSWORD",
+    "TOKEN_TYPE_SECRET",
+    "TOKEN_ENDPOINT_SECRET",
+    "TOKEN_PATH_SECRET",
+    "TOKEN_ID_SECRET",
+    "API_KEY_REF_SECRET",
+    "SECRET_REF_TOKEN",
+    "SECRET_VERSION_KEY",
+    "SECRET_MAX_KEY",
+    "TOKEN_URL_WITH_KEY",
+    "PASSWORD_FILE_CONTENTS",
+    "PASSWORD_FIELD_VALUE",
+    "SECRET_ID_VALUE",
+    "API_KEY_HEADER_VALUE",
+];
+
+const COMPOUND_PLAIN_NAMES: [&str; 22] = [
+    "API_KEY_ID",
+    "ACCESS_KEY_ID",
+    "PASSWORD_FILE",
+    "TOKEN_FILE",
+    "token_budget",
+    "password_field",
+    "token_endpoint",
+    "secret_arn",
+    "api_key_header",
+    "token_usage",
+    "secret_ref",
+    "password_strength",
+    "token_lifetime",
+    "secret_version",
+    "token_index",
+    "password_required",
+    "token_position",
+    "password_hash",
+    "max_tokens",
+    "token_count",
+    "tokenizer",
+    "secretary",
+];
+
+#[test]
+fn compound_names_with_a_secret_word_after_the_deny_word_are_redacted() {
+    let ph = "[REDACTED:kv_secret]";
+    for k in COMPOUND_SECRET_NAMES {
+        let lower = k.to_ascii_lowercase();
+        for name in [k.to_string(), lower] {
+            assert_eq!(out(&format!("{name}=Zx9qWm2Lp7Rt")), format!("{name}={ph}"));
+            assert_eq!(
+                out(&format!("{name}: \"Zx9qWm2Lp7Rt\"")),
+                format!("{name}: \"{ph}\"")
+            );
+            let (r, _) = redact_json(&json!({ name.as_str(): "Zx9qWm2Lp7Rt", "n": 1 }));
+            assert_eq!(r, json!({ name.as_str(): ph, "n": 1 }), "{name}");
+        }
+    }
+    // camelCase words count as delimited words too.
+    assert_eq!(
+        out("tokenHash_mySecret=Zx9qWm2Lp7Rt"),
+        format!("tokenHash_mySecret={ph}")
+    );
+    assert_eq!(
+        out("token_hashSecret=Zx9qWm2Lp7Rt"),
+        format!("token_hashSecret={ph}")
+    );
+}
+
+#[test]
+fn compound_names_without_a_secret_word_stay_plain() {
+    for k in COMPOUND_PLAIN_NAMES {
+        let s = format!("{k}=Zx9qWm2Lp7Rt");
+        assert_eq!(out(&s), s);
+        let v = json!({ k: "Zx9qWm2Lp7Rt", "n": 4096 });
+        let (r, _) = redact_json(&v);
+        assert_eq!(r, v, "{k}");
+        let v = json!({ k: 4096 });
+        assert_eq!(redact_json(&v).0, v, "{k}");
+    }
+}
+
+#[test]
+fn anthropic_prefix_needs_the_real_layout_mid_word() {
+    for s in [
+        "risk-ant-colony-optimization-algorithm-v2",
+        "task-ant-design-component-library",
+        "see risk-ant-colony-optimization-algorithm-v2 and fix/task-ant-design-component-library",
+    ] {
+        assert_eq!(out(s), s);
+    }
+    for k in [
+        "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv",
+        "sk-ant-admin01-AbCdEfGhIjKlMnOpQrStUv",
+    ] {
+        assert_eq!(out(&format!("xyz{k}")), "xyz[REDACTED:api_key]");
+        assert_eq!(out(&format!("key {k} end")), "key [REDACTED:api_key] end");
+    }
+    // Documented: `-` is a boundary, so a word that starts with `sk-` and runs
+    // 20+ chars after it is still redacted.
+    assert_eq!(
+        out("use-sk-learn-pipeline-configuration-v2"),
+        "use-[REDACTED:api_key]"
+    );
 }
