@@ -60,3 +60,36 @@ Residual risks (see the module docs in `crates/warden-core/src/snapshot.rs`):
   directories the agent created around it are left in place.
 - If `record_after` was never called for a snapshot, restore has no
   changed-since protection and overwrites whatever is on disk.
+
+## CLI PIN
+
+`warden init-pin` stores a random 16-byte salt and `sha256(salt || pin)` in
+`<home>/pin` (mode `0o600`; the data dir is created `0o700` if the CLI creates
+it). The PIN is compared in constant time and is never written to the audit
+log, stdout or stderr. Known weaknesses of this version:
+
+- **Offline guessing.** Salted sha256 is fast. Anyone who can read the `pin`
+  file can brute-force a short PIN offline in seconds. The 6-character
+  minimum does not change that. argon2 (or similar) was out of scope here.
+- **`--pin` is visible in process lists.** Command-line arguments can be read
+  by other local users (`ps`). Prefer the `WARDEN_PIN` environment variable.
+  If both are given, `--pin` wins.
+- **No attempt rate-limit.** Wrong PINs are audited as `refused: bad pin`, but
+  nothing slows or locks out repeated guesses.
+- **Approvals are flags, not signed approvals.** `--yes` and the PIN are
+  checked by the CLI process itself; the signed, single-use `Approver`
+  approvals from `warden-core` are not used yet. Anyone who can run `warden`
+  with the PIN can approve.
+
+Plan 2 wires the signed `Approver` into the CLI and moves the secret to
+keychain-backed storage.
+
+## CLI audit and execution
+
+Every command that writes (`run`, `undo`, `prune`, `init-pin`) opens the audit
+log first and refuses with exit code 1 if it cannot (including a broken hash
+chain), so nothing happens unaudited. `run` appends `approved` before taking
+the snapshot and acting, then `executed snapshot=<id>` or `failed: <reason>`.
+The audit summary names the kind and target only, never write content. The
+`write`/`delete` executor relies on the snapshot module's symlink checks; it
+inherits the same TOCTOU gap described under "Snapshots and restore".
