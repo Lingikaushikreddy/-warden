@@ -70,7 +70,9 @@ pub enum Command {
     /// Prefer the WARDEN_PIN environment variable over --pin: command-line
     /// arguments are visible to other users in process lists.
     Run {
-        /// Allowed root directory; write/delete outside it are refused.
+        /// Allowed root directory. write/delete of a path outside it, of a
+        /// symlink, or of a file with more than one hard link are refused
+        /// (a concurrent race remains; see docs/SECURITY-NOTES.md).
         #[arg(long, value_name = "DIR")]
         root: PathBuf,
         /// Approve a Yes or YesPin action.
@@ -114,9 +116,13 @@ pub enum Command {
     /// Set the PIN for YesPin actions (from the argument or WARDEN_PIN).
     InitPin {
         pin: Option<String>,
-        /// Replace an existing PIN.
+        /// Replace an existing PIN; needs the current PIN.
         #[arg(long)]
         force: bool,
+        /// The current PIN, required with --force when a PIN is set
+        /// (visible in process lists; prefer WARDEN_CURRENT_PIN).
+        #[arg(long, value_name = "PIN")]
+        current_pin: Option<String>,
     },
 }
 

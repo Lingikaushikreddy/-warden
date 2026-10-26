@@ -31,7 +31,9 @@ impl Env {
     }
     fn cmd(&self) -> Command {
         let mut c = Command::cargo_bin("warden").unwrap();
-        c.env_remove("WARDEN_PIN");
+        c.env_remove("WARDEN_PIN")
+            .env_remove("WARDEN_CURRENT_PIN")
+            .env_remove("WARDEN_TEST_FAIL_AUDIT_APPEND");
         c.arg("--home").arg(self.home());
         c
     }
@@ -372,7 +374,7 @@ fn init_pin_refuses_overwrite_without_force() {
     e.cmd().args(["init-pin", "another-pin"]).assert().code(2);
     assert_eq!(fs::read(e.home().join("pin")).unwrap(), before);
     e.cmd()
-        .args(["init-pin", "--force", "another-pin"])
+        .args(["init-pin", "--force", "--current-pin", PIN, "another-pin"])
         .assert()
         .success();
     assert_ne!(fs::read(e.home().join("pin")).unwrap(), before);
@@ -593,37 +595,6 @@ fn snapshot_id_of(out: &std::process::Output) -> Option<String> {
 }
 
 #[test]
-fn audit_failure_after_action_still_prints_snapshot_and_undo_works() {
-    let e = Env::new();
-    e.init_pin();
-    let f = e.file("a.txt");
-    fs::write(&f, "original").unwrap();
-    // Appends in `run write --yes`: 1 = approved, 2 = executed. Fail the 2nd.
-    let out = e
-        .cmd()
-        .env("WARDEN_TEST_FAIL_AUDIT_APPEND", "2")
-        .args(["run", "--root"])
-        .arg(e.root())
-        .args(["--yes", "write"])
-        .arg(&f)
-        .arg("changed")
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
-    assert_eq!(fs::read_to_string(&f).unwrap(), "changed");
-    let id = snapshot_id_of(&out).expect("snapshot id printed");
-    assert!(
-        stderr(&out).contains("audit append failed after the action"),
-        "{}",
-        stderr(&out)
-    );
-    assert!(stderr(&out).contains(&id));
-    let out = e.undo(&id, &[]);
-    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-    assert_eq!(fs::read_to_string(&f).unwrap(), "original");
-}
-
-#[test]
 fn action_failure_still_prints_snapshot_id() {
     let e = Env::new();
     e.init_pin();
@@ -705,12 +676,14 @@ fn undo_without_yes_exits_2_and_changes_nothing() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     assert_eq!(fs::read_to_string(&f).unwrap(), "v2");
-    let d = e.decisions();
-    assert_eq!(
-        d.last().map(String::as_str),
-        Some("refused: missing approval")
-    );
-    assert!(!d.iter().any(|x| x == "requested"));
+    let undo_decisions: Vec<String> = e
+        .audit_text()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|v| v["summary"].as_str().unwrap().starts_with("undo "))
+        .map(|v| v["decision"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(undo_decisions, vec!["refused: missing approval"]);
 }
 
 #[test]
@@ -848,4 +821,155 @@ fn write_through_symlink_exits_1_and_leaves_target() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+}
+
+#[test]
+fn init_pin_audits_requested_before_writing() {
+    let e = Env::new();
+    e.init_pin();
+    assert_eq!(e.decisions(), vec!["requested", "pin set"]);
+}
+
+#[test]
+fn prune_audits_snapshot_store_open_failure() {
+    let e = Env::new();
+    // A regular file where the snapshot store directory should be.
+    fs::write(e.home().join("snapshots"), "not a dir").unwrap();
+    let out = e.cmd().args(["prune", "--days", "30"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let d = e.decisions();
+    assert!(d.last().is_some_and(|x| x.starts_with("failed: ")), "{d:?}");
+}
+
+/// Run `delete <f>` with --yes and `pin`; return the exit code.
+fn delete_with_pin(e: &Env, f: &Path, pin: &str) -> Option<i32> {
+    e.cmd()
+        .args(["run", "--root"])
+        .arg(e.root())
+        .args(["--yes", "--pin", pin, "delete"])
+        .arg(f)
+        .output()
+        .unwrap()
+        .status
+        .code()
+}
+
+#[test]
+fn init_pin_force_without_current_pin_is_refused() {
+    let e = Env::new();
+    e.init_pin();
+    let before = fs::read(e.home().join("pin")).unwrap();
+    let out = e
+        .cmd()
+        .args(["init-pin", "--force", "another-pin"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(fs::read(e.home().join("pin")).unwrap(), before);
+    assert!(e
+        .decisions()
+        .last()
+        .is_some_and(|d| d.starts_with("refused: ")));
+    // The old PIN still works.
+    let f = e.file("a.txt");
+    fs::write(&f, "x").unwrap();
+    assert_eq!(delete_with_pin(&e, &f, PIN), Some(0));
+}
+
+#[test]
+fn init_pin_force_with_wrong_current_pin_is_refused_and_never_leaks() {
+    let e = Env::new();
+    e.init_pin();
+    let before = fs::read(e.home().join("pin")).unwrap();
+    let new_pin = "brand-new-pin-55";
+    let out = e
+        .cmd()
+        .env("WARDEN_CURRENT_PIN", WRONG_PIN)
+        .args(["init-pin", "--force", new_pin])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(fs::read(e.home().join("pin")).unwrap(), before);
+    assert_eq!(
+        e.decisions().last().map(String::as_str),
+        Some("refused: bad pin")
+    );
+    let all = format!("{}{}{}", e.audit_text(), stdout(&out), stderr(&out));
+    for secret in [PIN, WRONG_PIN, new_pin] {
+        assert!(!all.contains(secret), "leaked {secret}");
+    }
+    let f = e.file("a.txt");
+    fs::write(&f, "x").unwrap();
+    assert_eq!(delete_with_pin(&e, &f, new_pin), Some(2));
+    assert_eq!(delete_with_pin(&e, &f, PIN), Some(0));
+}
+
+#[test]
+fn init_pin_force_reads_current_pin_from_env() {
+    let e = Env::new();
+    e.init_pin();
+    e.cmd()
+        .env("WARDEN_CURRENT_PIN", PIN)
+        .args(["init-pin", "--force", "another-pin"])
+        .assert()
+        .success();
+    let f = e.file("a.txt");
+    fs::write(&f, "x").unwrap();
+    assert_eq!(delete_with_pin(&e, &f, "another-pin"), Some(0));
+}
+
+#[test]
+fn init_pin_force_with_no_existing_pin_is_plain_init() {
+    let e = Env::new();
+    e.cmd()
+        .args(["init-pin", "--force", PIN])
+        .assert()
+        .success();
+    let f = e.file("a.txt");
+    fs::write(&f, "x").unwrap();
+    assert_eq!(delete_with_pin(&e, &f, PIN), Some(0));
+}
+
+#[cfg(unix)]
+#[test]
+fn hard_linked_file_is_refused_for_write_and_delete() {
+    let e = Env::new();
+    e.init_pin();
+    let other = tempfile::tempdir().unwrap();
+    let outside = other.path().join("outside.txt");
+    fs::write(&outside, "outside content").unwrap();
+    let link = e.file("link.txt");
+    fs::hard_link(&outside, &link).unwrap();
+
+    let out = e
+        .cmd()
+        .args(["run", "--root"])
+        .arg(e.root())
+        .args(["--yes", "write"])
+        .arg(&link)
+        .arg("pwned")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "outside content");
+    assert_eq!(
+        e.decisions().last().map(String::as_str),
+        Some("refused: hard-linked file")
+    );
+
+    let out = e
+        .cmd()
+        .args(["run", "--root"])
+        .arg(e.root())
+        .args(["--yes", "--pin", PIN, "delete"])
+        .arg(&link)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(link.exists());
+    assert_eq!(
+        e.decisions().last().map(String::as_str),
+        Some("refused: hard-linked file")
+    );
+    assert!(!e.decisions().iter().any(|d| d == "approved"));
 }

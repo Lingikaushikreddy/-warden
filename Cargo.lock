@@ -686,6 +686,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "warden-cli",
  "warden-core",
 ]
 

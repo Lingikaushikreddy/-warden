@@ -10,6 +10,15 @@ description = "The warden command line: classify, run, undo, audit verify, prune
 name = "warden"
 path = "src/main.rs"
 
+[features]
+# Test-only fault injection (WARDEN_TEST_FAIL_AUDIT_APPEND). Off by default;
+# never enable it in a build that is shipped.
+test-hooks = []
+
+[[test]]
+name = "test_hooks"
+required-features = ["test-hooks"]
+
 [dependencies]
 warden-core = { path = "../warden-core" }
 clap = { version = "4", features = ["derive"] }
@@ -18,6 +27,9 @@ sha2 = "0.10"
 hex = "0.4"
 
 [dev-dependencies]
+# Self-reference so `cargo test` builds the binary with `test-hooks` on and
+# the `test_hooks` target runs without extra flags.
+warden-cli = { path = ".", features = ["test-hooks"] }
 assert_cmd = "2"
 tempfile = "3"
 serde_json = "1"

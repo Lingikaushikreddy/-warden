@@ -20,6 +20,7 @@ use warden_core::{
 };
 
 const PIN_ENV: &str = "WARDEN_PIN";
+const CURRENT_PIN_ENV: &str = "WARDEN_CURRENT_PIN";
 const NOT_EXECUTED: &str = "not executed (classify-only in this version)";
 
 /// Print a line to stdout, ignoring write errors (for example EPIPE), so a
@@ -37,22 +38,24 @@ macro_rules! err {
     }};
 }
 
-/// Test-only fault injection, compiled into debug builds only: when
-/// `WARDEN_TEST_FAIL_AUDIT_APPEND=<n>` is set, the n-th audit append of this
-/// process fails. It can only make a command fail, never let one through.
+/// Test-only fault injection, compiled in only with the `test-hooks` Cargo
+/// feature (off by default): when `WARDEN_TEST_FAIL_AUDIT_APPEND=<n>` is
+/// set, the n-th audit append of this process fails. It never lets a refused
+/// action through, but failing the append that follows an executed action
+/// leaves that action without its final audit record (an audit gap).
+#[cfg(feature = "test-hooks")]
 fn injected_append_failure() -> bool {
-    #[cfg(debug_assertions)]
-    {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static APPENDS: AtomicU64 = AtomicU64::new(0);
-        let n = APPENDS.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Some(k) = std::env::var("WARDEN_TEST_FAIL_AUDIT_APPEND")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            return n == k;
-        }
-    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static APPENDS: AtomicU64 = AtomicU64::new(0);
+    let n = APPENDS.fetch_add(1, Ordering::Relaxed) + 1;
+    std::env::var("WARDEN_TEST_FAIL_AUDIT_APPEND")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|k| n == k)
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn injected_append_failure() -> bool {
     false
 }
 
@@ -87,7 +90,11 @@ pub fn dispatch(cli: Cli) -> u8 {
             command: AuditCommand::Verify,
         } => cmd_audit_verify(&home),
         Command::Prune { days } => cmd_prune(&home, days),
-        Command::InitPin { pin, force } => cmd_init_pin(&home, pin, force),
+        Command::InitPin {
+            pin,
+            force,
+            current_pin,
+        } => cmd_init_pin(&home, pin, force, current_pin),
     }
 }
 
@@ -456,6 +463,14 @@ fn run_inner(
             );
             return Ok(EXIT_DENIED);
         }
+        if hard_linked(path) {
+            record("refused: hard-linked file")?;
+            err!(
+                "refused: {} has more than one hard link; writing or deleting it could change a file outside --root",
+                path.display()
+            );
+            return Ok(EXIT_DENIED);
+        }
     }
 
     // 4. Approved: audit before doing anything.
@@ -526,6 +541,21 @@ fn run_inner(
         return Ok(EXIT_ERROR);
     }
     Ok(code)
+}
+
+/// True if `path` is an existing regular file with more than one hard link.
+/// Opening such a file with `O_TRUNC` (write) or unlinking one name (delete)
+/// would act on an inode that may also be reachable from outside the root.
+#[cfg(unix)]
+fn hard_linked(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.nlink() > 1)
+}
+
+/// Link counts are not checked on this platform.
+#[cfg(not(unix))]
+fn hard_linked(_path: &Path) -> bool {
+    false
 }
 
 fn snapshot_err_label(e: &SnapshotError) -> String {
@@ -660,36 +690,41 @@ fn cmd_prune(home: &Path, days: u64) -> u8 {
     };
     let id = random_hex16();
     let sum = format!("prune --days {days}");
+    let mut record = |d: &str| audit(&mut log, &id, &sum, Tier::Auto, d);
+    // Audit before anything is deleted.
+    if let Err(c) = record("requested") {
+        return c;
+    }
     let store = match SnapshotStore::open(&home.join("snapshots")) {
         Ok(s) => s,
         Err(e) => {
+            let _ = record(&format!("failed: snapshot store {:?}", e.kind()));
             err!("error: cannot open snapshot store: {e}");
             return EXIT_ERROR;
         }
     };
     match store.prune(Duration::from_secs(secs)) {
         Ok(n) => {
-            if let Err(c) = audit(&mut log, &id, &sum, Tier::Auto, &format!("pruned {n}")) {
+            if let Err(c) = record(&format!("pruned {n}")) {
                 return c;
             }
             out!("pruned {n}");
             EXIT_OK
         }
         Err(e) => {
-            let _ = audit(
-                &mut log,
-                &id,
-                &sum,
-                Tier::Auto,
-                &format!("failed: {:?}", e.kind()),
-            );
+            let _ = record(&format!("failed: {:?}", e.kind()));
             err!("error: prune failed: {e}");
             EXIT_ERROR
         }
     }
 }
 
-fn cmd_init_pin(home: &Path, pin_arg: Option<String>, force: bool) -> u8 {
+fn cmd_init_pin(
+    home: &Path,
+    pin_arg: Option<String>,
+    force: bool,
+    current_flag: Option<String>,
+) -> u8 {
     let Some(pin) = pin_arg.or_else(|| std::env::var(PIN_ENV).ok()) else {
         err!("error: give the PIN as an argument or in {PIN_ENV}");
         return EXIT_DENIED;
@@ -699,7 +734,46 @@ fn cmd_init_pin(home: &Path, pin_arg: Option<String>, force: bool) -> u8 {
         Err(c) => return c,
     };
     let id = random_hex16();
-    let decision = match pin::set_pin(&home.join("pin"), &pin, force) {
+    let mut record = |d: &str| audit(&mut log, &id, "init-pin", Tier::Auto, d);
+    // Audit before the PIN file is touched.
+    if let Err(c) = record("requested") {
+        return c;
+    }
+    let pin_path = home.join("pin");
+    // Replacing an existing PIN requires the current one; with no PIN set,
+    // --force is unnecessary and this is a plain init.
+    if force && fs::symlink_metadata(&pin_path).is_ok() {
+        let refusal = match current_flag.or_else(|| std::env::var(CURRENT_PIN_ENV).ok()) {
+            None => Some((
+                EXIT_DENIED,
+                "refused: missing current pin",
+                format!("refused: replacing the PIN needs the current one; set {CURRENT_PIN_ENV} or pass --current-pin"),
+            )),
+            Some(cur) => match pin::check_pin(&pin_path, &cur) {
+                Ok(PinCheck::Match) => None,
+                Ok(PinCheck::Mismatch) => Some((
+                    EXIT_DENIED,
+                    "refused: bad pin",
+                    "refused: wrong current PIN".to_owned(),
+                )),
+                // Removed between the existence check and the read.
+                Ok(PinCheck::NotSet) => None,
+                Err(e) => Some((
+                    EXIT_ERROR,
+                    "failed: pin file unreadable",
+                    format!("error: cannot read PIN file {}: {e}", pin_path.display()),
+                )),
+            },
+        };
+        if let Some((code, decision, msg)) = refusal {
+            if let Err(c) = record(decision) {
+                return c;
+            }
+            err!("{msg}");
+            return code;
+        }
+    }
+    let decision = match pin::set_pin(&pin_path, &pin, force) {
         Ok(()) => {
             out!("pin set");
             Ok("pin set")
@@ -712,7 +786,7 @@ fn cmd_init_pin(home: &Path, pin_arg: Option<String>, force: bool) -> u8 {
             Err((EXIT_DENIED, "refused: pin too short"))
         }
         Err(SetPinError::Exists) => {
-            err!("error: a PIN is already set; pass --force to replace it");
+            err!("error: a PIN is already set; pass --force and the current PIN to replace it");
             Err((EXIT_DENIED, "refused: pin exists"))
         }
         Err(SetPinError::Io(e)) => {
@@ -724,7 +798,7 @@ fn cmd_init_pin(home: &Path, pin_arg: Option<String>, force: bool) -> u8 {
         Ok(d) => (EXIT_OK, d),
         Err((c, d)) => (c, d),
     };
-    match audit(&mut log, &id, "init-pin", Tier::Auto, d) {
+    match record(d) {
         Ok(()) => code,
         Err(c) => c,
     }
