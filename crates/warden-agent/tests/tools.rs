@@ -389,7 +389,6 @@ fn bad_max_bytes_values_are_bad_args() {
         json!(-1),
         json!(1.5),
         json!("10"),
-        json!(null),
         json!(u64::MAX as f64 * 4.0),
     ] {
         assert!(
@@ -430,4 +429,51 @@ fn tool_name_variants_are_unknown() {
             "{n:?}"
         );
     }
+}
+
+// ---- task 6 ride-along ----
+
+#[test]
+fn hangul_filler_u115f_is_rejected() {
+    assert!(path_err("/root/a\u{115f}b"));
+}
+
+#[test]
+fn hangul_filler_u1160_is_rejected() {
+    assert!(path_err("/root/a\u{1160}b"));
+}
+
+#[test]
+fn hangul_filler_u3164_is_rejected() {
+    assert!(path_err("/root/a\u{3164}b"));
+}
+
+#[test]
+fn halfwidth_hangul_filler_uffa0_is_rejected() {
+    assert!(path_err("/root/a\u{ffa0}b"));
+}
+
+#[test]
+fn braille_blank_u2800_is_rejected() {
+    assert!(path_err("/root/a\u{2800}b"));
+}
+
+#[test]
+fn explicit_null_max_bytes_means_default() {
+    let t = parse("read_file", json!({"path": "/root/a", "max_bytes": null})).unwrap();
+    assert!(matches!(t, Tool::ReadFile { max_bytes, .. } if max_bytes == DEFAULT_READ_BYTES));
+}
+
+#[test]
+fn absent_max_bytes_means_default() {
+    let t = parse("read_file", json!({"path": "/root/a"})).unwrap();
+    assert!(matches!(t, Tool::ReadFile { max_bytes, .. } if max_bytes == DEFAULT_READ_BYTES));
+}
+
+#[test]
+fn read_file_array_args_with_number_are_bad_args() {
+    assert!(matches!(
+        parse("read_file", json!(["/root/a", 5])),
+        Err(ToolError::BadArgs(_))
+    ));
 }

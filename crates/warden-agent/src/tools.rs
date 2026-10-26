@@ -111,8 +111,16 @@ fn parse_args<T: serde::de::DeserializeOwned>(call: &ToolCall) -> Result<T, Tool
     serde_json::from_value(call.args.clone()).map_err(|_| bad(&call.name))
 }
 
-/// Characters that could make a displayed path misleading: controls, and
-/// Unicode format, bidi and invisible characters.
+/// Characters that could make a displayed path misleading: controls,
+/// Unicode format, bidi and invisible characters, and blank-looking fillers
+/// (Hangul fillers U+115F, U+1160, U+3164, U+FFA0 and the braille blank
+/// U+2800).
+///
+/// This is deliberately strict: legitimate file names that contain ZWNJ or
+/// ZWJ (U+200C, U+200D; used in some scripts and in emoji sequences), LRM or
+/// RLM (U+200E, U+200F) or a soft hyphen (U+00AD) are rejected on purpose,
+/// because the same characters can make two different paths look identical
+/// in an approval prompt.
 fn is_forbidden_path_char(c: char) -> bool {
     c.is_control()
         || matches!(c,
@@ -122,6 +130,8 @@ fn is_forbidden_path_char(c: char) -> bool {
             | '\u{202A}'..='\u{202E}'
             | '\u{2060}'..='\u{206F}'
             | '\u{FEFF}'
+            | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}'
+            | '\u{2800}'
             | '\u{FFF9}'..='\u{FFFB}'
             | '\u{E0000}'..='\u{E007F}')
 }
@@ -145,11 +155,8 @@ pub fn parse_call(call: &ToolCall, cwd: &Path) -> Result<Tool, ToolError> {
             })
         }
         "read_file" => {
+            // An explicit JSON null deserializes to None: same as absent.
             let a: ReadArgs = parse_args(call)?;
-            // Explicit null is refused rather than treated as "absent".
-            if call.args.get("max_bytes").is_some_and(Value::is_null) {
-                return Err(bad("read_file"));
-            }
             let max_bytes = match a.max_bytes {
                 None => DEFAULT_READ_BYTES,
                 Some(0) => return Err(bad("read_file")),
