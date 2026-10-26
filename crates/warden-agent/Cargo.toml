@@ -6,8 +6,27 @@ rust-version.workspace = true
 license.workspace = true
 description = "Agent engine for Warden: redaction of secrets before anything leaves the machine"
 
+[features]
+# Test-only accessors on ApproverStore (last_approval_for_test and friends).
+# Off by default; never enable it in a build that is shipped.
+test-hooks = []
+
+[[test]]
+name = "authorize"
+required-features = ["test-hooks"]
+
 [dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 warden-core = { path = "../warden-core" }
+
+[dev-dependencies]
+# Self-reference so `cargo test` builds with `test-hooks` on and the
+# `authorize` target runs without extra flags.
+warden-agent = { path = ".", features = ["test-hooks"] }
+hex = "0.4"
+tempfile = "3"

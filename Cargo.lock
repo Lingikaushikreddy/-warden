@@ -711,9 +711,15 @@ dependencies = [
 name = "warden-agent"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "rand",
  "regex",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
+ "warden-agent",
  "warden-core",
 ]
 
