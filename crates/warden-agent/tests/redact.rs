@@ -426,6 +426,15 @@ fn idempotent_on_generated_mixtures() {
         "[REDACTED:kv_secret]",
         "dXNlcjpwYXNzd29yZA==",
         "Authorization: ",
+        "risk-assessment-for-the-quarter",
+        "task",
+        "-management-system-configuration",
+        "network_test_connectivitycheckall",
+        "AKIAIOSFODNN7EXAMPLE",
+        "sk-proj1234567890abcdefghijKLMN",
+        "(",
+        "token_budget: ",
+        "2200 1234 5678 9019",
     ];
     let mut seed: u64 = 0x9E3779B97F4A7C15;
     for _ in 0..20_000 {
@@ -716,7 +725,10 @@ fn expected_cards(nums: &[String]) -> usize {
         let b = d.as_bytes();
         match b[0] {
             b'4' | b'5' | b'6' => true,
-            b'2' => (2221..=2720).contains(&d[..4].parse::<u32>().unwrap()),
+            b'2' => {
+                let n = d[..4].parse::<u32>().unwrap();
+                (2200..=2204).contains(&n) || (2221..=2720).contains(&n)
+            }
             b'3' => matches!(b[1], b'0' | b'4'..=b'9'),
             _ => false,
         }
@@ -780,4 +792,191 @@ fn generated_number_rows_only_redact_real_luhn_valid_windows() {
     assert_eq!(total_expected, total_actual);
     // Roughly one Luhn pass in ten per four-digit window: a handful, not thousands.
     assert!(total_actual < 4000, "{total_actual}");
+}
+
+const KEBAB_NAMES: [&str; 12] = [
+    "risk-assessment-for-the-quarter",
+    "disk-usage-monitoring-dashboard.md",
+    "task-management-system-configuration",
+    "desk-reservation-service-handler",
+    "mask-sensitive-fields-in-logs",
+    "ask-for-approval-before-executing",
+    "git checkout fix/task-queue-deadlock-on-shutdown",
+    "docs/risk-register-template-2026.md",
+    "kiosk-mode-browser-launcher",
+    "network_test_connectivitycheckall",
+    "benchmark_test_serializationspeed",
+    "whisk_live_streamingdashboardconfigv2",
+];
+
+#[test]
+fn kebab_and_snake_names_are_not_mangled() {
+    for s in KEBAB_NAMES {
+        assert_eq!(out(s), s);
+        let quoted = format!("open \"{s}\" now");
+        assert_eq!(out(&quoted), quoted);
+    }
+}
+
+#[test]
+fn generated_sk_word_grid_is_not_mangled() {
+    let words = [
+        "risk", "disk", "task", "desk", "mask", "ask", "kiosk", "whisk", "flask", "dusk", "husk",
+        "tusk",
+    ];
+    let tails = [
+        "-assessment-for-the-quarter",
+        "-usage-monitoring-dashboard",
+        "-management-system-configuration",
+        "-reservation-service-handler-v2",
+        "-sensitive-fields-in-the-logs",
+        "-queue-deadlock-on-shutdown-fix",
+        "-register-template-2026-final",
+        "_test_connectivitycheckallnodes",
+    ];
+    let mut n = 0;
+    for w in words {
+        for t in tails {
+            let s = format!("see {w}{t} and branch fix/{w}{t}");
+            assert_eq!(out(&s), s);
+            n += 1;
+        }
+    }
+    assert_eq!(n, 96);
+}
+
+#[test]
+fn bounded_prefix_keys_after_delimiters_are_redacted() {
+    let keys = [
+        "sk-proj1234567890abcdefghijKLMN",
+        "sk_l\x69ve_4eC39HqLyjWDarjtT1zdp7dc",
+        "rk_t\x65st_4eC39HqLyjWDarjtT1zdp7dc",
+        "hf_abcdefghijklmnopqrstuvwxyzABCDEF",
+        "glpat-abcdefghij0123456789",
+        "xapp-1-A024BE91L1V-1234567890123-abcdef",
+        "xoxb-123456789012-abcdefghijkl",
+        "github_pat_11ABCDEFG0123456789abcd_efghij",
+    ];
+    for k in keys {
+        for (pre, post) in [
+            ("", ""),
+            (" ", ""),
+            ("\"", "\""),
+            ("x=", ""),
+            ("(", ")"),
+            ("a\n", ""),
+            ("'", "'"),
+            ("é ", ""),
+        ] {
+            let s = format!("{pre}{k}{post}");
+            let o = out(&s);
+            assert_eq!(o, format!("{pre}[REDACTED:api_key]{post}"), "{s:?}");
+        }
+    }
+    // Distinctive or fixed-length prefixes stay boundary-free.
+    for k in [
+        "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+        "AKIAIOSFODNN7EXAMPLE",
+        "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+        "AIzaSyA-1234567890abcdefghijklmnopqrstu",
+    ] {
+        assert_eq!(out(&format!("xyz{k}")), "xyz[REDACTED:api_key]", "{k}");
+    }
+}
+
+#[test]
+fn mixed_key_chains_are_fully_redacted() {
+    let sk = "sk-proj1234567890abcdefghijKLMN";
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    for s in [
+        format!("{aws}{sk}"),
+        format!("{aws}{sk}{aws}{sk}"),
+        format!("x {aws}{aws}{aws}{sk}"),
+        format!("{}{sk}", aws.repeat(200)),
+    ] {
+        let (r, _) = redact(&s);
+        assert!(!r.as_str().contains("AKIA"), "{s}");
+        assert!(!r.as_str().contains("sk-"), "{s} -> {r}");
+        assert!(!r.as_str().contains("overflow"), "{s} -> {r}");
+        assert_eq!(out(r.as_str()), r.as_str());
+    }
+}
+
+#[test]
+fn compound_non_secret_suffixes_are_left_alone() {
+    for s in [
+        "token_budget: 4096",
+        "password_field: input_pw",
+        "token_endpoint: https://auth.example.com/oauth/token",
+        "secret_arn: arn:aws:secretsmanager:us-east-1:123:secret:x",
+        "api_key_header: X-Api-Key",
+        "token_usage: 123456",
+        "secret_ref: vault-main",
+        "password_strength: strong",
+        "token_lifetime: 3600s",
+        "secret_version: v12345",
+        "token_index: 12345",
+        "password_required: false",
+        "token_position: 12345",
+        "password_min_length: 12345",
+        "password_max_length: 12345",
+        "token_budget_total: 4096",
+        "token_count_total: 12345",
+    ] {
+        assert_eq!(out(s), s);
+    }
+    let v = json!({"password_min_length":12,"token_budget":4096,"password_required":true,
+                   "token_usage":{"prompt":5}});
+    let (r, rep) = redact_json(&v);
+    assert_eq!(r, v);
+    assert_eq!(rep.count, 0);
+}
+
+#[test]
+fn compound_suffixes_do_not_hide_real_secrets() {
+    for k in [
+        "JWT_SECRET",
+        "SECRET_KEY_BASE",
+        "DATABASE_PASSWORD_PROD",
+        "TOKEN_PROD",
+        "OPENAI_API_KEY_2",
+        "password1",
+        "SECRET_TOKEN_VALUE",
+        "PASSWORD_SALT",
+        "secret_value",
+        "api_key_secret",
+        "SECRET_KEY_FILE",
+    ] {
+        assert_eq!(
+            out(&format!("{k}=abcd1234")),
+            format!("{k}=[REDACTED:kv_secret]")
+        );
+        let (r, _) = redact_json(&json!({ k: 4096 }));
+        assert_eq!(r, json!({ k: "[REDACTED:kv_secret]" }), "{k}");
+    }
+}
+
+#[test]
+fn mir_cards_are_redacted() {
+    for s in [
+        "2200 1234 5678 9019",
+        "2200-1234-5678-9019",
+        "2204 1234 5678 9015",
+    ] {
+        assert_eq!(out(&format!("n {s} x")), "n [REDACTED:card] x", "{s}");
+    }
+}
+
+#[test]
+fn many_short_kv_matches_are_fast() {
+    for unit in ["pwd:\"x\" ", "token=abcd "] {
+        let s = unit.repeat(2_000_000 / unit.len());
+        let start = Instant::now();
+        let (r, rep) = redact(&s);
+        let t = start.elapsed();
+        eprintln!("kv run {unit:?} x {}: {t:?}", s.len());
+        assert!(t < Duration::from_secs(2), "{unit:?}: {t:?}");
+        assert_eq!(rep.count, 2_000_000 / unit.len());
+        assert!(!r.as_str().contains("abcd") && !r.as_str().contains("\"x\""));
+    }
 }

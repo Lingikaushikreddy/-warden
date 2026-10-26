@@ -11,8 +11,14 @@
 //!
 //! Redaction is pattern-based, tuned for bounded recall with few false
 //! positives. It does not catch:
-//! - secret formats it has no pattern for, or auth-header values without a
-//!   scheme (`X-Api-Auth: abcd1234` with no `Bearer`/`Basic`);
+//! - secret formats it has no pattern for, or bare auth-header values
+//!   without a scheme (`X-Api-Auth: abcd1234` with no `Bearer`/`Basic`);
+//! - secret names without one of the keywords in text: `ENCRYPTION_KEY=`,
+//!   `MASTER_KEY=`, `SIGNING_KEY=`, `DB_PASS=` (`pass` is a secret key only
+//!   in JSON);
+//! - plural secret names in text (`SECRETS=...`, `API_KEYS=...`): the glued
+//!   `s` suffix is on the deny list because `tokens`/`secrets` collections
+//!   and counts are common;
 //! - secrets that were base64- or otherwise obfuscated;
 //! - secrets split across tokens or lines (for example a key broken by a
 //!   newline), or an unquoted value with spaces (`password: correct horse`
@@ -22,9 +28,11 @@
 //! - card numbers embedded in a longer digit run (a 25-digit order number).
 //!   A spaced or hyphenated card must have a real shape (4-4-4-4, 4-4-4-4-3,
 //!   4-6-5, 4-6-4, 4-4-4-3, one separator kind throughout) and a plausible
-//!   issuer prefix (4, 51-59, 2221-2720, 30/34-39, 6x); an unspaced one is 13-19
-//!   digits starting 2-6. All need a valid Luhn checksum. Other layouts, such
-//!   as `4111-111111-111111`, are not caught;
+//!   issuer prefix (4; any 5x, which covers Mastercard 51-55 and Maestro
+//!   50/56-58; Mir 2200-2204; Mastercard 2221-2720; 30/34-39; any 6x); an
+//!   unspaced one is 13-19 digits starting 2-6. All need a valid Luhn
+//!   checksum. Other layouts are not caught: `4111-111111-111111`, a spaced
+//!   13-digit Visa as 4-4-4-1, and mixed separators (`4111 1111-1111 1111`);
 //! - bare numbers under a secret key in text (`password = 1234 5678` redacts
 //!   only the first group; valid card numbers are caught by the card rule).
 //!
@@ -33,12 +41,19 @@
 //! identifier (`token = request.headers["x"]`, `self.token = token`,
 //! `const token: string = ...`, `pub token: String`). A secret keyword may
 //! carry any identifier prefix and any suffix (`DB_PASSWORD`,
-//! `SECRET_KEY_BASE`, `OPENAI_API_KEY_2`, `password1`), except a short deny
-//! list of known non-secrets: `s`, `izer`/`ize`/`ized`/`izing`, `ary`,
-//! `_hash`, `_count`, `_path`, `_file`, `_id(s)`, `_type`, `_length`, `_len`,
-//! `_limit`, `_expiry`, `_confirmation`, `_policy`, `_ttl`, `_url`, `_name`
-//! (so `tokens`, `tokenizer`, `secretary`, `password_hash`, `token_count`,
-//! `max_tokens` are left alone; `tokens_used: 12345` is not). To keep source
+//! `SECRET_KEY_BASE`, `OPENAI_API_KEY_2`, `password1`), except a deny list
+//! of known non-secrets. Glued suffixes match exactly: `s`,
+//! `izer`/`ize`/`ized`/`izing`, `ary`, `hash`, `count` (so `tokens`,
+//! `tokenizer`, `secretary` are left alone; `tokens_used: 12345` is not).
+//! Delimited words match as a prefix, so more `_word` parts may follow:
+//! `_hash`, `_count`, `_path`, `_file`, `_id(s)`, `_type`, `_length`,
+//! `_len`, `_limit`, `_expiry`, `_confirmation`, `_policy`, `_ttl`, `_url`,
+//! `_name`, `_budget`, `_usage`, `_lifetime`, `_endpoint`, `_arn`,
+//! `_header`, `_ref`, `_version`, `_strength`, `_required`, `_position`,
+//! `_index`, `_field`, `_min(_length)`, `_max(_length)` (so `token_budget`,
+//! `token_budget_total`, `password_min_length`, `api_key_header` are left
+//! alone, while `SECRET_KEY_FILE`, `secret_value`, `PASSWORD_SALT` are
+//! secret: the deny word must come right after the keyword). To keep source
 //! code intact, unquoted values that start with `& ( { [ : =`, end with `(`
 //! or `)`, or are shorter than 4 characters are left alone.
 //! In JSON the same keyword/deny-list rule applies to keys; plural keys
@@ -50,10 +65,17 @@
 //! `Basic <x>` outside an `Authorization:` header is redacted only when `x`
 //! is 12+ base64 characters containing a digit or `+/=`.
 //!
-//! Fixed-prefix tokens (`AKIA`, `ASIA`, `sk-`, `sk_live_`, `ghp_`, `github_pat_`,
-//! `glpat-`, `hf_`, `xox?-`, `xapp-`, `AIza`) are matched anywhere, even in the
-//! middle of a word, so chains of keys are caught in one pass; this can
-//! over-redact ordinary text such as `risk-assessment-for-the-quarter`.
+//! Token prefixes: fixed-length or distinctive ones (`AKIA`, `ASIA`,
+//! `gh[pousr]_`, `AIza`, `sk-ant-`) match anywhere, even mid-word, so chains
+//! of keys are caught. The variable-length ones that also occur inside
+//! ordinary words (`sk-`, `sk_/rk_live_/test_`, `hf_`, `glpat-`, `xapp-`,
+//! `xox?-`, `github_pat_`) need a left boundary: start of text or a char that
+//! is not a letter or digit (`_`, `-`, quotes, `=`, `(` all count), so
+//! `risk-assessment-for-the-quarter` and `network_test_connectivitycheck`
+//! are left alone. A bounded key glued to an unbounded one
+//! (`AKIA...EXAMPLEsk-...`) is caught on the next pass, after the first
+//! key's placeholder gives it a boundary. A word that itself starts with
+//! `sk-` and runs 20+ chars (`sk-learn-...`) is still over-redacted.
 //!
 //! Fail closed: `redact` repeats its passes until the text stops changing
 //! (a placeholder can create a new boundary for a later pattern). If it has
@@ -67,7 +89,7 @@
 //! let _ = warden_agent::redact::Redacted("x".to_string());
 //! ```
 
-use regex::{Captures, Regex};
+use regex::{CaptureLocations, Regex};
 use serde_json::{Map, Value};
 use std::fmt;
 use std::sync::OnceLock;
@@ -158,17 +180,27 @@ fn patterns() -> &'static Patterns {
         )
         .unwrap(),
         jwt: Regex::new(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap(),
+        // Variable-length prefixes that also occur inside ordinary words
+        // (`risk-assessment`, `network_test_...`) need a left boundary: start
+        // of text or a char that is not a letter or digit. It is consumed as
+        // group `lb` (the regex crate has no look-behind) and written back.
+        // Fixed-length or distinctive prefixes match anywhere, so key chains
+        // are caught; a bounded key glued to one of them is caught on the next
+        // fixpoint pass, once the placeholder's `]` precedes it.
         api_key: Regex::new(concat!(
+            r"(?P<lb>^|[^\p{L}\p{N}])(?:",
             r"sk-[A-Za-z0-9_-]{20,}",
-            r"|gh[pousr]_[A-Za-z0-9]{36}",
-            r"|github_pat_[A-Za-z0-9_]{22,}",
-            r"|xox[abprs]-[A-Za-z0-9-]{10,}",
-            r"|xapp-[A-Za-z0-9-]{10,}",
-            r"|(?:AKIA|ASIA)[0-9A-Z]{16}",
-            r"|AIza[0-9A-Za-z_-]{35}",
             r"|[sr]k_(?:live|test)_[A-Za-z0-9]{16,}",
             r"|hf_[A-Za-z0-9]{30,}",
             r"|glpat-[A-Za-z0-9_-]{20,}",
+            r"|xapp-[A-Za-z0-9-]{10,}",
+            r"|xox[abprs]-[A-Za-z0-9-]{10,}",
+            r"|github_pat_[A-Za-z0-9_]{22,}",
+            r")",
+            r"|sk-ant-[A-Za-z0-9_-]{17,}",
+            r"|gh[pousr]_[A-Za-z0-9]{36}",
+            r"|(?:AKIA|ASIA)[0-9A-Z]{16}",
+            r"|AIza[0-9A-Za-z_-]{35}",
         ))
         .unwrap(),
         url_userinfo: Regex::new(
@@ -196,19 +228,192 @@ fn patterns() -> &'static Patterns {
     })
 }
 
+fn push_placeholder(out: &mut String, kind: &str) {
+    out.push_str(PLACEHOLDER_PREFIX);
+    out.push_str(kind);
+    out.push(']');
+}
+
+/// Span text of capture group `i`, or "" when it did not participate.
+fn cap<'t>(text: &'t str, locs: &CaptureLocations, i: usize) -> &'t str {
+    locs.get(i).map_or("", |(s, e)| &text[s..e])
+}
+
+/// Walks every match of `re` with one reused capture buffer and one output
+/// buffer (no allocation per match). `f` gets the text and the match's
+/// capture locations, appends a replacement to `out` and returns true, or
+/// returns false (writing nothing) to keep the match as is.
+fn rewrite(
+    text: &str,
+    re: &Regex,
+    kind: &'static str,
+    report: &mut RedactionReport,
+    mut f: impl FnMut(&str, &CaptureLocations, &mut String) -> bool,
+) -> String {
+    let mut locs = re.capture_locations();
+    let mut out = String::with_capacity(text.len() + text.len() / 8);
+    let (mut last, mut at, mut n) = (0, 0, 0);
+    while at <= text.len() {
+        let Some(m) = re.captures_read_at(&mut locs, text, at) else {
+            break;
+        };
+        out.push_str(&text[last..m.start()]);
+        if f(text, &locs, &mut out) {
+            n += 1;
+        } else {
+            out.push_str(m.as_str());
+        }
+        last = m.end();
+        at = if m.is_empty() {
+            // No pattern here matches empty; step one char to stay safe.
+            m.end() + text[m.end()..].chars().next().map_or(1, char::len_utf8)
+        } else {
+            m.end()
+        };
+    }
+    out.push_str(&text[last..]);
+    report.record(kind, n);
+    out
+}
+
+/// Like [`rewrite`], but `f` gets only the matched text. Uses `find` (no
+/// capture engine), which is several times cheaper per match; used for the
+/// patterns that can match very often (api keys, key/value pairs).
+fn rewrite_found(
+    text: &str,
+    re: &Regex,
+    kind: &'static str,
+    report: &mut RedactionReport,
+    mut f: impl FnMut(&str, &mut String) -> bool,
+) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 8);
+    let (mut last, mut n) = (0, 0);
+    for m in re.find_iter(text) {
+        out.push_str(&text[last..m.start()]);
+        if f(m.as_str(), &mut out) {
+            n += 1;
+        } else {
+            out.push_str(m.as_str());
+        }
+        last = m.end();
+    }
+    out.push_str(&text[last..]);
+    report.record(kind, n);
+    out
+}
+
 fn replace_simple(
     text: &str,
     re: &Regex,
     kind: &'static str,
     report: &mut RedactionReport,
 ) -> String {
-    let mut n = 0;
-    let out = re.replace_all(text, |_: &Captures| {
-        n += 1;
-        placeholder(kind)
-    });
-    report.record(kind, n);
-    out.into_owned()
+    rewrite_found(text, re, kind, report, |_, out| {
+        push_placeholder(out, kind);
+        true
+    })
+}
+
+/// The keyword alternatives of [`KEYWORDS`], expanded, in the regex's
+/// preference order (`credentials` before `credential`).
+const KEYWORD_FORMS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "api_key",
+    "api-key",
+    "apikey",
+    "access_key",
+    "access-key",
+    "accesskey",
+    "private_key",
+    "private-key",
+    "privatekey",
+    "credentials",
+    "credential",
+];
+
+/// The parts of one `kv` match, split without the capture engine.
+#[derive(Debug, PartialEq, Eq)]
+struct KvParts<'a> {
+    /// Keyword, suffix, optional quote, separator and blanks.
+    pre: &'a str,
+    suffix: &'a str,
+    /// `"`, `'` or "" (bare value).
+    open: &'static str,
+    value: &'a str,
+    /// The closing quote when present, else "".
+    close: &'a str,
+}
+
+/// Splits text matched by `patterns().kv` into its parts. This mirrors the
+/// regex exactly (checked against the capture groups in a unit test): the
+/// keyword is the first form in [`KEYWORD_FORMS`] that prefixes the match,
+/// the suffix is the following run of `[A-Za-z0-9_-]`, then an optional
+/// quote, blanks, `=` or `:`, blanks, and the value. A quoted value runs to
+/// the first unescaped quote or the end of the match.
+fn split_kv(m: &str) -> KvParts<'_> {
+    let b = m.as_bytes();
+    let kw = KEYWORD_FORMS
+        .iter()
+        .find(|k| b.len() >= k.len() && b[..k.len()].eq_ignore_ascii_case(k.as_bytes()))
+        .map_or(0, |k| k.len());
+    let mut i = kw;
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'-') {
+        i += 1;
+    }
+    let suffix = &m[kw..i];
+    if i < b.len() && (b[i] == b'"' || b[i] == b'\'') {
+        i += 1;
+    }
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    i += 1; // the `=` or `:`
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    let pre = &m[..i];
+    let rest = &m[i..];
+    let quote = match rest.as_bytes().first() {
+        Some(b'"') => ("\"", b'"'),
+        Some(b'\'') => ("'", b'\''),
+        _ => {
+            return KvParts {
+                pre,
+                suffix,
+                open: "",
+                value: rest,
+                close: "",
+            };
+        }
+    };
+    let body = &rest[1..];
+    // Content: any char but the quote, `\` or newline, or `\` + a non-newline
+    // char. Escapes are ASCII `\`, so stepping by bytes and skipping one whole
+    // char after `\` keeps us on char boundaries.
+    let bb = body.as_bytes();
+    let mut j = 0;
+    while j < bb.len() {
+        match bb[j] {
+            c if c == quote.1 => break,
+            b'\n' => break,
+            b'\\' => match body[j + 1..].chars().next() {
+                Some(c) if c != '\n' => j += 1 + c.len_utf8(),
+                _ => break,
+            },
+            _ => j += 1,
+        }
+    }
+    KvParts {
+        pre,
+        suffix,
+        open: quote.0,
+        value: &body[..j],
+        close: &body[j..],
+    }
 }
 
 /// True when the digits of `groups[i..=j]` (read right to left) pass Luhn.
@@ -253,7 +458,8 @@ fn iin_plausible(b: &[u8]) -> bool {
                 + (u32::from(b[1] - b'0') * 100)
                 + (u32::from(b[2] - b'0') * 10)
                 + u32::from(b[3] - b'0');
-            (2221..=2720).contains(&n)
+            // Mir 2200-2204, Mastercard 2221-2720.
+            (2200..=2204).contains(&n) || (2221..=2720).contains(&n)
         }
         b'3' => matches!(b[1], b'0' | b'4'..=b'9'),
         _ => false,
@@ -324,7 +530,7 @@ fn redact_cards(text: &str, report: &mut RedactionReport) -> String {
     for m in patterns().card.find_iter(text) {
         for (s, e) in card_spans(m.as_str(), m.start()) {
             out.push_str(&text[last..s]);
-            out.push_str(&placeholder("card"));
+            push_placeholder(&mut out, "card");
             last = e;
             n += 1;
         }
@@ -341,36 +547,80 @@ fn is_placeholder(v: &str) -> bool {
         .is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
 }
 
-/// Suffixes after a secret keyword that mark a known non-secret
-/// (`tokens`, `tokenizer`, `password_hash`, `token_count`, ...).
+/// Whole suffixes glued to the keyword that mark a non-secret (`tokens`,
+/// `tokenizer`, `secretary`, `passwordhash`). Matched exactly: `tokens_used`
+/// is still treated as a secret name.
+const DENY_GLUED: &[&str] = &["s", "izer", "ize", "ized", "izing", "ary", "hash", "count"];
+
+/// Delimited words after the keyword that mark a non-secret
+/// (`password_hash`, `token_budget`). Matched as a prefix of the suffix, so
+/// more `_word` parts may follow (`token_budget_total`, `password_min_length`).
+const DENY_WORDS: &[&str] = &[
+    "hash",
+    "count",
+    "path",
+    "file",
+    "id",
+    "ids",
+    "type",
+    "length",
+    "len",
+    "limit",
+    "expiry",
+    "confirmation",
+    "policy",
+    "ttl",
+    "url",
+    "name",
+    "budget",
+    "usage",
+    "lifetime",
+    "endpoint",
+    "arn",
+    "header",
+    "ref",
+    "version",
+    "strength",
+    "required",
+    "position",
+    "index",
+    "field",
+    "min_length",
+    "max_length",
+    "min",
+    "max",
+];
+
+/// ASCII case-insensitive equality that treats `-` and `_` as the same.
+fn word_eq(a: &[u8], b: &[u8]) -> bool {
+    let norm = |c: u8| {
+        if c == b'-' {
+            b'_'
+        } else {
+            c.to_ascii_lowercase()
+        }
+    };
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| norm(*x) == norm(*y))
+}
+
+/// True when the suffix after a secret keyword marks a known non-secret:
+/// `suffix == entry` for [`DENY_GLUED`], or `suffix == "_" + entry` or
+/// `suffix.starts_with("_" + entry + "_")` for [`DENY_WORDS`] (`-` = `_`).
+/// No allocation.
 fn suffix_denied(suffix: &str) -> bool {
-    let l = suffix.to_ascii_lowercase().replace('-', "_");
-    matches!(
-        l.as_str(),
-        "s" | "izer"
-            | "ize"
-            | "ized"
-            | "izing"
-            | "ary"
-            | "_hash"
-            | "hash"
-            | "_count"
-            | "count"
-            | "_path"
-            | "_file"
-            | "_id"
-            | "_ids"
-            | "_type"
-            | "_length"
-            | "_len"
-            | "_limit"
-            | "_expiry"
-            | "_confirmation"
-            | "_policy"
-            | "_ttl"
-            | "_url"
-            | "_name"
-    )
+    let s = suffix.as_bytes();
+    if DENY_GLUED.iter().any(|e| word_eq(s, e.as_bytes())) {
+        return true;
+    }
+    let Some(rest) = s.strip_prefix(b"_").or_else(|| s.strip_prefix(b"-")) else {
+        return false;
+    };
+    DENY_WORDS.iter().any(|e| {
+        let e = e.as_bytes();
+        rest.len() >= e.len()
+            && word_eq(&rest[..e.len()], e)
+            && (rest.len() == e.len() || matches!(rest[e.len()], b'_' | b'-'))
+    })
 }
 
 fn bare_looks_like_code(v: &str) -> bool {
@@ -415,72 +665,60 @@ fn redact_pass(input: &str, report: &mut RedactionReport) -> String {
 
     let s = replace_simple(input, &p.pem, "private_key", report);
     let s = replace_simple(&s, &p.jwt, "jwt", report);
-    let s = replace_simple(&s, &p.api_key, "api_key", report);
+    // Every key starts with an ASCII letter and the boundary char `lb` never
+    // is one, so a match that starts with anything else carries `lb` first.
+    let s = rewrite_found(&s, &p.api_key, "api_key", report, |m, out| {
+        if let Some(c) = m.chars().next().filter(|c| !c.is_ascii_alphabetic()) {
+            out.push(c);
+        }
+        push_placeholder(out, "api_key");
+        true
+    });
     let s = replace_simple(&s, &p.bearer, "bearer", report);
 
-    let mut n = 0;
-    let s = p
-        .basic
-        .replace_all(&s, |c: &Captures| {
-            let prefix = c.get(1).map_or("", |m| m.as_str());
-            if !prefix.is_empty() || looks_like_base64_credential(&c[2]) {
-                n += 1;
-                format!("{prefix}{}", placeholder("bearer"))
-            } else {
-                c[0].to_string()
-            }
-        })
-        .into_owned();
-    report.record("bearer", n);
+    let s = rewrite(&s, &p.basic, "bearer", report, |t, l, out| {
+        let prefix = cap(t, l, 1);
+        if prefix.is_empty() && !looks_like_base64_credential(cap(t, l, 2)) {
+            return false;
+        }
+        out.push_str(prefix);
+        push_placeholder(out, "bearer");
+        true
+    });
 
     let s = redact_cards(&s, report);
 
     // After cards: a card inside a URL password becomes a placeholder first,
     // so the second pass sees the same text and the result is idempotent.
-    let mut n = 0;
-    let s = p
-        .url_userinfo
-        .replace_all(&s, |c: &Captures| {
-            if is_placeholder(&c[2]) {
-                c[0].to_string()
-            } else {
-                n += 1;
-                format!("{}{}@", &c[1], placeholder("kv_secret"))
-            }
-        })
-        .into_owned();
-    report.record("kv_secret", n);
+    let s = rewrite(&s, &p.url_userinfo, "kv_secret", report, |t, l, out| {
+        if is_placeholder(cap(t, l, 2)) {
+            return false;
+        }
+        out.push_str(cap(t, l, 1));
+        push_placeholder(out, "kv_secret");
+        out.push('@');
+        true
+    });
 
-    let mut n = 0;
-    let s =
-        p.kv.replace_all(&s, |c: &Captures| {
-            if suffix_denied(&c["suffix"]) {
-                return c[0].to_string();
-            }
-            let pre = &c["pre"];
-            let (open, value, close) = if let Some(v) = c.name("dq") {
-                ("\"", v.as_str(), c.name("dqc").map_or("", |m| m.as_str()))
-            } else if let Some(v) = c.name("sq") {
-                ("'", v.as_str(), c.name("sqc").map_or("", |m| m.as_str()))
-            } else {
-                ("", &c["bare"], "")
-            };
-            let skip = value.is_empty()
-                || is_placeholder(value)
-                || (open.is_empty()
-                    && !value.contains(PLACEHOLDER_PREFIX)
-                    && bare_looks_like_code(value));
-            if skip {
-                c[0].to_string()
-            } else {
-                n += 1;
-                format!("{pre}{open}{}{close}", placeholder("kv_secret"))
-            }
-        })
-        .into_owned();
-    report.record("kv_secret", n);
-
-    s
+    rewrite_found(&s, &p.kv, "kv_secret", report, |m, out| {
+        let k = split_kv(m);
+        if suffix_denied(k.suffix) {
+            return false;
+        }
+        let skip = k.value.is_empty()
+            || is_placeholder(k.value)
+            || (k.open.is_empty()
+                && !k.value.contains(PLACEHOLDER_PREFIX)
+                && bare_looks_like_code(k.value));
+        if skip {
+            return false;
+        }
+        out.push_str(k.pre);
+        out.push_str(k.open);
+        push_placeholder(out, "kv_secret");
+        out.push_str(k.close);
+        true
+    })
 }
 
 /// Redact every string value and every object key, recursively. Under a
@@ -549,5 +787,106 @@ mod tests {
         // With one more pass it converges normally.
         let (r, _) = redact_with_max_passes("key AKIAIOSFODNN7EXAMPLE", 2);
         assert_eq!(r.as_str(), "key [REDACTED:api_key]");
+    }
+
+    /// `split_kv` must agree with the regex's own capture groups.
+    #[test]
+    fn split_kv_matches_regex_captures() {
+        let frags = [
+            "password",
+            "PASSWD",
+            "pwd",
+            "Secret",
+            "token",
+            "api_key",
+            "Api-Key",
+            "apikey",
+            "access_key",
+            "privatekey",
+            "credentials",
+            "credential",
+            "_x",
+            "s",
+            "-2",
+            "\"",
+            "'",
+            " ",
+            "\t",
+            "=",
+            ":",
+            "\\",
+            "\\\"",
+            "\\'",
+            "é",
+            "日本",
+            "\n",
+            "abc",
+            ",",
+            ";",
+            "x y",
+            "[REDACTED:kv_secret]",
+            "🚀",
+        ];
+        let kv = &patterns().kv;
+        let mut seed: u64 = 42;
+        let mut checked = 0;
+        for _ in 0..20_000 {
+            let mut s = String::new();
+            for _ in 0..10 {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                s.push_str(frags[(seed >> 33) as usize % frags.len()]);
+            }
+            for c in kv.captures_iter(&s) {
+                let g = |n: &str| c.name(n).map_or("", |m| m.as_str());
+                let (open, value, close) = if c.name("dq").is_some() {
+                    ("\"", g("dq"), g("dqc"))
+                } else if c.name("sq").is_some() {
+                    ("'", g("sq"), g("sqc"))
+                } else {
+                    ("", g("bare"), "")
+                };
+                let want = KvParts {
+                    pre: g("pre"),
+                    suffix: g("suffix"),
+                    open,
+                    value,
+                    close,
+                };
+                assert_eq!(split_kv(&c[0]), want, "{s:?}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 3_000, "{checked}");
+    }
+
+    #[test]
+    fn suffix_deny_list_rules() {
+        for s in [
+            "s",
+            "IZER",
+            "_budget",
+            "-budget",
+            "_budget_total",
+            "_min_length",
+            "_MAX",
+            "_id",
+        ] {
+            assert!(suffix_denied(s), "{s}");
+        }
+        for s in [
+            "",
+            "_2",
+            "_prod",
+            "s_used",
+            "_key_file",
+            "_identity",
+            "_value",
+            "_budgets",
+            "1",
+        ] {
+            assert!(!suffix_denied(s), "{s}");
+        }
     }
 }
