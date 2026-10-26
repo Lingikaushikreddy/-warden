@@ -14,29 +14,49 @@ check belongs to the executor.
 
 ## Approvals: expiry and persisted nonces
 
-`Approver::redeem(action, cfg, approval)` computes the required tier itself
-with `classify(action, cfg)`; callers cannot pass a tier. A caller holding a
-stale or lower view of an action therefore cannot downgrade it: a `YesPin`
-action is never redeemed with a `Yes` approval, and a `Blocked` action is
-refused whatever the approval says. Check order: `Blocked` → action hash →
-signature → tier floor → nonce insert. The caller must pass the same
+`Approver::redeem(action, cfg, approval, now_ms)` computes the required tier
+itself with `classify(action, cfg)`; callers cannot pass a tier. A caller
+holding a stale or lower view of an action therefore cannot downgrade it: a
+`YesPin` action is never redeemed with a `Yes` approval, and a `Blocked` action
+is refused whatever the approval says. Check order: `Blocked` → action hash →
+signature (`verify_strict`) → expiry → tier floor → nonce insert. The nonce is
+inserted last, so a failed redeem never burns it. The caller must pass the same
 `PolicyConfig` the executor will act under.
 
-`Approver` keeps its spent-nonce set in memory only, and an `Approval` is valid
-for as long as the key that signed it. `Approver::from_signing_key` starts with
-an empty spent set, so reloading a key after a restart lets every approval that
-key ever signed be redeemed again (cross-restart replay).
+**Expiry.** The signed message uses the v2 domain:
 
-Open items for Plan 2:
+```text
+b"warden/approval/v2\0" || action_hash (32) || tier byte (1)
+    || issued_at_ms (u64 BE) || expires_at_ms (u64 BE) || nonce (16)
+```
 
-- Approvals carry no expiry or epoch. Add one to the signed message (for
-  example an issued-at time plus a TTL, or a key epoch) so old approvals stop
-  verifying.
-- The spent-nonce set must be persisted together with the signing key, and
-  loaded before any redeem, so a restart cannot reset it.
+`Approver::grant(action, tier, issued_at_ms, ttl_ms)` sets
+`expires_at_ms = issued_at_ms + ttl_ms` and refuses (`BadTtl`) a TTL of 0,
+above `MAX_TTL_MS` (600 000 ms, 10 minutes), or one that overflows. `redeem`
+returns `Expired` when `now_ms >= expires_at_ms`; a `now_ms` earlier than
+`issued_at_ms` is accepted (clock skew). Both times are inside the signature,
+so changing either is `BadSignature`. v1 approvals do not verify under v2.
+`warden-core` does not read the clock: the caller supplies milliseconds since
+the Unix epoch, and a caller that passes a wrong `now_ms` defeats expiry.
+
+**Persisted nonces.** `Approver::spent()` exports the spent-nonce set (sorted,
+so output is deterministic) and `Approver::from_signing_key_with_spent(key,
+spent)` restores it. `warden-core` itself does not write the set anywhere;
+persisting it next to the signing key, and loading it before any redeem, is
+done by the agent crate (Plan 2, Task 5). `Approver::from_signing_key` still
+starts with an empty set: reloading a key that way lets an already redeemed,
+unexpired approval be redeemed once more, so the replay window after a restart
+is bounded by `MAX_TTL_MS` but is not zero.
+
+Remaining items:
+
 - The spent-nonce set grows with every legitimate redemption (rejected
-  approvals never add to it). With an expiry in place, nonces older than the
-  expiry window can be pruned.
+  approvals never add to it). Nonces whose approvals have expired could be
+  pruned, but `spent()` exports bare nonces without their expiry, so pruning
+  needs the persisting caller to track expiry alongside them.
+- **The standalone CLI still uses flags.** `warden run`/`undo` approve with
+  `--yes` and the PIN (see "CLI PIN"); they do not create or redeem signed
+  approvals. Signed approvals are used by the agent engine only.
 
 ## Snapshots and restore
 
@@ -97,8 +117,9 @@ log, stdout or stderr. Known weaknesses of this version:
   approvals from `warden-core` are not used yet. Anyone who can run `warden`
   with the PIN can approve.
 
-Plan 2 wires the signed `Approver` into the CLI and moves the secret to
-keychain-backed storage.
+The standalone CLI commands keep these flags; signed approvals are used by
+the agent engine (see "Approvals: expiry and persisted nonces"). Moving the
+secret to keychain-backed storage is still open.
 
 ## CLI audit and execution
 
