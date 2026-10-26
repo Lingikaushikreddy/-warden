@@ -1,0 +1,11 @@
+[package]
+name = "warden-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Agent engine for Warden: redaction of secrets before anything leaves the machine"
+
+[dependencies]
+regex = "1"
+serde_json = "1"
