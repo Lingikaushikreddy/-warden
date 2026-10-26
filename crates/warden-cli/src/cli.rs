@@ -83,11 +83,20 @@ pub enum Command {
         args: Vec<OsString>,
     },
     /// Restore the files recorded in a snapshot.
+    ///
+    /// Restore can overwrite and delete files, so undo is a YesPin action:
+    /// it needs --yes and the PIN (prefer WARDEN_PIN over --pin).
     Undo {
         snapshot_id: String,
         /// The root the snapshot was taken under.
         #[arg(long, value_name = "DIR")]
         root: PathBuf,
+        /// Approve the restore.
+        #[arg(long)]
+        yes: bool,
+        /// PIN (visible in process lists; prefer WARDEN_PIN).
+        #[arg(long, value_name = "PIN")]
+        pin: Option<String>,
         /// Restore even if files changed since the action.
         #[arg(long)]
         force: bool,

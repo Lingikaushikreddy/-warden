@@ -53,6 +53,16 @@ impl Env {
     fn init_pin(&self) {
         self.cmd().args(["init-pin", PIN]).assert().success();
     }
+    /// `warden undo <id> --root <root> --yes --pin PIN` plus `extra`.
+    fn undo(&self, id: &str, extra: &[&str]) -> std::process::Output {
+        self.cmd()
+            .args(["undo", id, "--root"])
+            .arg(self.root())
+            .args(["--yes", "--pin", PIN])
+            .args(extra)
+            .output()
+            .unwrap()
+    }
 }
 
 fn stdout(o: &std::process::Output) -> String {
@@ -186,12 +196,7 @@ fn delete_with_pin_snapshots_then_undo_restores() {
     assert_eq!(d[n - 2], "approved");
     assert_eq!(d[n - 1], format!("executed snapshot={id}"));
 
-    let out = e
-        .cmd()
-        .args(["undo", &id, "--root"])
-        .arg(e.root())
-        .output()
-        .unwrap();
+    let out = e.undo(&id, &[]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(fs::read_to_string(&f).unwrap(), "precious");
     e.cmd().args(["audit", "verify"]).assert().success();
@@ -426,6 +431,7 @@ fn pin_file_is_0600_and_new_home_is_0700() {
 #[test]
 fn undo_with_wrong_root_is_refused() {
     let e = Env::new();
+    e.init_pin();
     let f = e.file("a.txt");
     fs::write(&f, "v1").unwrap();
     let out = e
@@ -447,14 +453,12 @@ fn undo_with_wrong_root_is_refused() {
     e.cmd()
         .args(["undo", &id, "--root"])
         .arg(other.path())
+        .args(["--yes", "--pin", PIN])
         .assert()
         .code(2);
     assert_eq!(fs::read_to_string(&f).unwrap(), "v2");
-    e.cmd()
-        .args(["undo", &id, "--root"])
-        .arg(e.root())
-        .assert()
-        .success();
+    let out = e.undo(&id, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(fs::read_to_string(&f).unwrap(), "v1");
 }
 
@@ -591,6 +595,7 @@ fn snapshot_id_of(out: &std::process::Output) -> Option<String> {
 #[test]
 fn audit_failure_after_action_still_prints_snapshot_and_undo_works() {
     let e = Env::new();
+    e.init_pin();
     let f = e.file("a.txt");
     fs::write(&f, "original").unwrap();
     // Appends in `run write --yes`: 1 = approved, 2 = executed. Fail the 2nd.
@@ -613,11 +618,8 @@ fn audit_failure_after_action_still_prints_snapshot_and_undo_works() {
         stderr(&out)
     );
     assert!(stderr(&out).contains(&id));
-    e.cmd()
-        .args(["undo", &id, "--root"])
-        .arg(e.root())
-        .assert()
-        .success();
+    let out = e.undo(&id, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(fs::read_to_string(&f).unwrap(), "original");
 }
 
@@ -645,6 +647,7 @@ fn action_failure_still_prints_snapshot_id() {
 #[test]
 fn undo_is_audited_as_requested() {
     let e = Env::new();
+    e.init_pin();
     let f = e.file("a.txt");
     fs::write(&f, "v1").unwrap();
     let out = e
@@ -657,16 +660,134 @@ fn undo_is_audited_as_requested() {
         .output()
         .unwrap();
     let id = snapshot_id_of(&out).unwrap();
-    e.cmd()
-        .args(["undo", &id, "--root"])
-        .arg(e.root())
-        .assert()
-        .success();
+    let out = e.undo(&id, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let d = e.decisions();
     assert_eq!(
         &d[d.len() - 2..],
         &["requested".to_owned(), "restored files=1".to_owned()]
     );
+    // Undo is audited at tier YesPin.
+    let last: serde_json::Value =
+        serde_json::from_str(e.audit_text().lines().last().unwrap()).unwrap();
+    assert_eq!(last["tier"], "YesPin");
+}
+
+/// Run `write <name> v2` over an existing `v1` file with approval; return the
+/// snapshot id.
+fn write_v2(e: &Env, name: &str) -> (PathBuf, String) {
+    let f = e.file(name);
+    fs::write(&f, "v1").unwrap();
+    let out = e
+        .cmd()
+        .args(["run", "--root"])
+        .arg(e.root())
+        .args(["--yes", "write"])
+        .arg(&f)
+        .arg("v2")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    (f, snapshot_id_of(&out).unwrap())
+}
+
+#[test]
+fn undo_without_yes_exits_2_and_changes_nothing() {
+    let e = Env::new();
+    e.init_pin();
+    let (f, id) = write_v2(&e, "a.txt");
+    let out = e
+        .cmd()
+        .args(["undo", &id, "--root"])
+        .arg(e.root())
+        .args(["--pin", PIN])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&f).unwrap(), "v2");
+    let d = e.decisions();
+    assert_eq!(
+        d.last().map(String::as_str),
+        Some("refused: missing approval")
+    );
+    assert!(!d.iter().any(|x| x == "requested"));
+}
+
+#[test]
+fn undo_without_pin_exits_2() {
+    let e = Env::new();
+    e.init_pin();
+    let (f, id) = write_v2(&e, "a.txt");
+    let out = e
+        .cmd()
+        .args(["undo", &id, "--root"])
+        .arg(e.root())
+        .arg("--yes")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&f).unwrap(), "v2");
+    assert_eq!(
+        e.decisions().last().map(String::as_str),
+        Some("refused: missing approval")
+    );
+}
+
+#[test]
+fn undo_with_no_pin_set_fails_closed() {
+    let e = Env::new();
+    let (f, id) = write_v2(&e, "a.txt");
+    let out = e.undo(&id, &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("init-pin"), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&f).unwrap(), "v2");
+    assert_eq!(
+        e.decisions().last().map(String::as_str),
+        Some("refused: no pin set")
+    );
+}
+
+#[test]
+fn undo_with_wrong_pin_exits_2_and_never_leaks_pin() {
+    let e = Env::new();
+    e.init_pin();
+    let (f, id) = write_v2(&e, "a.txt");
+    let out = e
+        .cmd()
+        .args(["undo", &id, "--root"])
+        .arg(e.root())
+        .args(["--yes", "--pin", WRONG_PIN])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&f).unwrap(), "v2");
+    assert_eq!(
+        e.decisions().last().map(String::as_str),
+        Some("refused: bad pin")
+    );
+    let all = format!("{}{}{}", e.audit_text(), stdout(&out), stderr(&out));
+    for secret in [PIN, WRONG_PIN] {
+        assert!(!all.contains(secret), "leaked {secret}");
+    }
+}
+
+#[test]
+fn undo_refuses_if_changed_since_unless_force() {
+    let e = Env::new();
+    e.init_pin();
+    let (f, id) = write_v2(&e, "a.txt");
+    fs::write(&f, "edited later").unwrap();
+    let out = e.undo(&id, &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("--force"), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&f).unwrap(), "edited later");
+    assert_eq!(
+        e.decisions().last().map(String::as_str),
+        Some("refused: changed since snapshot")
+    );
+    let out = e.undo(&id, &["--force"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&f).unwrap(), "v1");
 }
 
 #[test]

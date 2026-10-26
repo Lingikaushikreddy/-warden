@@ -91,8 +91,11 @@ Every command that writes (`run`, `undo`, `prune`, `init-pin`) opens the audit
 log first and refuses with exit code 1 if it cannot (including a broken hash
 chain), so nothing happens unaudited. `run` appends `approved` before taking
 the snapshot and acting, then `executed snapshot=<id>` or `failed: <reason>`.
-The audit summary names the kind and target only, never write content. `undo` needs no `--yes` in this version; it is audited as `requested` and
-then its outcome. Once a write/delete has been attempted, `run` prints
+The audit summary names the kind and target only, never write content.
+`undo` is treated as a `YesPin` action, because restore can overwrite and
+delete files: it needs `--yes` and the PIN (same `--pin` / `WARDEN_PIN` rules
+and fail-closed behaviour as `run`, exit 2 on refusal). It is audited at tier
+`YesPin` as `refused: <reason>`, or `requested` and then its outcome. Once a write/delete has been attempted, `run` prints
 `snapshot <id>` before the final audit append, so the id is never lost; if
 that append fails, it warns and exits 1, and the change can still be undone.
 Debug builds honour `WARDEN_TEST_FAIL_AUDIT_APPEND=<n>` (fail the n-th

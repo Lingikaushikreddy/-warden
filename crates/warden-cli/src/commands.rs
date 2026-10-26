@@ -79,8 +79,10 @@ pub fn dispatch(cli: Cli) -> u8 {
         Command::Undo {
             snapshot_id,
             root,
+            yes,
+            pin,
             force,
-        } => cmd_undo(&home, &snapshot_id, &root, force),
+        } => cmd_undo(&home, &snapshot_id, &root, yes, pin, force),
         Command::Audit {
             command: AuditCommand::Verify,
         } => cmd_audit_verify(&home),
@@ -187,6 +189,61 @@ fn audit(
             err!("error: cannot append to audit log: {e}");
             EXIT_ERROR
         })
+}
+
+/// Check `--yes` and, for `YesPin`, the PIN (flag, else `WARDEN_PIN`).
+///
+/// Outer `Err` is an audit-append failure; inner `Err(code)` is a refusal
+/// that has been audited and reported. Fails closed when no PIN is set.
+fn check_approval(
+    home: &Path,
+    tier: Tier,
+    yes: bool,
+    pin_flag: Option<String>,
+    sum: &str,
+    record: &mut dyn FnMut(&str) -> Result<(), u8>,
+) -> Result<Result<(), u8>, u8> {
+    if tier >= Tier::Yes && !yes {
+        record("refused: missing approval")?;
+        err!("refused: `{sum}` needs approval (tier {tier:?}); pass --yes");
+        return Ok(Err(EXIT_DENIED));
+    }
+    if tier != Tier::YesPin {
+        return Ok(Ok(()));
+    }
+    let pin_path = home.join("pin");
+    let supplied = pin_flag.or_else(|| std::env::var(PIN_ENV).ok());
+    let check = match supplied {
+        None if fs::symlink_metadata(&pin_path).is_err() => PinCheck::NotSet,
+        None => {
+            record("refused: missing approval")?;
+            err!(
+                "refused: `{sum}` needs --yes and a PIN (tier YesPin); set {PIN_ENV} or pass --pin"
+            );
+            return Ok(Err(EXIT_DENIED));
+        }
+        Some(p) => match pin::check_pin(&pin_path, &p) {
+            Ok(c) => c,
+            Err(e) => {
+                record("failed: pin file unreadable")?;
+                err!("error: cannot read PIN file {}: {e}", pin_path.display());
+                return Ok(Err(EXIT_ERROR));
+            }
+        },
+    };
+    match check {
+        PinCheck::Match => Ok(Ok(())),
+        PinCheck::NotSet => {
+            record("refused: no pin set")?;
+            err!("refused: `{sum}` needs a PIN (tier YesPin) but none is set; run `warden init-pin` first");
+            Ok(Err(EXIT_DENIED))
+        }
+        PinCheck::Mismatch => {
+            record("refused: bad pin")?;
+            err!("refused: wrong PIN");
+            Ok(Err(EXIT_DENIED))
+        }
+    }
 }
 
 /// What an action targets, after argument validation.
@@ -382,47 +439,8 @@ fn run_inner(
     }
 
     // 2. Approval.
-    if tier >= Tier::Yes && !yes {
-        record("refused: missing approval")?;
-        err!("refused: `{sum}` needs approval (tier {tier:?}); pass --yes");
-        return Ok(EXIT_DENIED);
-    }
-    if tier == Tier::YesPin {
-        let pin_path = home.join("pin");
-        let supplied = pin_flag.or_else(|| std::env::var(PIN_ENV).ok());
-        let check = match supplied {
-            None if fs::symlink_metadata(&pin_path).is_err() => PinCheck::NotSet,
-            None => {
-                record("refused: missing approval")?;
-                err!(
-                    "refused: `{sum}` needs --yes and a PIN (tier YesPin); set {PIN_ENV} or pass --pin"
-                );
-                return Ok(EXIT_DENIED);
-            }
-            Some(p) => match pin::check_pin(&pin_path, &p) {
-                Ok(c) => c,
-                Err(e) => {
-                    record("failed: pin file unreadable")?;
-                    err!("error: cannot read PIN file {}: {e}", pin_path.display());
-                    return Ok(EXIT_ERROR);
-                }
-            },
-        };
-        match check {
-            PinCheck::Match => {}
-            PinCheck::NotSet => {
-                record("refused: no pin set")?;
-                err!(
-                    "refused: `{sum}` needs a PIN (tier YesPin) but none is set; run `warden init-pin` first"
-                );
-                return Ok(EXIT_DENIED);
-            }
-            PinCheck::Mismatch => {
-                record("refused: bad pin")?;
-                err!("refused: wrong PIN");
-                return Ok(EXIT_DENIED);
-            }
-        }
+    if let Err(code) = check_approval(home, tier, yes, pin_flag, sum, &mut record)? {
+        return Ok(code);
     }
 
     // 3. Executed kinds must stay under --root.
@@ -534,7 +552,14 @@ fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     f.sync_all()
 }
 
-fn cmd_undo(home: &Path, snapshot_id: &str, root: &Path, force: bool) -> u8 {
+fn cmd_undo(
+    home: &Path,
+    snapshot_id: &str,
+    root: &Path,
+    yes: bool,
+    pin_flag: Option<String>,
+    force: bool,
+) -> u8 {
     let mut log = match open_audit(home) {
         Ok(l) => l,
         Err(c) => return c,
@@ -547,8 +572,13 @@ fn cmd_undo(home: &Path, snapshot_id: &str, root: &Path, force: bool) -> u8 {
     } else {
         sum
     };
-    let mut record = |d: &str| audit(&mut log, &id, &sum, Tier::Yes, d);
-    // Undo needs no --yes in this version; it is audited as `requested`.
+    // Restore can overwrite and delete files: undo is a YesPin action and
+    // goes through the same --yes + PIN gate as `run`.
+    let mut record = |d: &str| audit(&mut log, &id, &sum, Tier::YesPin, d);
+    match check_approval(home, Tier::YesPin, yes, pin_flag, &sum, &mut record) {
+        Ok(Ok(())) => {}
+        Ok(Err(c)) | Err(c) => return c,
+    }
     if let Err(c) = record("requested") {
         return c;
     }
