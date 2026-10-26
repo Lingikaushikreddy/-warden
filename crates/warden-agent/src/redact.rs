@@ -11,25 +11,38 @@
 //!
 //! Redaction is pattern-based, tuned for bounded recall with few false
 //! positives. It does not catch:
-//! - secret formats it has no pattern for;
+//! - secret formats it has no pattern for, or auth-header values without a
+//!   scheme (`X-Api-Auth: abcd1234` with no `Bearer`/`Basic`);
 //! - secrets that were base64- or otherwise obfuscated;
 //! - secrets split across tokens or lines (for example a key broken by a
 //!   newline), or an unquoted value with spaces (`password: correct horse`
 //!   redacts only `correct`; quote the value and the whole value is caught);
 //! - escaped-quote JSON inside a string (`{\"password\":\"x\"}` from doubly
 //!   serialized text), because the key is followed by `\"`, not `"`;
+//! - card numbers embedded in a longer digit run (a 25-digit order number), or
+//!   spaced cards whose groups are shorter than 4 digits (to avoid redacting
+//!   ordinary lists of numbers); a spaced card needs every group of 4+ digits
+//!   (the last may have 3), an unspaced one 13-19 digits, a leading 2-6 and a
+//!   valid Luhn checksum;
 //! - bare numbers under a secret key in text (`password = 1234 5678` redacts
 //!   only the first group; valid card numbers are caught by the card rule).
 //!
-//! Remaining false positives: key/value redaction fires on identifiers that
-//! merely contain a keyword (`token_count=12345`, a struct field
-//! `pub token: String`, `max_tokens_note: "abc"`). To keep source code intact,
-//! unquoted values that start with `& ( { [ : =`, end with `(` or `)`, or are
-//! shorter than 4 characters are left alone. Card numbers must start with
-//! 2-6 (the major issuer ranges) and pass Luhn; an unlucky Luhn-valid number
-//! in that range is redacted. `Basic <word>` outside an `Authorization:`
-//! header is redacted only when the word looks like base64 (digit, `+/=`, or
-//! interior capital).
+//! Remaining false positives (over-redaction costs model context but leaks
+//! nothing): key/value redaction fires on code that assigns to a secret-named
+//! identifier (`token = request.headers["x"]`, `self.token = token`,
+//! `const token: string = ...`, `pub token: String`). Text keys may carry any
+//! identifier prefix (`DB_PASSWORD`, `auth_token`) but only a `key`, `token`,
+//! `secret` or `password` suffix, so `tokens`, `tokenizer`, `secretary`,
+//! `password_hash`, `token_count` and `max_tokens` are left alone. To keep
+//! source code intact, unquoted values that start with `& ( { [ : =`, end with
+//! `(` or `)`, or are shorter than 4 characters are left alone.
+//! In JSON, plural keys (`tokens`, `credentials`, `api_keys`) are secret only
+//! when their value is an array or object, and `auth`, `pass`, `passphrase`
+//! count as secret keys only as a whole key or `_`/`-` delimited word. Every
+//! string and number leaf under a secret JSON key is replaced. Card numbers
+//! are matched by checksum, so an unlucky Luhn-valid number is redacted.
+//! `Basic <x>` outside an `Authorization:` header is redacted only when `x`
+//! is 12+ base64 characters containing a digit or `+/=`.
 //!
 //! All matching uses the `regex` crate (finite automata, linear time in the
 //! input). Inputs are never logged.
@@ -103,6 +116,7 @@ fn placeholder(kind: &str) -> String {
     format!("{PLACEHOLDER_PREFIX}{kind}]")
 }
 
+const KEY_SUFFIX: &str = "(?:[_-]?(?:key|token|secret|password))?";
 const KEYWORDS: &str =
     "password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credential";
 
@@ -116,6 +130,8 @@ struct Patterns {
     kv: Regex,
     card: Regex,
     secret_key_name: Regex,
+    word_key_name: Regex,
+    plural_key_name: Regex,
 }
 
 fn patterns() -> &'static Patterns {
@@ -140,7 +156,7 @@ fn patterns() -> &'static Patterns {
         ))
         .unwrap(),
         url_userinfo: Regex::new(
-            r#"([A-Za-z][A-Za-z0-9+.-]*://[^\s/:@"'<>]+:)([^\s/@"'<>]+)@"#,
+            r#"([A-Za-z][A-Za-z0-9+.-]*://[^\s/:@"'<>]*:)([^\s/@"'<>]+)@"#,
         )
         .unwrap(),
         bearer: Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}").unwrap(),
@@ -149,13 +165,18 @@ fn patterns() -> &'static Patterns {
         )
         .unwrap(),
         kv: Regex::new(&format!(
-            r#"(?i)(?P<pre>(?:{KEYWORDS})[A-Za-z0-9_-]*["']?[ \t]*[=:][ \t]*)(?:"(?P<dq>[^"\n]*)(?P<dqc>"?)|'(?P<sq>[^'\n]*)(?P<sqc>'?)|(?P<bare>[^\s"',;]+))"#
+            r#"(?i)(?P<pre>(?:{KEYWORDS}){KEY_SUFFIX}["']?[ \t]*[=:][ \t]*)(?:"(?P<dq>(?:[^"\\\n]|\\[^\n])*)(?P<dqc>"?)|'(?P<sq>(?:[^'\\\n]|\\[^\n])*)(?P<sqc>'?)|(?P<bare>[^\s"',;]+))"#
         ))
         .unwrap(),
         // Maximal runs of digit groups joined by single spaces or hyphens;
         // card windows are searched inside each run.
         card: Regex::new(r"\b[0-9]+(?:[ -][0-9]+)*\b").unwrap(),
-        secret_key_name: Regex::new(&format!("(?i)(?:{KEYWORDS})")).unwrap(),
+        secret_key_name: Regex::new(&format!("(?i)(?:{KEYWORDS}){KEY_SUFFIX}$")).unwrap(),
+        word_key_name: Regex::new(&format!(
+            "(?i)(?:^|[_-])(?:auth|passphrase|pass){KEY_SUFFIX}$"
+        ))
+        .unwrap(),
+        plural_key_name: Regex::new(&format!("(?i)(?:{KEYWORDS})s$")).unwrap(),
     })
 }
 
@@ -174,32 +195,35 @@ fn replace_simple(
     out.into_owned()
 }
 
-fn luhn_valid(digits: &[u32]) -> bool {
-    let sum: u32 = digits
-        .iter()
-        .rev()
-        .enumerate()
-        .map(|(i, &d)| {
-            if i % 2 == 1 {
-                let x = d * 2;
-                if x > 9 {
-                    x - 9
-                } else {
-                    x
+/// True when the digits of `groups[i..=j]` (read right to left) pass Luhn.
+/// No allocation: walks the bytes in place.
+fn window_luhn(bytes: &[u8], groups: &[(usize, usize)]) -> bool {
+    let mut sum = 0u32;
+    let mut idx = 0usize;
+    for g in groups.iter().rev() {
+        for b in bytes[g.0..g.1].iter().rev() {
+            let mut d = u32::from(b - b'0');
+            if idx % 2 == 1 {
+                d *= 2;
+                if d > 9 {
+                    d -= 9;
                 }
-            } else {
-                d
             }
-        })
-        .sum();
+            sum += d;
+            idx += 1;
+        }
+    }
     // is_multiple_of needs Rust 1.90; the workspace MSRV is 1.89.
     #[allow(clippy::manual_is_multiple_of)]
     let ok = sum % 10 == 0;
     ok
 }
 
-/// Find card numbers inside a run of digit groups: every group-aligned window
-/// of 13-19 digits starting with 2-6 that passes Luhn (longest first).
+/// Find card numbers inside a run of digit groups. A window is a single group
+/// of 13-19 digits, or several groups of which every one but the last has 4+
+/// digits (the last has 3+), totalling 13-19 digits. It must start with 2-6
+/// and pass Luhn; the longest passing window wins. Each start tries at most
+/// five groups, so the scan is linear in the run and allocation-free per window.
 fn card_spans(run: &str, base: usize) -> Vec<(usize, usize)> {
     let bytes = run.as_bytes();
     let mut groups: Vec<(usize, usize)> = Vec::new();
@@ -218,28 +242,22 @@ fn card_spans(run: &str, base: usize) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut i = 0;
     while i < groups.len() {
-        let first = bytes[groups[i].0];
+        let len0 = groups[i].1 - groups[i].0;
         let mut found = None;
-        if (b'2'..=b'6').contains(&first) {
+        if (b'2'..=b'6').contains(&bytes[groups[i].0]) && len0 >= 4 {
             let mut total = 0;
-            let mut max_j = None;
-            for (j, g) in groups.iter().enumerate().skip(i) {
-                total += g.1 - g.0;
+            for j in i..groups.len() {
+                let len = groups[j].1 - groups[j].0;
+                total += len;
                 if total > 19 {
                     break;
                 }
-                max_j = Some(j);
-            }
-            if let Some(max_j) = max_j {
-                for j in (i..=max_j).rev() {
-                    let digits: Vec<u32> = groups[i..=j]
-                        .iter()
-                        .flat_map(|g| bytes[g.0..g.1].iter().map(|b| u32::from(b - b'0')))
-                        .collect();
-                    if (13..=19).contains(&digits.len()) && luhn_valid(&digits) {
-                        found = Some(j);
-                        break;
-                    }
+                let eligible = if j == i { total >= 13 } else { len >= 3 };
+                if (13..=19).contains(&total) && eligible && window_luhn(bytes, &groups[i..=j]) {
+                    found = Some(j);
+                }
+                if len < 4 {
+                    break;
                 }
             }
         }
@@ -271,6 +289,13 @@ fn redact_cards(text: &str, report: &mut RedactionReport) -> String {
     out
 }
 
+/// True when `v` is exactly one placeholder, like `[REDACTED:card]`.
+fn is_placeholder(v: &str) -> bool {
+    v.strip_prefix(PLACEHOLDER_PREFIX)
+        .and_then(|r| r.strip_suffix(']'))
+        .is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+}
+
 fn bare_looks_like_code(v: &str) -> bool {
     v.chars().count() < 4
         || v.starts_with(['&', '(', '{', '[', ':', '='])
@@ -278,8 +303,7 @@ fn bare_looks_like_code(v: &str) -> bool {
 }
 
 fn looks_like_base64_credential(w: &str) -> bool {
-    w.contains(|c: char| c.is_ascii_digit() || matches!(c, '+' | '/' | '='))
-        || w.chars().skip(1).any(|c| c.is_ascii_uppercase())
+    w.len() >= 12 && w.contains(|c: char| c.is_ascii_digit() || matches!(c, '+' | '/' | '='))
 }
 
 /// Redact secrets from text. Order matters: PEM, JWT, API keys, URL
@@ -287,28 +311,28 @@ fn looks_like_base64_credential(w: &str) -> bool {
 /// after `password =` is caught whole), so earlier placeholders are never
 /// re-matched.
 pub fn redact(input: &str) -> (Redacted, RedactionReport) {
-    let p = patterns();
     let mut report = RedactionReport::default();
+    let mut text = redact_pass(input, &mut report);
+    // A placeholder can create a word boundary that was not there before
+    // (`...KEYxapp-...`), so repeat until nothing changes. This makes the
+    // result a fixed point: redacting the output again is a no-op.
+    for _ in 0..8 {
+        let next = redact_pass(&text, &mut report);
+        if next == text {
+            break;
+        }
+        text = next;
+    }
+    (Redacted(text), report)
+}
 
-    let s = replace_simple(input, &p.pem, "private_key", &mut report);
-    let s = replace_simple(&s, &p.jwt, "jwt", &mut report);
-    let s = replace_simple(&s, &p.api_key, "api_key", &mut report);
+fn redact_pass(input: &str, report: &mut RedactionReport) -> String {
+    let p = patterns();
 
-    let mut n = 0;
-    let s = p
-        .url_userinfo
-        .replace_all(&s, |c: &Captures| {
-            if c[2].starts_with(PLACEHOLDER_PREFIX) {
-                c[0].to_string()
-            } else {
-                n += 1;
-                format!("{}{}@", &c[1], placeholder("kv_secret"))
-            }
-        })
-        .into_owned();
-    report.record("kv_secret", n);
-
-    let s = replace_simple(&s, &p.bearer, "bearer", &mut report);
+    let s = replace_simple(input, &p.pem, "private_key", report);
+    let s = replace_simple(&s, &p.jwt, "jwt", report);
+    let s = replace_simple(&s, &p.api_key, "api_key", report);
+    let s = replace_simple(&s, &p.bearer, "bearer", report);
 
     let mut n = 0;
     let s = p
@@ -325,7 +349,23 @@ pub fn redact(input: &str) -> (Redacted, RedactionReport) {
         .into_owned();
     report.record("bearer", n);
 
-    let s = redact_cards(&s, &mut report);
+    let s = redact_cards(&s, report);
+
+    // After cards: a card inside a URL password becomes a placeholder first,
+    // so the second pass sees the same text and the result is idempotent.
+    let mut n = 0;
+    let s = p
+        .url_userinfo
+        .replace_all(&s, |c: &Captures| {
+            if is_placeholder(&c[2]) {
+                c[0].to_string()
+            } else {
+                n += 1;
+                format!("{}{}@", &c[1], placeholder("kv_secret"))
+            }
+        })
+        .into_owned();
+    report.record("kv_secret", n);
 
     let mut n = 0;
     let s =
@@ -339,8 +379,10 @@ pub fn redact(input: &str) -> (Redacted, RedactionReport) {
                 ("", &c["bare"], "")
             };
             let skip = value.is_empty()
-                || value.starts_with(PLACEHOLDER_PREFIX)
-                || (open.is_empty() && bare_looks_like_code(value));
+                || is_placeholder(value)
+                || (open.is_empty()
+                    && !value.contains(PLACEHOLDER_PREFIX)
+                    && bare_looks_like_code(value));
             if skip {
                 c[0].to_string()
             } else {
@@ -351,43 +393,49 @@ pub fn redact(input: &str) -> (Redacted, RedactionReport) {
         .into_owned();
     report.record("kv_secret", n);
 
-    (Redacted(s), report)
+    s
 }
 
-/// Redact every string value and every object key, recursively. A non-empty
-/// string under a secret-named key (`password`, `token`, ...) is replaced
-/// wholesale. The result is always valid JSON. If two keys redact to the same text, the later wins.
+/// Redact every string value and every object key, recursively. Under a
+/// secret-named key (`password`, `token`, ...; plural names like `tokens`
+/// when the value is an array or object) every string and number leaf is
+/// replaced wholesale; booleans and null are kept. The result is always valid
+/// JSON. If two keys redact to the same text, the later wins.
 pub fn redact_json(value: &Value) -> (Value, RedactionReport) {
     let mut report = RedactionReport::default();
-    let v = walk(value, &mut report);
+    let v = walk(value, false, &mut report);
     (v, report)
 }
 
-fn walk(value: &Value, report: &mut RedactionReport) -> Value {
+fn is_secret_key(key: &str, value: &Value) -> bool {
+    let p = patterns();
+    p.secret_key_name.is_match(key)
+        || p.word_key_name.is_match(key)
+        || (matches!(value, Value::Array(_) | Value::Object(_)) && p.plural_key_name.is_match(key))
+}
+
+fn walk(value: &Value, secret: bool, report: &mut RedactionReport) -> Value {
     match value {
+        Value::String(s) if secret && !s.is_empty() && !is_placeholder(s) => {
+            report.record("kv_secret", 1);
+            Value::String(placeholder("kv_secret"))
+        }
+        Value::Number(_) if secret => {
+            report.record("kv_secret", 1);
+            Value::String(placeholder("kv_secret"))
+        }
         Value::String(s) => {
             let (r, rep) = redact(s);
             report.merge(rep);
             Value::String(r.into_string())
         }
-        Value::Array(a) => Value::Array(a.iter().map(|v| walk(v, report)).collect()),
+        Value::Array(a) => Value::Array(a.iter().map(|v| walk(v, secret, report)).collect()),
         Value::Object(o) => {
             let mut m = Map::new();
             for (k, v) in o {
                 let (rk, rep) = redact(k);
                 report.merge(rep);
-                let secret_named = patterns().secret_key_name.is_match(k);
-                let nv = match v {
-                    Value::String(sv)
-                        if secret_named
-                            && !sv.is_empty()
-                            && !sv.starts_with(PLACEHOLDER_PREFIX) =>
-                    {
-                        report.record("kv_secret", 1);
-                        Value::String(placeholder("kv_secret"))
-                    }
-                    other => walk(other, report),
-                };
+                let nv = walk(v, secret || is_secret_key(k, v), report);
                 m.insert(rk.into_string(), nv);
             }
             Value::Object(m)
