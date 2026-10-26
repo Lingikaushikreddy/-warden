@@ -1,8 +1,10 @@
 //! Differential fuzz: the current redactor against the frozen round-3
 //! redactor (c9ca68f) on an ASCII corpus that avoids the intended later
 //! changes (no mid-word key prefixes, no deny-list words, no Mir cards,
-//! no non-ASCII). On that corpus the outputs must be identical; on every
-//! input the current redactor must not panic and must be idempotent.
+//! no non-ASCII). The oracle is one-sided: the current redactor may redact
+//! more than the frozen one (later rounds widened the secret words) but must
+//! never leak a value the old one removed. On every input it must not panic
+//! and must be idempotent.
 
 #[allow(dead_code)]
 #[path = "support/redact_c9ca68f.rs"]
@@ -72,8 +74,29 @@ const FRAGS: &[&str] = &[
     "}",
 ];
 
+/// Literal secret values present in the corpus. If the old redactor removed
+/// one of these from an input, the new output must not contain it either.
+const VALUES: &[&str] = &[
+    "Zx9qWm2Lp7Rt",
+    "hunter22pass",
+    "sk-proj1234567890abcdefghijKLMN",
+    "AKIAIOSFODNN7EXAMPLE",
+    "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+    "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUv",
+    "sk_l\x69ve_4eC39HqLyjWDarjtT1zdp7dc",
+    "hf_abcdefghijklmnopqrstuvwxyzABCDEF",
+    "glpat-abcdefghij0123456789",
+    "xoxb-123456789012-abcdefghijkl",
+    "abcDEF0123456789xyzXYZ",
+    "dXNlcjpwYXNzd29yZA==",
+    "s3cretpw",
+    "4111 1111 1111 1111",
+    "5555555555554444",
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc_-123",
+];
+
 #[test]
-fn ascii_corpus_matches_round_3_redactor() {
+fn ascii_corpus_never_leaks_what_round_3_redacted() {
     let mut seed: u64 = 0x5EED_0005;
     let mut next = |m: usize| {
         seed = seed
@@ -90,7 +113,13 @@ fn ascii_corpus_matches_round_3_redactor() {
         let new = std::panic::catch_unwind(|| redact(&s).0.into_string())
             .unwrap_or_else(|_| panic!("panic on generated input (len {})", s.len()));
         let old = old::redact(&s).0.into_string();
-        assert_eq!(new, old, "{s:?}");
+        // A value present in the input and removed by the old redactor must
+        // be absent from the new output (new redacts a superset).
+        for v in VALUES {
+            if s.contains(v) && !old.contains(v) {
+                assert!(!new.contains(v), "leaked {v:?} in {s:?}");
+            }
+        }
         assert_eq!(redact(&new).0.as_str(), new, "{s:?}");
         if new != s {
             redacted_cases += 1;

@@ -1212,3 +1212,43 @@ fn anthropic_prefix_needs_the_real_layout_mid_word() {
         "use-[REDACTED:api_key]"
     );
 }
+
+const NEW_SECRET_NAMES: &[&str] = &[
+    "SECRET_HASH_PEPPER",
+    "TOKEN_ID_PRIVATE",
+    "TOKEN_HASH_SIGNING",
+    "PASSWORD_FILE_CLEAR",
+    "SECRET_REF_CREDENTIALS",
+    "TOKEN_HASH_HMAC",
+    "TOKEN_TYPE_JWT",
+    "SECRET_ID_CERT",
+    "PASSWORD_MIN_PIN",
+    "TOKEN_FILE_PASS",
+    "SECRET_PATH_PASSPHRASE",
+    "SECRET_ID_AUTH",
+];
+
+#[test]
+fn extended_secret_words_are_redacted_in_text_and_json() {
+    for name in NEW_SECRET_NAMES {
+        let text = format!("{name}=Zx9qWm2Lp7Rt");
+        assert!(!out(&text).contains("Zx9qWm2Lp7Rt"), "text {name}");
+        let (v, _) = redact_json(&json!({ *name: "Zx9qWm2Lp7Rt" }));
+        assert!(!v.to_string().contains("Zx9qWm2Lp7Rt"), "json {name}");
+    }
+}
+
+#[test]
+fn non_secret_names_stay_unredacted() {
+    for line in [
+        "API_KEY_ID=AbCdEf123456",
+        "ACCESS_KEY_ID=AbCdEf123456",
+        "PASSWORD_FILE=/run/secrets/pw",
+        "TOKEN_FILE=/run/secrets/t",
+        "token_budget: 4096",
+        "max_tokens: 1024",
+        "secretary: alice",
+    ] {
+        assert_eq!(out(line), line, "{line}");
+    }
+}

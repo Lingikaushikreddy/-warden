@@ -750,8 +750,30 @@ const DENY_WORDS: &[&str] = &[
 /// Words that make a suffix secret again even after a deny word
 /// (`TOKEN_HASH_SECRET`, `PASSWORD_FIELD_VALUE`, `TOKEN_URL_WITH_KEY`).
 const SECRET_WORDS: &[&str] = &[
-    "secret", "token", "password", "passwd", "pwd", "key", "value", "contents", "content", "data",
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "pwd",
+    "key",
+    "value",
+    "contents",
+    "content",
+    "data",
     "salt",
+    "credential",
+    "credentials",
+    "private",
+    "pass",
+    "passphrase",
+    "auth",
+    "pepper",
+    "hmac",
+    "signing",
+    "pin",
+    "cert",
+    "jwt",
+    "clear",
 ];
 
 /// ASCII case-insensitive equality that treats `-` and `_` as the same.
