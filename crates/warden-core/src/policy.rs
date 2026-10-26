@@ -31,7 +31,7 @@ pub struct PolicyConfig {
 /// as inside any root. `..` at the filesystem root stays at the root.
 ///
 /// Lexical only: symlinks are NOT resolved and the filesystem is never touched.
-fn normalize(p: &Path) -> Option<PathBuf> {
+pub fn normalize(p: &Path) -> Option<PathBuf> {
     if !p.is_absolute() {
         return None;
     }

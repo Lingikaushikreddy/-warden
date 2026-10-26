@@ -2,7 +2,7 @@
 pub mod action;
 pub use action::{Action, Capability};
 pub mod policy;
-pub use policy::{classify, PolicyConfig, Tier};
+pub use policy::{classify, normalize, PolicyConfig, Tier};
 pub mod approval;
 pub use approval::{
     approval_message, tier_byte, Approval, ApprovalError, Approver, APPROVAL_DOMAIN, MAX_SKEW_MS,
