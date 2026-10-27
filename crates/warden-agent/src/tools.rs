@@ -163,7 +163,14 @@ pub(crate) fn is_forbidden_path_char(c: char) -> bool {
             | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}'
             | '\u{2800}'
             | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{E0000}'..='\u{E007F}')
+            | '\u{E0000}'..='\u{E007F}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{E0100}'..='\u{E01EF}'
+            | '\u{034F}'
+            | '\u{180B}'..='\u{180E}'
+            | '\u{17B4}' | '\u{17B5}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{FFFC}')
 }
 
 fn resolve(tool: &str, raw: &str, cwd: &Path) -> Result<PathBuf, ToolError> {

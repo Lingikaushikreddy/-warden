@@ -19,10 +19,18 @@ fn prompt(summary: &str, tier: Tier, note: Option<&str>) -> ApprovalPrompt {
     }
 }
 
-async fn ask(input: &str) -> ApprovalReply {
+async fn ask_tier(input: &str, tier: Tier) -> ApprovalReply {
     let mut out = Vec::new();
     let mut c = chan(input.as_bytes(), &mut out);
-    c.ask_approval(&prompt("do it", Tier::YesPin, None)).await
+    c.ask_approval(&prompt("do it", tier, None)).await
+}
+
+async fn ask(input: &str) -> ApprovalReply {
+    ask_tier(input, Tier::Yes).await
+}
+
+async fn ask_pin(input: &str) -> ApprovalReply {
+    ask_tier(input, Tier::YesPin).await
 }
 
 #[test]
@@ -128,7 +136,7 @@ async fn approval_prompt_labels_model_note_as_unverified() {
     let s = String::from_utf8(out).unwrap();
     assert_eq!(
         s,
-        "Approval needed (Yes):\n  write_file \"a\"\n  model says (unverified): trust me\nReply \"yes\", \"no\":\n"
+        "Approval needed (Yes):\n  write_file \"a\"\n  model says (unverified): trust me\nReply \"yes\" or \"no\":\n"
     );
 }
 
@@ -140,10 +148,7 @@ async fn pin_tier_prompt_mentions_pin() {
         c.ask_approval(&prompt("x", Tier::YesPin, None)).await;
     }
     let s = String::from_utf8(out).unwrap();
-    assert!(
-        s.ends_with("Reply \"yes\", \"no\", or \"yes <PIN>\":\n"),
-        "{s}"
-    );
+    assert!(s.ends_with("Reply \"yes <PIN>\" or \"no\":\n"), "{s}");
 }
 
 #[tokio::test]
@@ -172,45 +177,95 @@ async fn prompt_text_is_sanitized_even_if_summary_has_escapes() {
 }
 
 #[tokio::test]
-async fn yes_no_and_yes_pin_parse() {
-    assert!(matches!(ask("yes\n").await, ApprovalReply::Yes));
-    assert!(matches!(ask("YES\n").await, ApprovalReply::Yes));
-    assert!(matches!(ask("  Yes  \r\n").await, ApprovalReply::Yes));
-    assert!(matches!(ask("no\n").await, ApprovalReply::No));
-    assert!(matches!(ask("NO\n").await, ApprovalReply::No));
-    match ask("Yes   1234 \n").await {
-        ApprovalReply::YesPin(p) => assert_eq!(p, "1234"),
-        other => panic!("{other:?}"),
-    }
+async fn yes_tier_accepts_only_exact_yes() {
+    assert_eq!(ask("yes\n").await, ApprovalReply::Yes);
+    assert_eq!(ask("YES\n").await, ApprovalReply::Yes);
+    assert_eq!(ask("  Yes  \r\n").await, ApprovalReply::Yes);
+    assert_eq!(ask("no\n").await, ApprovalReply::No);
+    assert_eq!(ask("NO\n").await, ApprovalReply::No);
+    // Stale queued chat text must not approve a prompt the owner never saw.
+    assert_eq!(ask("yes please go ahead\n").await, ApprovalReply::No);
+    assert_eq!(ask("yes 1234\n").await, ApprovalReply::No);
+}
+
+#[tokio::test]
+async fn yes_pin_tier_requires_pin() {
+    assert_eq!(
+        ask_pin("Yes   1234 \n").await,
+        ApprovalReply::YesPin("1234".into())
+    );
+    assert_eq!(ask_pin("yes\n").await, ApprovalReply::No);
+    assert_eq!(ask_pin("no\n").await, ApprovalReply::No);
+    let ok = format!("yes {}\n", "9".repeat(128));
+    assert!(matches!(ask_pin(&ok).await, ApprovalReply::YesPin(p) if p.len() == 128));
+    let long = format!("yes {}\n", "9".repeat(129));
+    assert_eq!(ask_pin(&long).await, ApprovalReply::No);
 }
 
 #[tokio::test]
 async fn garbage_and_empty_and_eof_are_no() {
+    for input in ["maybe\n", "\n", "", "yess\n", "y\n", "no 1234\n"] {
+        assert_eq!(ask(input).await, ApprovalReply::No, "{input:?}");
+    }
     for input in [
         "maybe\n",
         "\n",
         "",
-        "yess\n",
-        "y\n",
+        "yess 1\n",
+        "y 1\n",
         "no 1234\n",
-        "yes please\nyes\n",
+        "1234\n",
     ] {
-        let r = ask(input).await;
-        // "yes please" is a PIN attempt by definition; the engine verifies it.
-        if input.starts_with("yes please") {
-            assert!(matches!(r, ApprovalReply::YesPin(_)));
-        } else {
-            assert!(matches!(r, ApprovalReply::No), "{input:?} -> {r:?}");
-        }
+        assert_eq!(ask_pin(input).await, ApprovalReply::No, "{input:?}");
     }
 }
 
 #[tokio::test]
-async fn overlong_reply_line_is_no() {
+async fn eof_in_the_middle_of_a_reply_line_is_no() {
+    assert_eq!(ask("yes").await, ApprovalReply::No);
+    assert_eq!(ask_pin("yes 1234").await, ApprovalReply::No);
+}
+
+#[tokio::test]
+async fn overlong_reply_is_no_notice_sent_and_next_line_still_read() {
     let mut input = "yes ".to_string();
     input.push_str(&"9".repeat(100_000));
-    input.push('\n');
-    assert!(matches!(ask(&input).await, ApprovalReply::No));
+    input.push_str("\nhello\n");
+    let mut out = Vec::new();
+    {
+        let mut c = chan(input.as_bytes(), &mut out);
+        let r = c.ask_approval(&prompt("x", Tier::Yes, None)).await;
+        assert_eq!(r, ApprovalReply::No);
+        assert_eq!(c.recv().await.unwrap().text, "hello");
+    }
+    assert!(String::from_utf8(out)
+        .unwrap()
+        .ends_with("reply too long, treated as no\n"));
+}
+
+#[tokio::test]
+async fn truncated_summary_or_note_is_refused_without_prompting() {
+    for (summary, note) in [
+        ("a".repeat(10_000), None),
+        ("ok".to_string(), Some("n".repeat(10_000))),
+    ] {
+        let mut out = Vec::new();
+        {
+            let mut c = chan(b"yes\nyes\n", &mut out);
+            let p = ApprovalPrompt {
+                summary,
+                tier: Tier::Yes,
+                model_note: note,
+            };
+            assert_eq!(c.ask_approval(&p).await, ApprovalReply::No);
+            // The queued "yes" was not consumed as an answer.
+            assert_eq!(c.recv().await.unwrap().text, "yes");
+        }
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "request too long to approve safely; refused\n"
+        );
+    }
 }
 
 #[test]
@@ -261,6 +316,140 @@ async fn line_at_exactly_the_cap_is_accepted() {
     let mut out = Vec::new();
     let mut c = chan(&input, &mut out);
     assert_eq!(c.recv().await.unwrap().text.len(), 65_536);
+}
+
+#[tokio::test]
+async fn cap_is_on_content_excluding_line_ending() {
+    for (n, eol, ok) in [
+        (65_536, "\n", true),
+        (65_537, "\n", false),
+        (65_536, "\r\n", true),
+        (65_537, "\r\n", false),
+    ] {
+        let mut input = "a".repeat(n);
+        input.push_str(eol);
+        input.push_str("next\n");
+        let mut out = Vec::new();
+        let mut c = chan(input.as_bytes(), &mut out);
+        let first = c.recv().await.unwrap().text;
+        if ok {
+            assert_eq!(first.len(), n, "{n} {eol:?}");
+            assert_eq!(c.recv().await.unwrap().text, "next");
+        } else {
+            assert_eq!(first, "next", "{n} {eol:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn crlf_split_across_buffer_boundaries() {
+    let mut out = Vec::new();
+    let reader = BufReader::with_capacity(1, &b"ab\r\ncd\r\n"[..]);
+    let mut c = StdioChannel::new(reader, &mut out);
+    assert_eq!(c.recv().await.unwrap().text, "ab");
+    assert_eq!(c.recv().await.unwrap().text, "cd");
+    assert!(c.recv().await.is_none());
+    let reader = BufReader::with_capacity(1, &b"yes\r\n"[..]);
+    let mut out = Vec::new();
+    let mut c = StdioChannel::new(reader, &mut out);
+    assert_eq!(
+        c.ask_approval(&prompt("x", Tier::Yes, None)).await,
+        ApprovalReply::Yes
+    );
+}
+
+/// Endless newline-free input that errors after `limit` bytes.
+struct Endless {
+    served: usize,
+    limit: usize,
+}
+
+impl tokio::io::AsyncRead for Endless {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.served >= self.limit {
+            return std::task::Poll::Ready(Err(std::io::Error::other("asked for too much")));
+        }
+        let n = buf.remaining().min(self.limit - self.served);
+        buf.put_slice(&vec![b'a'; n]);
+        self.served += n;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn unbounded_input_is_discarded_not_buffered() {
+    let reader = BufReader::with_capacity(
+        8192,
+        Endless {
+            served: 0,
+            limit: 200_000,
+        },
+    );
+    let mut out = Vec::new();
+    {
+        let mut c = StdioChannel::new(reader, &mut out);
+        assert!(c.recv().await.is_none());
+    }
+    assert_eq!(String::from_utf8(out).unwrap(), "line too long, ignored\n");
+}
+
+#[test]
+fn invisible_code_points_are_visible_and_rejected_in_paths() {
+    use serde_json::json;
+    use warden_agent::tools::{parse_call, ToolCall, ToolError};
+    let cps = [
+        0xFE00u32, 0xFE0F, 0xE0100, 0xE01EF, 0x034F, 0x180B, 0x180E, 0x17B4, 0x17B5, 0x1D173,
+        0x1D17A, 0xFFFC,
+    ];
+    for cp in cps {
+        let c = char::from_u32(cp).unwrap();
+        let shown = sanitize_for_display(&format!("a{c}b"));
+        assert_eq!(shown, format!("a\\u{{{cp:x}}}b"), "{cp:x}");
+        let call = ToolCall {
+            id: "1".into(),
+            name: "read_file".into(),
+            args: json!({"path": format!("/root/a{c}b")}),
+        };
+        assert!(
+            matches!(
+                parse_call(&call, std::path::Path::new("/root")),
+                Err(ToolError::BadArgs(_))
+            ),
+            "{cp:x}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn blank_looking_spaces_are_escaped_in_display_but_allowed_in_paths() {
+    use serde_json::json;
+    use warden_agent::tools::{parse_call, ToolCall};
+    for cp in [0xA0u32, 0x2000, 0x200A, 0x202F, 0x205F, 0x3000] {
+        let c = char::from_u32(cp).unwrap();
+        assert_eq!(
+            sanitize_for_display(&format!("a{c}b")),
+            format!("a\\u{{{cp:x}}}b")
+        );
+    }
+    assert_eq!(sanitize_for_display("a b"), "a b");
+    let call = ToolCall {
+        id: "1".into(),
+        name: "read_file".into(),
+        args: json!({"path": "/root/a\u{a0}b"}),
+    };
+    assert!(parse_call(&call, std::path::Path::new("/root")).is_ok());
+    let mut out = Vec::new();
+    {
+        let mut c = chan(b"no\n", &mut out);
+        c.ask_approval(&prompt("read_file \"/root/a\u{a0}b\"", Tier::Yes, None))
+            .await;
+    }
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("a\\u{a0}b") && !s.contains('\u{a0}'));
 }
 
 #[tokio::test]

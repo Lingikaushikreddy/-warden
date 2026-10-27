@@ -18,6 +18,8 @@ use crate::tools::is_forbidden_path_char;
 const MAX_DISPLAY_CHARS: usize = 4096;
 /// Hard cap on one input line, in bytes (newline excluded).
 const MAX_LINE_BYTES: usize = 65_536;
+/// Longest accepted PIN, in characters.
+const MAX_PIN_CHARS: usize = 128;
 
 /// Identity of the party that sent a message, as vouched for by the channel.
 #[derive(PartialEq, Eq, Clone, Debug)]
@@ -70,6 +72,19 @@ pub trait Channel {
 
     /// Ask the owner to approve an action.
     ///
+    /// Reply rules (stdio): for tiers other than `YesPin`, only the exact
+    /// reply `yes` (case-insensitive, trimmed) is `Yes`; `yes <anything>` is
+    /// `No`. For `YesPin`, `yes <pin>` (1-128 chars) is `YesPin(pin)` and a
+    /// bare `yes` is `No`. A prompt whose summary or note would be truncated
+    /// is refused without asking.
+    ///
+    /// Freshness: stdin is one stream, so an approval is only as fresh as the
+    /// stream. Input queued before the prompt can answer it. An interactive
+    /// terminal front end should discard pending input before prompting, and
+    /// the engine must keep chat text and approvals as separate states. The
+    /// PIN is returned as a plain `String` (not zeroized); the engine must
+    /// compare it in constant time.
+    ///
     /// Contract: this must only return a reply that came from the OWNER. The
     /// engine does not re-check who answered. Implementations must return
     /// `ApprovalReply::No` on any doubt (closed channel, unparseable reply,
@@ -80,17 +95,24 @@ pub trait Channel {
     ) -> impl Future<Output = ApprovalReply> + Send;
 }
 
-/// Make text safe to show to a human. Control, C1, DEL, `\r`, format, bidi
-/// and invisible characters become a visible `\u{hex}` escape (never silently
-/// dropped, so injected terminal escapes cannot hide). `\n` and `\t` are kept.
-/// The result is capped at 4096 characters, ending with `…` when truncated.
-pub fn sanitize_for_display(s: &str) -> String {
+/// Blank-looking spaces escaped for display only. They are legal in paths
+/// but can make two different strings look identical in a prompt.
+fn is_blank_looking(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00A0}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+    )
+}
+
+/// Sanitize and report whether the 4096-character cap truncated the text.
+fn sanitize_capped(s: &str) -> (String, bool) {
     let mut out = String::new();
     let mut count = 0usize;
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        let escape =
-            c == '\r' || (c != '\n' && c != '\t' && (is_forbidden_path_char(c) || c == '\u{7f}'));
+        let escape = c == '\r'
+            || is_blank_looking(c)
+            || (c != '\n' && c != '\t' && (is_forbidden_path_char(c) || c == '\u{7f}'));
         let piece: String = if escape {
             format!("\\u{{{:x}}}", c as u32)
         } else {
@@ -105,22 +127,52 @@ pub fn sanitize_for_display(s: &str) -> String {
         };
         if !fits {
             out.push('…');
-            return out;
+            return (out, true);
         }
         out.push_str(&piece);
         count += n;
     }
-    out
+    (out, false)
+}
+
+/// Make text safe to show to a human. Control, C1, DEL, `\r`, format, bidi,
+/// invisible and blank-looking space characters become a visible `\u{hex}`
+/// escape (never silently dropped, so injected terminal escapes cannot hide).
+/// `\n`, `\t` and plain space are kept. The result is capped at 4096
+/// characters, ending with `…` when truncated.
+///
+/// Limits: a literal backslash is not escaped, so literal text `\u{1b}` is
+/// indistinguishable from an escaped ESC (noise only, it hides nothing).
+/// Visual confusables (e.g. Cyrillic lookalikes) and tab alignment tricks are
+/// not solvable by character filtering.
+pub fn sanitize_for_display(s: &str) -> String {
+    sanitize_capped(s).0
 }
 
 /// Sanitize and prefix every line after the first with `  | ` so multi-line
 /// text cannot start a line that looks like part of the prompt.
-fn block(s: &str) -> String {
-    sanitize_for_display(s).replace('\n', "\n  | ")
+/// Returns `None` when the text was truncated.
+fn block(s: &str) -> Option<String> {
+    let (t, truncated) = sanitize_capped(s);
+    (!truncated).then(|| t.replace('\n', "\n  | "))
+}
+
+fn finish(mut bytes: Vec<u8>, terminated: bool) -> Line {
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    if bytes.len() > MAX_LINE_BYTES {
+        return Line::TooLong;
+    }
+    Line::Text { bytes, terminated }
 }
 
 enum Line {
-    Text(Vec<u8>),
+    /// `terminated` is false when EOF ended the line.
+    Text {
+        bytes: Vec<u8>,
+        terminated: bool,
+    },
     TooLong,
     Eof,
 }
@@ -140,9 +192,12 @@ where
         Self { reader, writer }
     }
 
-    /// Read one line with a bounded buffer. An over-long line is consumed up
+    /// Read one line with a bounded buffer. The cap applies to the content
+    /// excluding the trailing `\r\n`/`\n`. An over-long line is consumed up
     /// to its newline without being stored.
     async fn read_line(&mut self) -> Line {
+        // One extra byte is allowed while reading so a trailing `\r` fits.
+        let limit = MAX_LINE_BYTES + 1;
         let mut line: Vec<u8> = Vec::new();
         let mut overflow = false;
         loop {
@@ -158,14 +213,14 @@ where
                     if line.is_empty() {
                         return Line::Eof;
                     }
-                    return Line::Text(line);
+                    return finish(line, false);
                 }
                 let (data, used, done) = match chunk.iter().position(|&b| b == b'\n') {
                     Some(p) => (&chunk[..p], p + 1, true),
                     None => (chunk, chunk.len(), false),
                 };
                 if !overflow {
-                    if line.len() + data.len() > MAX_LINE_BYTES {
+                    if line.len() + data.len() > limit {
                         overflow = true;
                         line = Vec::new();
                     } else {
@@ -179,7 +234,7 @@ where
                 return if overflow {
                     Line::TooLong
                 } else {
-                    Line::Text(line)
+                    finish(line, true)
                 };
             }
         }
@@ -203,10 +258,7 @@ where
             match self.read_line().await {
                 Line::Eof => return None,
                 Line::TooLong => self.write("line too long, ignored\n").await,
-                Line::Text(mut bytes) => {
-                    if bytes.last() == Some(&b'\r') {
-                        bytes.pop();
-                    }
+                Line::Text { bytes, .. } => {
                     if bytes.is_empty() {
                         continue;
                     }
@@ -226,35 +278,53 @@ where
     }
 
     async fn ask_approval(&mut self, prompt: &ApprovalPrompt) -> ApprovalReply {
-        let mut s = format!(
-            "Approval needed ({:?}):\n  {}\n",
-            prompt.tier,
-            block(&prompt.summary)
-        );
-        if let Some(note) = &prompt.model_note {
-            s.push_str(&format!("  model says (unverified): {}\n", block(note)));
+        let summary = block(&prompt.summary);
+        let note = prompt.model_note.as_deref().map(block);
+        let (Some(summary), true) = (summary, note.as_ref().is_none_or(|n| n.is_some())) else {
+            self.write("request too long to approve safely; refused\n")
+                .await;
+            return ApprovalReply::No;
+        };
+        let needs_pin = prompt.tier == Tier::YesPin;
+        let mut s = format!("Approval needed ({:?}):\n  {}\n", prompt.tier, summary);
+        if let Some(Some(note)) = note {
+            s.push_str(&format!("  model says (unverified): {note}\n"));
         }
-        if prompt.tier == Tier::YesPin {
-            s.push_str("Reply \"yes\", \"no\", or \"yes <PIN>\":\n");
+        if needs_pin {
+            s.push_str("Reply \"yes <PIN>\" or \"no\":\n");
         } else {
-            s.push_str("Reply \"yes\", \"no\":\n");
+            s.push_str("Reply \"yes\" or \"no\":\n");
         }
         self.write(&s).await;
 
-        let Line::Text(bytes) = self.read_line().await else {
-            return ApprovalReply::No;
+        let bytes = match self.read_line().await {
+            Line::Text {
+                bytes,
+                terminated: true,
+            } => bytes,
+            Line::TooLong => {
+                self.write("reply too long, treated as no\n").await;
+                return ApprovalReply::No;
+            }
+            // EOF mid-line or no line at all: fail closed.
+            _ => return ApprovalReply::No,
         };
-        let text = String::from_utf8_lossy(&bytes);
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        drop(bytes);
         let text = text.trim();
+        if !needs_pin {
+            return if text.eq_ignore_ascii_case("yes") {
+                ApprovalReply::Yes
+            } else {
+                ApprovalReply::No
+            };
+        }
         let mut parts = text.splitn(2, char::is_whitespace);
         let first = parts.next().unwrap_or("");
         let rest = parts.next().map(str::trim).unwrap_or("");
-        if first.eq_ignore_ascii_case("yes") {
-            if rest.is_empty() {
-                ApprovalReply::Yes
-            } else {
-                ApprovalReply::YesPin(rest.to_string())
-            }
+        let n = rest.chars().count();
+        if first.eq_ignore_ascii_case("yes") && (1..=MAX_PIN_CHARS).contains(&n) {
+            ApprovalReply::YesPin(rest.to_string())
         } else {
             ApprovalReply::No
         }

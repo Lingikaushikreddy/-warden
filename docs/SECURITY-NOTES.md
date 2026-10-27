@@ -419,3 +419,18 @@ exists at the time of the check.
   missing approval replies are `No`.
 - `StdioChannel` is local-only: whoever controls the process's stdin is the
   owner. It is not suitable for any network-exposed transport.
+- Approval replies fail closed. For tiers other than `YesPin` only the exact
+  reply `yes` approves (`yes <anything>` is No), so queued chat text cannot
+  approve a prompt. For `YesPin`, `yes <pin>` (1-128 chars) is required. EOF
+  in the middle of a reply line, over-long replies and a truncated summary or
+  note (the prompt is refused without asking) are all No.
+- Freshness: stdin is one stream, so an approval is only as fresh as the
+  stream. An interactive terminal front end should discard pending input
+  before prompting, and the engine must treat chat text and approvals as
+  separate states.
+- The PIN comes back as a plain `String` (not zeroized); the engine must
+  compare it in constant time.
+- Display also escapes blank-looking spaces (NBSP, U+2000-200A, U+202F,
+  U+205F, U+3000), which stay legal in paths. A literal backslash is not
+  escaped, so literal `\u{1b}` text looks like an escaped ESC (noise only).
+  Confusables and tab alignment are not solvable by filtering.
