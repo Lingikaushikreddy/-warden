@@ -436,7 +436,9 @@ exists at the time of the check.
   replies, and a truncated summary or note or an invalid challenge (the
   prompt is refused without asking) are all No. EOF before a complete
   reply line is `ApprovalReply::Closed`, which the engine treats as a
-  refusal audited `refused: no reply`.
+  refusal audited `refused: no reply` that also ends the message (the
+  owner is told `input closed`, the message is audited `failed: input
+  closed`, and the planner is not called again).
 - Freshness: stdin is one stream. The challenge code is what makes an
   approval fresh: only a reply typed after the prompt appeared can carry
   it. On top of that the engine calls `discard_pending_input` before every
@@ -517,7 +519,10 @@ planner and the executor are wired together.
      the action is audited `refused: approval timed out`, then the message
      `failed: timeout`; no further call of that message is processed or
      prompted, and the planner is not called again. A late reply can
-     therefore only arrive as a new message.
+     therefore only arrive as a new message. A closed input stream at a
+     prompt (`ApprovalReply::Closed`) ends the message the same way: the
+     owner is told `input closed`, the audit reads `refused: no reply` then
+     `failed: input closed`.
   2. **Approval-shaped messages never reach the planner.** An owner
      message that, after trimming and ignoring ASCII case, is exactly
      `yes`, `no`, or `yes` followed by whitespace and anything is dropped
@@ -536,11 +541,15 @@ planner and the executor are wired together.
      chat message `34`; the whole line arrives as one (dropped) message.
   5. **PIN-like chat is dropped.** An owner message of at most 8
      whitespace-separated tokens is checked token by token (tokens of
-     1-128 characters; each token as typed, with ASCII punctuation trimmed
-     from its ends, and each piece between ASCII punctuation, so
-     `4815162342.`, `(4815162342)`, `"4815162342"` and `pin=4815162342`
+     1-128 characters; each token as typed, with punctuation trimmed from
+     its ends, and each piece between punctuation, so `4815162342.`,
+     `(4815162342)`, `"4815162342"`, `4815162342。` and `pin=4815162342`
      match) against the stored PIN with `check_pin` (constant
-     time, on a blocking thread). On a match the message is dropped, the
+     time, on a blocking thread). "Punctuation" here is any character that
+     is neither alphanumeric nor whitespace (so full-width `。，！？、` count).
+     At most 64 distinct candidates are checked per message (whole and
+     trimmed tokens first, then pieces), each once, so a long message with
+     many separators costs at most 64 PIN-hash checks. On a match the message is dropped, the
      owner is told `that message looks like your PIN; it was not sent`, and
      `ignored: pin-like message` is audited with no content. The check is
      skipped silently when no PIN is set or the file cannot be read, and it
@@ -592,7 +601,8 @@ thread.
   `refused: prompt too long`, and one aggregated `refused: too
   many calls` entry per planner response for calls beyond
   `max_calls_per_message`.
-- Per message: `failed: planner`, `failed: timeout`, `failed: step limit`.
+- Per message: `failed: planner`, `failed: timeout`, `failed: input
+  closed`, `failed: step limit`.
 - Summaries are the validated action summaries (kind, quoted path, sizes);
   file content and write content never enter the audit log. A failed
   refusal append is reported to the owner (`warning: audit append failed`).
@@ -641,10 +651,9 @@ reached`) and `max_calls_per_message` tool calls per message.
 - Input that reaches the process after the discard can still answer a
   prompt only if it contains that prompt's code, that is, only if it was
   typed by someone who saw the prompt (or guessed the 4 digits).
-- The PIN-like filter checks short messages only (at most 8 tokens) and
-  only ASCII punctuation boundaries: a PIN inside a longer message, glued
-  to letters or non-ASCII punctuation, or typed after the PIN file was
-  changed is ordinary chat and goes to the planner after redaction, which
+- The PIN-like filter checks short messages only (at most 8 tokens, at most
+  64 candidates): a PIN inside a longer message, glued to letters, past the
+  64th candidate, or typed after the PIN file was changed is ordinary chat and goes to the planner after redaction, which
   does not recognize PINs.
 - `AuditLog` appends and `ApproverStore` share the engine's lifetime; the
   engine holds both behind mutexes and processes one message at a time.

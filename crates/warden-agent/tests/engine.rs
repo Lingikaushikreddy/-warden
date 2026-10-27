@@ -1820,7 +1820,11 @@ fn drive(lines: Vec<(u64, String)>) -> (DuplexReader, tokio::task::JoinHandle<()
 }
 
 fn two_writes() -> MockPlanner {
-    MockPlanner::scripted(vec![
+    MockPlanner::scripted(two_writes_script())
+}
+
+fn two_writes_script() -> Vec<Result<PlanResponse, PlannerError>> {
+    vec![
         reply(
             Some("updating"),
             vec![
@@ -1838,7 +1842,7 @@ fn two_writes() -> MockPlanner {
         ),
         reply(Some("ok"), vec![]),
         reply(Some("chat"), vec![]),
-    ])
+    ]
 }
 
 fn out_text(out: &SharedBuf) -> String {
@@ -2352,7 +2356,54 @@ async fn eof_at_a_prompt_is_audited_as_no_reply() {
     e.run().await;
     h.await.unwrap();
     assert_eq!(fs::read_to_string(&a).unwrap(), "A-old");
-    assert_eq!(env.decisions(), vec!["refused: no reply"]);
+    assert_eq!(
+        env.decisions(),
+        vec!["refused: no reply", "failed: input closed"]
+    );
+    assert!(out_text(&out).contains("input closed"));
+    // The message ends at EOF: the planner is not asked again.
+    assert_eq!(e.planner().requests().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn eof_at_a_prompt_ends_the_message_with_one_planner_request() {
+    let env = env();
+    let a = env.file("a.txt", "A-old");
+    let b = env.file("b.txt", "B-old");
+    let (reader, h) = drive(vec![(0, "update a\n".into())]);
+    let out = SharedBuf::default();
+    let mut e = stdio_engine(&env, two_writes(), reader, out.clone(), |_| {});
+    e.run().await;
+    h.await.unwrap();
+    assert_eq!(fs::read_to_string(&a).unwrap(), "A-old");
+    assert_eq!(fs::read_to_string(&b).unwrap(), "B-old");
+    let text = out_text(&out);
+    assert_eq!(text.matches("Approval needed").count(), 1, "{text}");
+    assert_eq!(
+        env.decisions(),
+        vec!["refused: no reply", "failed: input closed"]
+    );
+    assert_eq!(e.planner().requests().len(), 1);
+}
+
+#[tokio::test]
+async fn closed_reply_ends_the_message_on_any_channel() {
+    let env = env();
+    let mut e = env.engine(
+        two_writes_script(),
+        Opts {
+            replies: vec![Reply::Is(ApprovalReply::Closed), yes()],
+            ..Opts::default()
+        },
+    );
+    e.handle(msg("update a")).await;
+    assert_eq!(env.seen.prompts().len(), 1);
+    assert_eq!(
+        env.decisions(),
+        vec!["refused: no reply", "failed: input closed"]
+    );
+    assert_eq!(env.seen.sent().last().unwrap(), "input closed");
+    assert_eq!(e.planner().requests().len(), 1);
 }
 
 #[tokio::test]
@@ -2471,4 +2522,46 @@ async fn case_variant_spelling_is_refused_before_prompting() {
     );
     assert_eq!(env.decisions(), vec!["refused: outside root"]);
     assert_eq!(fs::read_to_string(&f).unwrap(), "A");
+}
+
+#[tokio::test]
+async fn pin_like_check_trims_full_width_punctuation() {
+    let env = env();
+    env.set_pin();
+    let mut e = env.engine(vec![reply(Some("chat"), vec![])], Opts::default());
+    for t in [
+        format!("{PIN}\u{3002}"),
+        format!("\u{FF0C}{PIN}\u{FF01}"),
+        format!("pin\u{3001}{PIN}\u{FF1F}"),
+    ] {
+        e.handle(msg(&t)).await;
+    }
+    assert!(e.planner().requests().is_empty());
+    assert_eq!(env.decisions(), vec!["ignored: pin-like message"; 3]);
+}
+
+#[tokio::test]
+async fn pin_like_check_is_bounded_on_a_long_message() {
+    let env = env();
+    env.set_pin();
+    let mut e = env.engine(vec![reply(Some("chat"), vec![])], Opts::default());
+    // 8 tokens of ~8 KiB, each with thousands of distinct pieces.
+    let token = |k: usize| -> String {
+        let mut t = String::new();
+        let mut i = 0;
+        while t.len() < 8 * 1024 {
+            t.push_str(&format!("{k}x{i};"));
+            i += 1;
+        }
+        t
+    };
+    let text: Vec<String> = (0..8).map(token).collect();
+    let text = text.join(" ");
+    assert!(text.len() >= 64 * 1024);
+    e.handle(msg(&text)).await;
+    let checks = e.pin_like_checks_for_test();
+    assert!(checks <= 64, "{checks} PIN checks");
+    assert!(checks > 0);
+    // Not PIN-like: it went to the planner.
+    assert_eq!(e.planner().requests().len(), 1);
 }

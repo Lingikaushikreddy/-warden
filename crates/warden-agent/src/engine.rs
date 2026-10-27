@@ -72,6 +72,9 @@ const NON_OWNER_AUDIT_EVERY_MS: u64 = 60_000;
 const RECENT_CHALLENGES: usize = 100;
 /// Owner messages with at most this many tokens are checked for the PIN.
 const MAX_PIN_LIKE_TOKENS: usize = 8;
+/// At most this many distinct candidates per message are checked against
+/// the PIN, so a long message cannot cost many slow PIN-hash checks.
+const MAX_PIN_LIKE_CANDIDATES: usize = 64;
 /// Longest token checked against the PIN, in characters.
 const MAX_PIN_TOKEN_CHARS: usize = 128;
 /// Longest sender id written to the audit log, in characters.
@@ -449,10 +452,23 @@ pub struct Engine<P: Planner, C: Channel, A: AuditSink> {
     pin_guard: PinGuard,
     clock: Clock,
     last_non_owner_audit_ms: Option<u64>,
-    /// Set when an owner prompt timed out: the current message ends.
-    end_message: bool,
+    /// Set when an owner prompt timed out or the input closed: the current
+    /// message ends.
+    end_message: Option<EndReason>,
     /// Challenge codes of recent prompts; a new code never repeats one.
     recent_challenges: VecDeque<String>,
+    /// How many `check_pin` calls the PIN-like check has made (test-hooks).
+    #[cfg(feature = "test-hooks")]
+    pin_like_checks: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Why the current message ended early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndReason {
+    /// An owner prompt timed out.
+    Timeout,
+    /// The input stream closed at an owner prompt.
+    InputClosed,
 }
 
 impl<P: Planner, C: Channel, A: AuditSink> fmt::Debug for Engine<P, C, A> {
@@ -523,8 +539,10 @@ where
             pin_guard: PinGuard::new(),
             clock: Box::new(system_clock_ms),
             last_non_owner_audit_ms: None,
-            end_message: false,
+            end_message: None,
             recent_challenges: VecDeque::new(),
+            #[cfg(feature = "test-hooks")]
+            pin_like_checks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -542,6 +560,13 @@ where
 
     pub fn channel(&self) -> &C {
         &self.channel
+    }
+
+    /// How many PIN checks the PIN-like message check has made so far.
+    #[cfg(feature = "test-hooks")]
+    pub fn pin_like_checks_for_test(&self) -> usize {
+        self.pin_like_checks
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn now(&self) -> u64 {
@@ -636,7 +661,7 @@ where
             .await;
             return;
         }
-        self.end_message = false;
+        self.end_message = None;
 
         let msg_id = new_id();
         let started = Instant::now();
@@ -707,10 +732,13 @@ where
                     calls_used += 1;
                     self.process_call(c, resp.text.as_deref()).await
                 };
-                if self.end_message {
+                match self.end_message {
                     // A prompt timed out: a late reply must never answer a
                     // later prompt, so nothing else in this message runs.
-                    return self.timed_out(&msg_id).await;
+                    Some(EndReason::Timeout) => return self.timed_out(&msg_id).await,
+                    // No owner can answer any more: stop here too.
+                    Some(EndReason::InputClosed) => return self.input_closed(&msg_id).await,
+                    None => {}
                 }
                 results.push(self.result_block(id, outcome));
             }
@@ -741,38 +769,52 @@ where
     /// Does a short owner message contain the PIN as a whole token? Checked
     /// with `check_pin` (constant time) on a blocking thread; no PIN file or
     /// an unreadable one means "no". Never touches the [`PinGuard`].
-    async fn is_pin_like(&self, text: &str) -> bool {
+    async fn is_pin_like<'a>(&self, text: &'a str) -> bool {
         let tokens: Vec<&str> = text.split_whitespace().collect();
         if tokens.is_empty() || tokens.len() > MAX_PIN_LIKE_TOKENS {
             return false;
         }
-        // Each token as typed, with ASCII punctuation trimmed from its ends
-        // (`4815162342.`, `(4815162342)`, `"4815162342"`), and its pieces
-        // between ASCII punctuation (`pin=4815162342`).
+        // Each token as typed, then with punctuation trimmed from its ends
+        // (`4815162342.`, `(4815162342)`, `"4815162342"`, `4815162342。`),
+        // then its pieces between punctuation (`pin=4815162342`). At most
+        // MAX_PIN_LIKE_CANDIDATES distinct candidates, each checked once;
+        // whole and trimmed tokens come first so the cap only drops pieces.
+        let punct = |c: char| !c.is_alphanumeric() && !c.is_whitespace();
+        let mut seen: HashSet<&str> = HashSet::new();
         let mut candidates: Zeroizing<Vec<String>> = Zeroizing::new(Vec::new());
-        let punct = |c: char| c.is_ascii_punctuation();
-        for t in tokens {
-            let mut add = |c: &str| {
-                if (1..=MAX_PIN_TOKEN_CHARS).contains(&c.chars().count())
-                    && !candidates.iter().any(|x| x == c)
-                {
-                    candidates.push(c.to_owned());
-                }
-            };
-            add(t);
-            add(t.trim_matches(punct));
-            for piece in t.split(punct) {
-                add(piece);
+        // `false` once the cap is reached.
+        let mut add = |c: &'a str| -> bool {
+            if candidates.len() >= MAX_PIN_LIKE_CANDIDATES {
+                return false;
+            }
+            // Byte length bounds the char count from above: cheap first.
+            let ok_len = !c.is_empty()
+                && (c.len() <= MAX_PIN_TOKEN_CHARS
+                    || c.chars().take(MAX_PIN_TOKEN_CHARS + 1).count() <= MAX_PIN_TOKEN_CHARS);
+            if ok_len && seen.insert(c) {
+                candidates.push(c.to_owned());
+            }
+            true
+        };
+        let whole = tokens.iter().flat_map(|t| [*t, t.trim_matches(punct)]);
+        let pieces = tokens.iter().flat_map(|t| t.split(punct));
+        for c in whole.chain(pieces) {
+            if !add(c) {
+                break;
             }
         }
         if candidates.is_empty() {
             return false;
         }
         let path = self.pin_path.clone();
+        #[cfg(feature = "test-hooks")]
+        let counter = Arc::clone(&self.pin_like_checks);
         tokio::task::spawn_blocking(move || {
-            candidates
-                .iter()
-                .any(|t| matches!(check_pin(&path, t), Ok(PinCheck::Match)))
+            candidates.iter().any(|t| {
+                #[cfg(feature = "test-hooks")]
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                matches!(check_pin(&path, t), Ok(PinCheck::Match))
+            })
         })
         .await
         .unwrap_or(false)
@@ -796,6 +838,12 @@ where
     async fn timed_out(&mut self, msg_id: &str) {
         self.channel.send("timed out").await;
         self.audit_or_warn(msg_id, "message", Tier::Auto, "failed: timeout")
+            .await;
+    }
+
+    async fn input_closed(&mut self, msg_id: &str) {
+        self.channel.send("input closed").await;
+        self.audit_or_warn(msg_id, "message", Tier::Auto, "failed: input closed")
             .await;
     }
 
@@ -944,7 +992,7 @@ where
         .await
         .ok();
         let Some(reply) = reply else {
-            self.end_message = true;
+            self.end_message = Some(EndReason::Timeout);
             return self
                 .refuse(
                     &action,
@@ -961,6 +1009,7 @@ where
                     .await;
             }
             (_, Consent::Closed) => {
+                self.end_message = Some(EndReason::InputClosed);
                 return self
                     .refuse(&action, tier, "refused: no reply", "owner declined")
                     .await;
