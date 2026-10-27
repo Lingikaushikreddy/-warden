@@ -7,8 +7,15 @@
 set -eu
 
 cd "$(dirname "$0")/.."
+bin="${CARGO_TARGET_DIR:-target}/release/warden"
+# Remove any previous binary first, so a failed build can never leave a
+# stale one to be checked.
+rm -f "$bin"
 cargo build --release -p warden-cli --locked
-bin=target/release/warden
+if [ ! -x "$bin" ]; then
+    echo "FAIL: release binary $bin is missing after the build" >&2
+    exit 1
+fi
 
 found=$(strings "$bin" | grep -i -E 'mock|from_script|WARDEN_TEST_FAIL|test-hooks' || true)
 if [ -n "$found" ]; then
@@ -20,7 +27,7 @@ echo "ok: no test-only strings in $bin"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-mkdir -m 700 "$tmp/home" "$tmp/root"
+mkdir -m 700 "$tmp/home" "$tmp/root" "$tmp/userhome"
 printf 'root = "%s"\nprovider = "mock"\nscript = "%s/s.json"\n' "$tmp/root" "$tmp" > "$tmp/home/config.toml"
 chmod 600 "$tmp/home/config.toml"
 printf 'root = "%s"\nprovider = "mock"\n' "$tmp/root" > "$tmp/home/mock-only.toml"
@@ -28,7 +35,7 @@ chmod 600 "$tmp/home/mock-only.toml"
 
 for cfg in config.toml mock-only.toml; do
     set +e
-    msg=$("$bin" --home "$tmp/home" agent --config "$tmp/home/$cfg" </dev/null 2>&1)
+    msg=$(HOME="$tmp/userhome" "$bin" --home "$tmp/home" agent --config "$tmp/home/$cfg" </dev/null 2>&1)
     code=$?
     set -e
     if [ "$code" -ne 1 ]; then

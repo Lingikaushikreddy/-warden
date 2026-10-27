@@ -21,6 +21,11 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Env {
     _tmp: tempfile::TempDir,
+    /// A fake `$HOME` for every spawned agent, in its own tempdir so it is
+    /// never under `base` (the tests must not depend on the ambient HOME,
+    /// which may be unset or missing, e.g. `/homeless-shelter` under Nix).
+    _user_tmp: tempfile::TempDir,
+    user_home: PathBuf,
     base: PathBuf,
     home: PathBuf,
     root: PathBuf,
@@ -30,6 +35,8 @@ impl Env {
     /// `<tmp>/home` (0700) and `<tmp>/root`, canonical.
     fn new() -> Env {
         let tmp = tempfile::tempdir().unwrap();
+        let user_tmp = tempfile::tempdir().unwrap();
+        let user_home = fs::canonicalize(user_tmp.path()).unwrap();
         let base = fs::canonicalize(tmp.path()).unwrap();
         let home = base.join("home");
         let root = base.join("root");
@@ -38,6 +45,8 @@ impl Env {
         fs::create_dir(&root).unwrap();
         Env {
             _tmp: tmp,
+            _user_tmp: user_tmp,
+            user_home,
             base,
             home,
             root,
@@ -66,6 +75,7 @@ impl Env {
         c.env_remove(KEY_VAR)
             .env_remove("WARDEN_PIN")
             .env_remove("WARDEN_TEST_FAIL_AUDIT_APPEND")
+            .env("HOME", &self.user_home)
             .current_dir(&self.root)
             .timeout(RUN_TIMEOUT)
             .arg("--home")
@@ -149,6 +159,7 @@ fn answer_prompt(e: &Env, first: &str, answer: impl Fn(&str) -> String) -> (i32,
     let re = regex::Regex::new(r#"Reply "yes (\d{4})"#).unwrap();
     let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("warden"))
         .env_remove(KEY_VAR)
+        .env("HOME", &e.user_home)
         .env_remove("WARDEN_PIN")
         .current_dir(&e.root)
         .arg("--home")
@@ -494,6 +505,7 @@ fn agent_logs_session_start_and_end() {
     // The chain verifies.
     Command::cargo_bin("warden")
         .unwrap()
+        .env("HOME", &e.user_home)
         .arg("--home")
         .arg(&e.home)
         .args(["audit", "verify"])
@@ -619,11 +631,16 @@ fn agent_refuses_to_start_without_home_env() {
     let (code, se) = run_with_home(&e, None, &e.root.clone(), false);
     assert_eq!(code, 1, "{se}");
     assert!(
-        se.contains("HOME is not set; pass --allow-home-root to continue"),
+        se.contains("HOME is not set or does not exist; pass --allow-home-root to continue"),
         "{se}"
     );
     let (code, se) = run_with_home(&e, None, &e.root.clone(), true);
     assert_eq!(code, 0, "{se}");
+    // A HOME that does not exist cannot be checked either.
+    let missing = e.base.join("no-such-home");
+    let (code, se) = run_with_home(&e, Some(&missing), &e.root.clone(), false);
+    assert_eq!(code, 1, "{se}");
+    assert!(se.contains("does not exist"), "{se}");
 }
 
 #[test]
@@ -647,6 +664,7 @@ fn agent_refuses_a_symlinked_data_dir() {
     let o = Command::cargo_bin("warden")
         .unwrap()
         .env_remove(KEY_VAR)
+        .env("HOME", &e.user_home)
         .current_dir(&e.root)
         .timeout(RUN_TIMEOUT)
         .arg("--home")
@@ -723,4 +741,31 @@ fn agent_does_not_name_an_odd_key_variable() {
         .unwrap();
     let se = out(&o).1;
     assert!(se.contains("MY_TEAM_KEY"), "{se}");
+}
+
+// ------------------------------------------------- review round 2
+
+#[test]
+fn agent_does_not_name_a_key_variable_that_carries_data() {
+    let e = Env::new();
+    for name in [
+        "CARD_4111111111111111",
+        "K_123456789012345678901234567890",
+        "GHP_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        "SK_LIVE_51ABCDEFGHIJKLMNOPQRSTUV",
+        "A_4111_1111_1111_1111",
+    ] {
+        e.config(&format!(
+            "root = \"{}\"\napi_key_env = \"{name}\"\n",
+            e.root.display()
+        ));
+        let o = e.cmd().env_remove(name).write_stdin("").output().unwrap();
+        let (so, se) = out(&o);
+        assert_eq!(o.status.code(), Some(1), "{name}: {so}\n{se}");
+        assert!(!se.contains(name) && !so.contains(name), "{name}: {se}");
+    }
+    // The default is always named.
+    e.config(&format!("root = \"{}\"\n", e.root.display()));
+    let o = e.cmd().write_stdin("").output().unwrap();
+    assert!(out(&o).1.contains(KEY_VAR));
 }

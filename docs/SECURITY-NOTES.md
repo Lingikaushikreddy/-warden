@@ -473,8 +473,9 @@ agent engine on stdin/stdout. The pieces, each with its own section here:
   sender); `root` missing, not a directory, `/`, or `$HOME` or an ANCESTOR
   of it (unless the hidden `--allow-home-root`; an unset or unresolvable
   `HOME` also needs the flag); key variable unset or empty (named only
-  when it is the default or a conventional `UPPER_SNAKE` name of at most
-  40 characters); planner config invalid. Only then are the audit log
+  when it is the default, or a conventional `UPPER_SNAKE` name of at most
+  40 characters that the redactor leaves unchanged, with no segment over
+  16 characters and at most 6 digits in all); planner config invalid. Only then are the audit log
   (broken or locked: refused), the approver store, the snapshot store and
   the executor opened, so the earlier failures leave no files but the data
   dir. Last, `Engine::try_new` refuses an unprotected state dir. The CLI
@@ -486,6 +487,10 @@ agent engine on stdin/stdout. The pieces, each with its own section here:
   effort). While the agent runs it holds the audit log lock, so other
   writing `warden` commands fail until it exits. The API key stays in the
   process environment (the planner zeroizes its own copy).
+- **The HOME-ancestor guard trusts the `HOME` environment variable**; the
+  passwd home is not consulted, so a process started with a different
+  `HOME` can bypass it. `--allow-home-root` and the choice of root remain
+  the user's responsibility.
 - **Owner values are never echoed raw**: `owner` must be
   `[A-Za-z0-9._@:-]{1,64}` and unchanged by the redactor.
 - **Planner trust model**: see "Planner boundary" (what is sent, transport,

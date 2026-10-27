@@ -106,21 +106,27 @@ pub fn cmd_agent(home: &Path, config: Option<PathBuf>, allow_home_root: bool) ->
     }
 }
 
-/// A conventional variable name, safe to show: the default, or
-/// `^[A-Z][A-Z0-9]*(_[A-Z0-9]+)+$` with at most 40 characters. Anything else
-/// might be a value pasted into `api_key_env` and is not shown.
+/// A variable name safe to show: the default always; otherwise a
+/// conventional `^[A-Z][A-Z0-9]*(_[A-Z0-9]+)+$` name of at most 40
+/// characters that the redactor leaves unchanged, with no `_`-separated
+/// segment longer than 16 characters and at most 6 digits in the whole
+/// name (a per-segment cap alone would let `A_4111_1111_1111_1111` through).
+/// Anything else might carry data pasted into `api_key_env` (a card number,
+/// a token) and is not shown.
 fn showable_env_name(name: &str) -> bool {
     if name == DEFAULT_API_KEY_ENV {
         return true;
     }
     let b = name.as_bytes();
-    let upper_digit = |c: &u8| c.is_ascii_uppercase() || c.is_ascii_digit();
+    let upper_digit = |c: u8| c.is_ascii_uppercase() || c.is_ascii_digit();
+    let segment_ok =
+        |part: &str| !part.is_empty() && part.len() <= 16 && part.bytes().all(upper_digit);
     name.len() <= 40
         && b.first().is_some_and(u8::is_ascii_uppercase)
         && name.contains('_')
-        && name
-            .split('_')
-            .all(|part| !part.is_empty() && part.bytes().all(|c| upper_digit(&c)))
+        && name.split('_').all(segment_ok)
+        && name.bytes().filter(u8::is_ascii_digit).count() <= 6
+        && warden_agent::redact::redact(name).0.as_str() == name
 }
 
 /// Step 1: the data dir exists, is a real directory (not a symlink), is
@@ -305,7 +311,7 @@ fn resolve_root(root: &Path, allow_home_root: bool) -> Result<PathBuf, u8> {
         .filter(|h| !h.is_empty())
         .and_then(|h| fs::canonicalize(h).ok());
     let Some(user_home) = user_home else {
-        err!("error: HOME is not set; pass --allow-home-root to continue");
+        err!("error: HOME is not set or does not exist; pass --allow-home-root to continue");
         return Err(EXIT_ERROR);
     };
     if user_home.starts_with(&canon) {
@@ -378,4 +384,33 @@ fn run<P: Planner>(planner: P, parts: Parts) -> Result<u8, u8> {
     // a stdin reader thread that might still be blocked.
     rt.shutdown_timeout(Duration::from_secs(1));
     Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::showable_env_name;
+
+    #[test]
+    fn env_names_shown_only_when_conventional() {
+        for ok in [
+            "ANTHROPIC_API_KEY",
+            "MY_TEAM_KEY",
+            "WARDEN_TEST_KEY_VAR",
+            "A1_B2",
+        ] {
+            assert!(showable_env_name(ok), "{ok}");
+        }
+        for bad in [
+            "CARD_4111111111111111",
+            "K_123456789012345678901234567890",
+            "GHP_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+            "SK_LIVE_51ABCDEFGHIJKLMNOPQRSTUV",
+            "A_4111_1111_1111_1111",
+            "NOUNDERSCORE",
+            "lower_case",
+            "A__B",
+        ] {
+            assert!(!showable_env_name(bad), "{bad}");
+        }
+    }
 }

@@ -115,7 +115,9 @@ Startup fails closed with exit code 1 and a short message on stderr
   folder that contains it (such as `/Users`), because that would expose
   `~/.ssh` and every dotfile to `Auto` reads. The deliberately unadvertised
   `--allow-home-root` flag overrides this, and is also required when
-  `HOME` is not set, since the check cannot be made then;
+  `HOME` is not set or does not exist, since the check cannot be made then
+  (the message is `HOME is not set or does not exist; pass
+  --allow-home-root to continue`);
 - the API key variable is unset or empty;
 - the audit log is broken or locked.
 
@@ -157,6 +159,10 @@ which has the details.
 - **Stdio trust.** Whoever controls stdin is the owner, and input already
   in transit when a prompt appears can still answer it if it carries that
   prompt's code.
+- **The home-folder guard trusts the `HOME` environment variable.** The
+  system's account database (passwd) is not consulted, so a process started
+  with a different `HOME` can get past it. `--allow-home-root` and the
+  choice of `root` remain your responsibility.
 - **The API key stays in the process environment** for the life of the
   agent (Warden zeroizes its own copy, but cannot safely remove the
   variable), so anything that can read the process's environment can read
