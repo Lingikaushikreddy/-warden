@@ -2165,3 +2165,310 @@ async fn pin_like_check_does_not_feed_the_pin_guard() {
         env.decisions()
     );
 }
+
+// ------------------------------------------------- review round 3: challenge codes
+
+/// Codes shown so far, in order, parsed from `Reply "yes <code>..."` lines.
+fn shown_codes(out: &SharedBuf) -> Vec<String> {
+    out_text(out)
+        .lines()
+        .filter_map(|l| l.strip_prefix("Reply \"yes "))
+        .filter_map(|r| r.split([' ', '"']).next())
+        .map(str::to_string)
+        .collect()
+}
+
+type Answer = Box<dyn Fn(&[String]) -> String + Send>;
+
+/// Write `first`, then answer the n-th prompt (once it is on screen) with
+/// `answers[n](codes shown so far)`, then keep the stream open briefly.
+fn drive_answers(
+    first: &str,
+    out: SharedBuf,
+    answers: Vec<Answer>,
+) -> (DuplexReader, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncWriteExt;
+    let (client, server) = tokio::io::duplex(4096);
+    let (srv_r, srv_w) = tokio::io::split(server);
+    let first = first.to_string();
+    let h = tokio::spawn(async move {
+        let _keep = srv_w;
+        let (_r, mut w) = tokio::io::split(client);
+        w.write_all(first.as_bytes()).await.unwrap();
+        for (i, answer) in answers.into_iter().enumerate() {
+            let mut tries = 0;
+            while shown_codes(&out).len() <= i && tries < 1000 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                tries += 1;
+            }
+            let line = answer(&shown_codes(&out));
+            w.write_all(line.as_bytes()).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        w.shutdown().await.unwrap();
+    });
+    (tokio::io::BufReader::new(srv_r), h)
+}
+
+#[tokio::test(start_paused = true)]
+async fn reply_with_the_shown_code_approves() {
+    let env = env();
+    let a = env.file("a.txt", "A-old");
+    let out = SharedBuf::default();
+    let (reader, h) = drive_answers(
+        "update a\n",
+        out.clone(),
+        vec![Box::new(|codes: &[String]| format!("yes {}\n", codes[0]))],
+    );
+    let planner = MockPlanner::scripted(vec![
+        reply(
+            None,
+            vec![call(
+                "t1",
+                "write_file",
+                json!({"path": "a.txt", "content": "A-new"}),
+            )],
+        ),
+        reply(Some("ok"), vec![]),
+    ]);
+    let mut e = stdio_engine(&env, planner, reader, out.clone(), |_| {});
+    e.run().await;
+    h.await.unwrap();
+    assert_eq!(fs::read_to_string(&a).unwrap(), "A-new");
+    let codes = shown_codes(&out);
+    assert_eq!(codes.len(), 1);
+    assert!(codes[0].len() == 4 && codes[0].bytes().all(|b| b.is_ascii_digit()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn fresh_bare_yes_after_the_prompt_does_not_approve() {
+    let env = env();
+    let a = env.file("a.txt", "A-old");
+    let out = SharedBuf::default();
+    let (reader, h) = drive_answers(
+        "update a\n",
+        out.clone(),
+        vec![Box::new(|_: &[String]| "yes\n".to_string())],
+    );
+    let planner = MockPlanner::scripted(vec![
+        reply(
+            None,
+            vec![call(
+                "t1",
+                "write_file",
+                json!({"path": "a.txt", "content": "A-new"}),
+            )],
+        ),
+        reply(Some("ok"), vec![]),
+    ]);
+    let mut e = stdio_engine(&env, planner, reader, out.clone(), |_| {});
+    e.run().await;
+    h.await.unwrap();
+    assert_eq!(fs::read_to_string(&a).unwrap(), "A-old");
+    assert_eq!(env.decisions(), vec!["refused: owner declined"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn previous_prompts_code_does_not_approve_the_next_prompt() {
+    let env = env();
+    let a = env.file("a.txt", "A-old");
+    let b = env.file("b.txt", "B-old");
+    let out = SharedBuf::default();
+    let (reader, h) = drive_answers(
+        "update a\n",
+        out.clone(),
+        vec![
+            Box::new(|codes: &[String]| format!("yes {}\n", codes[0])),
+            // The second prompt answered with the FIRST prompt's code.
+            Box::new(|codes: &[String]| format!("yes {}\n", codes[0])),
+        ],
+    );
+    let mut e = stdio_engine(&env, two_writes(), reader, out.clone(), |_| {});
+    e.run().await;
+    h.await.unwrap();
+    assert_eq!(fs::read_to_string(&a).unwrap(), "A-new");
+    assert_eq!(fs::read_to_string(&b).unwrap(), "B-old");
+    let codes = shown_codes(&out);
+    assert_eq!(codes.len(), 2);
+    assert_ne!(codes[0], codes[1]);
+    assert_eq!(env.decisions().last().unwrap(), "refused: owner declined");
+}
+
+#[tokio::test(start_paused = true)]
+async fn typed_ahead_burst_cannot_approve_and_owner_is_told() {
+    let env = env();
+    let a = env.file("a.txt", "A-old");
+    // The approval line arrives with the request, before any prompt exists.
+    let (reader, h) = drive(vec![
+        (0, "write a\nyes 1234\n".into()),
+        (1000, String::new()),
+    ]);
+    let out = SharedBuf::default();
+    let planner = MockPlanner::scripted(vec![
+        reply(
+            None,
+            vec![call(
+                "t1",
+                "write_file",
+                json!({"path": "a.txt", "content": "A-new"}),
+            )],
+        ),
+        reply(Some("ok"), vec![]),
+    ]);
+    let mut e = stdio_engine(&env, planner, reader, out.clone(), |c| {
+        c.approval_timeout = Duration::from_millis(200)
+    });
+    e.run().await;
+    h.await.unwrap();
+    assert_eq!(fs::read_to_string(&a).unwrap(), "A-old");
+    let text = out_text(&out);
+    let notice = text
+        .find("earlier unsent input was discarded")
+        .expect(&text);
+    assert!(
+        notice < text.find("Approval needed").unwrap(),
+        "notice before the prompt"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn eof_at_a_prompt_is_audited_as_no_reply() {
+    let env = env();
+    let a = env.file("a.txt", "A-old");
+    let (reader, h) = drive(vec![(0, "update a\n".into())]);
+    let out = SharedBuf::default();
+    let planner = MockPlanner::scripted(vec![
+        reply(
+            None,
+            vec![call(
+                "t1",
+                "write_file",
+                json!({"path": "a.txt", "content": "A-new"}),
+            )],
+        ),
+        reply(Some("ok"), vec![]),
+    ]);
+    let mut e = stdio_engine(&env, planner, reader, out.clone(), |_| {});
+    e.run().await;
+    h.await.unwrap();
+    assert_eq!(fs::read_to_string(&a).unwrap(), "A-old");
+    assert_eq!(env.decisions(), vec!["refused: no reply"]);
+}
+
+#[tokio::test]
+async fn challenge_codes_differ_between_prompts() {
+    let env = env();
+    let calls: Vec<ToolCall> = (0..50)
+        .map(|i| {
+            call(
+                &format!("t{i}"),
+                "write_file",
+                json!({"path": "a.txt", "content": "x"}),
+            )
+        })
+        .collect();
+    let mut e = env.engine(
+        vec![reply(None, calls), reply(Some("ok"), vec![])],
+        Opts {
+            tweak: Box::new(|c| c.max_calls_per_message = 50),
+            ..Opts::default()
+        },
+    );
+    e.handle(msg("go")).await;
+    let codes: Vec<String> = env
+        .seen
+        .prompts()
+        .into_iter()
+        .map(|p| p.challenge)
+        .collect();
+    assert_eq!(codes.len(), 50);
+    for c in &codes {
+        assert!(c.len() == 4 && c.bytes().all(|b| b.is_ascii_digit()), "{c}");
+    }
+    let distinct: std::collections::HashSet<&String> = codes.iter().collect();
+    assert!(distinct.len() >= 40, "{} distinct", distinct.len());
+    for w in codes.windows(2) {
+        assert_ne!(w[0], w[1]);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_coded_pin_reply_after_timeout_is_dropped() {
+    let env = env();
+    env.set_pin();
+    let f = env.file("a.txt", "A");
+    let mut e = env.engine(
+        vec![
+            reply(None, vec![call("t1", "delete_file", path_arg(&f))]),
+            reply(Some("must not be reached"), vec![]),
+        ],
+        Opts {
+            inbound: vec![msg("delete a.txt"), msg(&format!("yes 4821 {PIN}"))],
+            replies: vec![Reply::Hang],
+            tweak: Box::new(|c| c.approval_timeout = Duration::from_secs(5)),
+            ..Opts::default()
+        },
+    );
+    e.run().await;
+    assert!(f.exists());
+    assert_eq!(e.planner().requests().len(), 1);
+    assert!(!everything(&env, &e.planner().requests()).contains(PIN));
+    assert_eq!(env.seen.sent().last().unwrap(), "no approval pending");
+}
+
+#[tokio::test]
+async fn pin_like_check_trims_punctuation() {
+    let env = env();
+    env.set_pin();
+    let mut e = env.engine(vec![reply(Some("chat"), vec![])], Opts::default());
+    for t in [
+        format!("{PIN}."),
+        format!("({PIN})"),
+        format!("\"{PIN}\""),
+        format!("pin={PIN}"),
+        format!("my pin is {PIN}!"),
+    ] {
+        e.handle(msg(&t)).await;
+    }
+    assert!(e.planner().requests().is_empty());
+    assert_eq!(env.decisions(), vec!["ignored: pin-like message"; 5]);
+    assert!(!everything(&env, &[]).contains(PIN));
+}
+
+/// On a case-insensitive filesystem `/.../ROOT/a.txt` opens the same file,
+/// but the executor refuses that spelling as OutsideRoot; the engine must
+/// refuse it the same way, before any prompt.
+#[tokio::test]
+async fn case_variant_spelling_is_refused_before_prompting() {
+    let env = env();
+    let f = env.file("a.txt", "A");
+    let upper = env.root.parent().unwrap().join("ROOT").join("a.txt");
+    if fs::metadata(&upper).is_err() {
+        eprintln!("case-sensitive filesystem; skipping");
+        return;
+    }
+    let mut e = env.engine(
+        vec![
+            reply(
+                None,
+                vec![call(
+                    "t1",
+                    "write_file",
+                    json!({"path": upper.to_string_lossy(), "content": "B"}),
+                )],
+            ),
+            reply(Some("ok"), vec![]),
+        ],
+        Opts {
+            replies: vec![yes()],
+            ..Opts::default()
+        },
+    );
+    e.handle(msg("go")).await;
+    assert!(
+        env.seen.prompts().is_empty(),
+        "no prompt for a spelling the executor refuses"
+    );
+    assert_eq!(env.decisions(), vec!["refused: outside root"]);
+    assert_eq!(fs::read_to_string(&f).unwrap(), "A");
+}

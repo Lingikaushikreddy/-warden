@@ -38,7 +38,7 @@
 //! }
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -68,6 +68,8 @@ const PIN_MAX_FAILURES: u32 = 3;
 const PIN_LOCK_MS: u64 = 60_000;
 /// At most one `ignored: non-owner` audit entry per this many milliseconds.
 const NON_OWNER_AUDIT_EVERY_MS: u64 = 60_000;
+/// How many recent challenge codes a new one must differ from.
+const RECENT_CHALLENGES: usize = 100;
 /// Owner messages with at most this many tokens are checked for the PIN.
 const MAX_PIN_LIKE_TOKENS: usize = 8;
 /// Longest token checked against the PIN, in characters.
@@ -229,6 +231,11 @@ pub fn is_approval_shaped(text: &str) -> bool {
     first.eq_ignore_ascii_case("yes") && parts.next().is_some()
 }
 
+/// Would this summary, as displayed, be longer than [`MAX_SUMMARY_CHARS`]?
+fn summary_too_long(summary: &str) -> bool {
+    sanitize_for_display(summary).chars().count() > MAX_SUMMARY_CHARS
+}
+
 /// Cut a model note to [`MAX_NOTE_CHARS`] characters, ending with `…`.
 fn cap_note(note: &str) -> String {
     if note.chars().count() <= MAX_NOTE_CHARS {
@@ -239,15 +246,17 @@ fn cap_note(note: &str) -> String {
     out
 }
 
-/// Every path capability of `action` lies inside the canonical root, by
-/// the executor's rule: `..` removed lexically, then the deepest existing
-/// ancestor canonicalized. Any spelling of the root (a symlink alias,
-/// `/tmp` vs `/private/tmp`) therefore works, and `..` escapes and
-/// symlinked parents pointing out are refused.
-fn paths_inside(action: &Action, root_canon: &Path) -> bool {
+/// Every path capability of `action` is spelled in a way the executor
+/// accepts ([`Executor::accepts_spelling`]: under the canonical root or the
+/// root as given, with the deepest existing ancestor resolving inside the
+/// canonical root). Using the executor's own rule means the owner is never
+/// asked to approve an action `run` would refuse as `OutsideRoot` (a case
+/// variant or an unknown alias spelling of the root); `..` escapes and
+/// symlinked parents pointing out are refused too.
+fn paths_inside(action: &Action, executor: &Executor) -> bool {
     action.capabilities.iter().all(|c| match c {
         Capability::ReadPath(p) | Capability::WritePath(p) | Capability::DeletePath(p) => {
-            resolve_deepest(p).is_some_and(|p| p.starts_with(root_canon))
+            executor.accepts_spelling(p)
         }
         _ => true,
     })
@@ -411,6 +420,8 @@ impl Outcome {
 enum Consent {
     Yes,
     No,
+    /// The channel closed before any reply.
+    Closed,
     Pin(Zeroizing<String>),
 }
 
@@ -419,6 +430,7 @@ impl From<ApprovalReply> for Consent {
         match r {
             ApprovalReply::Yes => Consent::Yes,
             ApprovalReply::No => Consent::No,
+            ApprovalReply::Closed => Consent::Closed,
             ApprovalReply::YesPin(p) => Consent::Pin(Zeroizing::new(p)),
         }
     }
@@ -439,6 +451,8 @@ pub struct Engine<P: Planner, C: Channel, A: AuditSink> {
     last_non_owner_audit_ms: Option<u64>,
     /// Set when an owner prompt timed out: the current message ends.
     end_message: bool,
+    /// Challenge codes of recent prompts; a new code never repeats one.
+    recent_challenges: VecDeque<String>,
 }
 
 impl<P: Planner, C: Channel, A: AuditSink> fmt::Debug for Engine<P, C, A> {
@@ -510,6 +524,7 @@ where
             clock: Box::new(system_clock_ms),
             last_non_owner_audit_ms: None,
             end_message: false,
+            recent_challenges: VecDeque::new(),
         })
     }
 
@@ -731,13 +746,25 @@ where
         if tokens.is_empty() || tokens.len() > MAX_PIN_LIKE_TOKENS {
             return false;
         }
-        let candidates: Zeroizing<Vec<String>> = Zeroizing::new(
-            tokens
-                .into_iter()
-                .filter(|t| (1..=MAX_PIN_TOKEN_CHARS).contains(&t.chars().count()))
-                .map(str::to_owned)
-                .collect(),
-        );
+        // Each token as typed, with ASCII punctuation trimmed from its ends
+        // (`4815162342.`, `(4815162342)`, `"4815162342"`), and its pieces
+        // between ASCII punctuation (`pin=4815162342`).
+        let mut candidates: Zeroizing<Vec<String>> = Zeroizing::new(Vec::new());
+        let punct = |c: char| c.is_ascii_punctuation();
+        for t in tokens {
+            let mut add = |c: &str| {
+                if (1..=MAX_PIN_TOKEN_CHARS).contains(&c.chars().count())
+                    && !candidates.iter().any(|x| x == c)
+                {
+                    candidates.push(c.to_owned());
+                }
+            };
+            add(t);
+            add(t.trim_matches(punct));
+            for piece in t.split(punct) {
+                add(piece);
+            }
+        }
         if candidates.is_empty() {
             return false;
         }
@@ -749,6 +776,21 @@ where
         })
         .await
         .unwrap_or(false)
+    }
+
+    /// A fresh 4-digit challenge from the OS RNG, different from the last
+    /// [`RECENT_CHALLENGES`] codes. Never derived from the action.
+    fn new_challenge(&mut self) -> String {
+        loop {
+            let code = format!("{:04}", OsRng.next_u32() % 10_000);
+            if !self.recent_challenges.contains(&code) {
+                if self.recent_challenges.len() >= RECENT_CHALLENGES {
+                    self.recent_challenges.pop_front();
+                }
+                self.recent_challenges.push_back(code.clone());
+                return code;
+            }
+        }
     }
 
     async fn timed_out(&mut self, msg_id: &str) {
@@ -820,7 +862,21 @@ where
                     )
                     .await;
             }
-            _ if !paths_inside(&action, &self.cfg.root) => {
+            // Checked before the root rule: a path long enough to overflow
+            // the prompt can also fail canonicalization (PATH_MAX), and the
+            // owner should see the more specific reason.
+            Decision::NeedsYes | Decision::NeedsPin if summary_too_long(&action.summary) => {
+                let tier = classify(&action, &self.policy);
+                return self
+                    .refuse(
+                        &action,
+                        tier,
+                        "refused: prompt too long",
+                        "request too long",
+                    )
+                    .await;
+            }
+            _ if !paths_inside(&action, &self.executor) => {
                 // Lexical; the executor still checks canonically. Nothing
                 // outside the root can run, so never ask for consent.
                 let tier = classify(&action, &self.policy);
@@ -855,16 +911,6 @@ where
             Decision::NeedsPin => Tier::YesPin,
         };
 
-        if sanitize_for_display(&action.summary).chars().count() > MAX_SUMMARY_CHARS {
-            return self
-                .refuse(
-                    &action,
-                    tier,
-                    "refused: prompt too long",
-                    "request too long",
-                )
-                .await;
-        }
         if tier == Tier::YesPin {
             let now = self.now();
             if let PinState::Locked { until_ms } = self.pin_guard.state(now) {
@@ -881,9 +927,16 @@ where
             summary: action.summary.clone(),
             tier,
             model_note: note.map(cap_note),
+            challenge: self.new_challenge(),
         };
-        // Input already waiting cannot be a reply to a prompt not yet shown.
-        self.channel.discard_pending_input().await;
+        // Input already waiting cannot be a reply to a prompt not yet shown
+        // (it cannot contain the new code either); say so, so typed-ahead
+        // chat is not lost silently.
+        if self.channel.discard_pending_input().await > 0 {
+            self.channel
+                .send("earlier unsent input was discarded")
+                .await;
+        }
         let reply = timeout(
             self.cfg.approval_timeout,
             self.channel.ask_approval(&prompt),
@@ -905,6 +958,11 @@ where
             (_, Consent::No) => {
                 return self
                     .refuse(&action, tier, "refused: owner declined", "owner declined")
+                    .await;
+            }
+            (_, Consent::Closed) => {
+                return self
+                    .refuse(&action, tier, "refused: no reply", "owner declined")
                     .await;
             }
             (Decision::NeedsYes, Consent::Yes) => {}
@@ -1163,6 +1221,8 @@ mod tests {
             "yes 123456",
             "Yes\tpin",
             "yes please do it",
+            "yes 4821",
+            "yes 4821 123456",
         ] {
             assert!(is_approval_shaped(t), "{t:?}");
         }

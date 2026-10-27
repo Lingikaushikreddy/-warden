@@ -406,6 +406,39 @@ impl Executor {
         Ok(out)
     }
 
+    /// The path relative to the root, if `lex` (lexically normalized) is
+    /// spelled under the canonical root or the root as given. The single
+    /// spelling rule shared by [`Executor::check`] and
+    /// [`Executor::accepts_spelling`].
+    fn rel_under_root(&self, lex: &Path) -> Option<PathBuf> {
+        let rel = lex
+            .strip_prefix(&self.root)
+            .or_else(|_| lex.strip_prefix(&self.root_lexical))
+            .ok()?
+            .to_path_buf();
+        rel.components()
+            .all(|c| matches!(c, Component::Normal(_)))
+            .then_some(rel)
+    }
+
+    /// Would the root checks accept this spelling of a path? True when the
+    /// path is spelled under the root (canonical or as given, compared
+    /// component by component, so a case or other alias spelling the
+    /// executor does not know is refused) AND its deepest existing ancestor
+    /// resolves inside the canonical root. The engine uses this so it never
+    /// asks the owner to approve an action `run` would refuse as
+    /// `OutsideRoot`. Symlink, protected-path and file-kind checks still
+    /// happen only in `run`.
+    pub fn accepts_spelling(&self, path: &Path) -> bool {
+        let Some(lex) = normalize(path) else {
+            return false;
+        };
+        let Some(rel) = self.rel_under_root(&lex) else {
+            return false;
+        };
+        resolve_deepest(&self.root.join(rel)).is_ok_and(|c| within(&c, &self.root))
+    }
+
     /// Path checks shared by every tool (see the module docs).
     fn check(&self, raw: &Path) -> Result<Checked, ExecError> {
         let lex = normalize(raw).ok_or(ExecError::OutsideRoot)?;
@@ -414,14 +447,7 @@ impl Executor {
         if is_protected(&lex) {
             return Err(ExecError::Protected);
         }
-        let rel = lex
-            .strip_prefix(&self.root)
-            .or_else(|_| lex.strip_prefix(&self.root_lexical))
-            .map_err(|_| ExecError::OutsideRoot)?
-            .to_path_buf();
-        if !rel.components().all(|c| matches!(c, Component::Normal(_))) {
-            return Err(ExecError::OutsideRoot);
-        }
+        let rel = self.rel_under_root(&lex).ok_or(ExecError::OutsideRoot)?;
 
         // No existing component below the root may be a symlink.
         let mut cur = self.root.clone();

@@ -419,16 +419,30 @@ exists at the time of the check.
   missing approval replies are `No`.
 - `StdioChannel` is local-only: whoever controls the process's stdin is the
   owner. It is not suitable for any network-exposed transport.
-- Approval replies fail closed. For tiers other than `YesPin` only the exact
-  reply `yes` approves (`yes <anything>` is No), so queued chat text cannot
-  approve a prompt. For `YesPin`, `yes <pin>` (1-128 chars) is required. EOF
-  in the middle of a reply line, over-long replies and a truncated summary or
-  note (the prompt is refused without asking) are all No.
-- Freshness: stdin is one stream, so an approval is only as fresh as the
-  stream. The engine calls `discard_pending_input` before every prompt
-  (see "Engine", "Late replies" for what it can and cannot drop), ends the
-  message on a prompt timeout, and never treats approval-shaped text as
-  chat.
+- **Per-prompt challenge code.** Every `ApprovalPrompt` carries a
+  `challenge`: a fresh 4-digit code the ENGINE draws from the OS RNG for
+  that prompt (never derived from the action, and different from the last
+  100 codes), shown in the prompt as `Reply "yes <code>" or "no":` or
+  `Reply "yes <code> <PIN>" or "no":`. Why: a reply typed before the prompt
+  was displayed cannot contain its code, so stale, typed-ahead or
+  in-transit input, and a reply meant for an earlier prompt, can never
+  approve. The code is not secret (it is on screen); it is exact-matched,
+  and a wrong guess fails closed (1 in 10 000 for a blind guess).
+- Approval replies fail closed. For tiers other than `YesPin` only
+  `yes <code>` approves (`yes` in any case, trimmed, exactly one token
+  after it, equal to the code). For `YesPin`, `yes <code> <pin>` (the PIN
+  is the rest of the line, 1-128 chars) is required. A bare `yes`,
+  `yes <wrong or previous code>`, `yes <pin>` without the code, over-long
+  replies, and a truncated summary or note or an invalid challenge (the
+  prompt is refused without asking) are all No. EOF before a complete
+  reply line is `ApprovalReply::Closed`, which the engine treats as a
+  refusal audited `refused: no reply`.
+- Freshness: stdin is one stream. The challenge code is what makes an
+  approval fresh: only a reply typed after the prompt appeared can carry
+  it. On top of that the engine calls `discard_pending_input` before every
+  prompt (it returns the bytes dropped, and the owner is told `earlier
+  unsent input was discarded`), ends the message on a prompt timeout, and
+  never treats approval-shaped text as chat.
 - The PIN comes back as a plain `String` (not zeroized); the engine must
   compare it in constant time.
 - Display also escapes blank-looking spaces (NBSP, U+2000-200A, U+202F,
@@ -470,15 +484,20 @@ planner and the executor are wired together.
   through one running engine, not offline guessing of the PIN file (see
   "CLI PIN").
 - **Consent only for runnable actions.** Before any prompt, an action
-  with a path capability outside the root (by the executor's rule: `..`
-  removed lexically, then the deepest existing ancestor canonicalized and
-  compared with the canonical root, so a symlink alias of the root such as
-  `/tmp` for `/private/tmp` works and a symlinked parent pointing out does
-  not) is
+  with a path capability the executor would refuse as outside the root is
+  refused. The engine asks the executor itself
+  (`Executor::accepts_spelling`, the same spelling rule `run` uses): the
+  path must be spelled, component by component, under the canonical root
+  or the root as given (`..` removed lexically), and its deepest existing
+  ancestor must resolve inside the canonical root. So a symlink alias the
+  executor was built with works, while a case variant (`/.../ROOT/a.txt` on
+  a case-insensitive filesystem), an unknown alias, a path too long to
+  canonicalize, or a symlinked parent pointing out is
   refused (`refused: outside root`, tool result `outside the allowed
   folder`) without asking: the owner is never asked to approve something
   that cannot run. A summary longer than 3000 characters after display
-  sanitizing is refused unprompted (`refused: prompt too long`, tool result
+  sanitizing (checked first, for actions that would prompt) is refused
+  unprompted (`refused: prompt too long`, tool result
   `request too long`), and the model note is cut by the engine to 500
   characters with `…`, so the channel never has to refuse a truncated
   prompt. A write approval shows only the quoted path and the byte count,
@@ -490,6 +509,10 @@ planner and the executor are wired together.
   the same message, approving an action the owner never saw; or it could
   arrive as the next chat message and send the PIN to the remote planner.
   Mitigations:
+  0. **Per-prompt challenge code** (see "Channel"): an approval must
+     contain the code shown in THAT prompt, so no reply typed before the
+     prompt existed, and no reply carrying an earlier prompt's code, can
+     approve it. This is the primary defence; the rest is depth.
   1. **A prompt timeout ends the message.** The owner is told `timed out`,
      the action is audited `refused: approval timed out`, then the message
      `failed: timeout`; no further call of that message is processed or
@@ -513,7 +536,10 @@ planner and the executor are wired together.
      chat message `34`; the whole line arrives as one (dropped) message.
   5. **PIN-like chat is dropped.** An owner message of at most 8
      whitespace-separated tokens is checked token by token (tokens of
-     1-128 characters) against the stored PIN with `check_pin` (constant
+     1-128 characters; each token as typed, with ASCII punctuation trimmed
+     from its ends, and each piece between ASCII punctuation, so
+     `4815162342.`, `(4815162342)`, `"4815162342"` and `pin=4815162342`
+     match) against the stored PIN with `check_pin` (constant
      time, on a blocking thread). On a match the message is dropped, the
      owner is told `that message looks like your PIN; it was not sent`, and
      `ignored: pin-like message` is audited with no content. The check is
@@ -612,13 +638,13 @@ reached`) and `max_calls_per_message` tool calls per message.
   an approval prompt.
 - The model note in a prompt is model prose (labelled unverified); a
   persuasive note can still socially engineer the owner.
-- Freshness of approvals is only as good as the channel (see "Channel"):
-  input that has not reached the process when the stale-input discard runs
-  (see its limits above) can still answer the prompt.
-- The PIN-like filter matches whole whitespace-separated tokens of short
-  messages only: a PIN glued to punctuation (`1234.`), inside a longer
-  message (more than 8 tokens), or after the PIN file was changed is
-  ordinary chat and goes to the planner after redaction, which does not
-  recognize PINs.
+- Input that reaches the process after the discard can still answer a
+  prompt only if it contains that prompt's code, that is, only if it was
+  typed by someone who saw the prompt (or guessed the 4 digits).
+- The PIN-like filter checks short messages only (at most 8 tokens) and
+  only ASCII punctuation boundaries: a PIN inside a longer message, glued
+  to letters or non-ASCII punctuation, or typed after the PIN file was
+  changed is ordinary chat and goes to the planner after redaction, which
+  does not recognize PINs.
 - `AuditLog` appends and `ApproverStore` share the engine's lifetime; the
   engine holds both behind mutexes and processes one message at a time.

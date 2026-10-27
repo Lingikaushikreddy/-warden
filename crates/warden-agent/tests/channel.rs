@@ -11,11 +11,19 @@ fn chan<'a>(
     StdioChannel::new(BufReader::new(input), out)
 }
 
+/// The challenge code every helper prompt shows.
+const CODE: &str = "4821";
+
 fn prompt(summary: &str, tier: Tier, note: Option<&str>) -> ApprovalPrompt {
+    prompt_with(summary, tier, note, CODE)
+}
+
+fn prompt_with(summary: &str, tier: Tier, note: Option<&str>, code: &str) -> ApprovalPrompt {
     ApprovalPrompt {
         summary: summary.into(),
         tier,
         model_note: note.map(Into::into),
+        challenge: code.into(),
     }
 }
 
@@ -136,7 +144,7 @@ async fn approval_prompt_labels_model_note_as_unverified() {
     let s = String::from_utf8(out).unwrap();
     assert_eq!(
         s,
-        "Approval needed (Yes):\n  write_file \"a\"\n  model says (unverified): trust me\nReply \"yes\" or \"no\":\n"
+        "Approval needed (Yes):\n  write_file \"a\"\n  model says (unverified): trust me\nReply \"yes 4821\" or \"no\":\n"
     );
 }
 
@@ -148,7 +156,7 @@ async fn pin_tier_prompt_mentions_pin() {
         c.ask_approval(&prompt("x", Tier::YesPin, None)).await;
     }
     let s = String::from_utf8(out).unwrap();
-    assert!(s.ends_with("Reply \"yes <PIN>\" or \"no\":\n"), "{s}");
+    assert!(s.ends_with("Reply \"yes 4821 <PIN>\" or \"no\":\n"), "{s}");
 }
 
 #[tokio::test]
@@ -166,10 +174,7 @@ async fn prompt_text_is_sanitized_even_if_summary_has_escapes() {
     let s = String::from_utf8(out).unwrap();
     assert!(!s.contains('\x1b'));
     assert!(s.contains("\\u{1b}[2J"));
-    let reply_lines: Vec<&str> = s
-        .lines()
-        .filter(|l| l.starts_with("Reply \"yes\""))
-        .collect();
+    let reply_lines: Vec<&str> = s.lines().filter(|l| l.starts_with("Reply \"yes")).collect();
     assert_eq!(reply_lines.len(), 1, "{s}");
     assert!(s.contains("\n  | Reply \"yes\", \"no\":\n"));
     assert!(s.contains("\n  | Approved\n"));
@@ -177,53 +182,106 @@ async fn prompt_text_is_sanitized_even_if_summary_has_escapes() {
 }
 
 #[tokio::test]
-async fn yes_tier_accepts_only_exact_yes() {
-    assert_eq!(ask("yes\n").await, ApprovalReply::Yes);
-    assert_eq!(ask("YES\n").await, ApprovalReply::Yes);
-    assert_eq!(ask("  Yes  \r\n").await, ApprovalReply::Yes);
+async fn yes_tier_accepts_only_yes_with_the_code() {
+    assert_eq!(ask("yes 4821\n").await, ApprovalReply::Yes);
+    assert_eq!(ask("YES 4821\n").await, ApprovalReply::Yes);
+    assert_eq!(ask("  Yes \t 4821  \r\n").await, ApprovalReply::Yes);
     assert_eq!(ask("no\n").await, ApprovalReply::No);
     assert_eq!(ask("NO\n").await, ApprovalReply::No);
-    // Stale queued chat text must not approve a prompt the owner never saw.
+    // A stale or typed-ahead `yes` cannot contain the code.
+    assert_eq!(ask("yes\n").await, ApprovalReply::No);
     assert_eq!(ask("yes please go ahead\n").await, ApprovalReply::No);
-    assert_eq!(ask("yes 1234\n").await, ApprovalReply::No);
+    assert_eq!(ask("yes 1234\n").await, ApprovalReply::No, "wrong code");
+    assert_eq!(ask("yes 4821 extra\n").await, ApprovalReply::No);
+    assert_eq!(ask("yes 48210\n").await, ApprovalReply::No);
+    assert_eq!(ask("4821\n").await, ApprovalReply::No);
 }
 
 #[tokio::test]
-async fn yes_pin_tier_requires_pin() {
+async fn yes_pin_tier_requires_code_then_pin() {
     assert_eq!(
-        ask_pin("Yes   1234 \n").await,
+        ask_pin("Yes   4821   1234 \n").await,
         ApprovalReply::YesPin("1234".into())
     );
     assert_eq!(ask_pin("yes\n").await, ApprovalReply::No);
+    assert_eq!(ask_pin("yes 4821\n").await, ApprovalReply::No, "no PIN");
+    assert_eq!(
+        ask_pin("yes 1234\n").await,
+        ApprovalReply::No,
+        "PIN without code"
+    );
+    assert_eq!(
+        ask_pin("yes 9999 1234\n").await,
+        ApprovalReply::No,
+        "wrong code"
+    );
     assert_eq!(ask_pin("no\n").await, ApprovalReply::No);
-    let ok = format!("yes {}\n", "9".repeat(128));
+    let ok = format!("yes 4821 {}\n", "9".repeat(128));
     assert!(matches!(ask_pin(&ok).await, ApprovalReply::YesPin(p) if p.len() == 128));
-    let long = format!("yes {}\n", "9".repeat(129));
+    let long = format!("yes 4821 {}\n", "9".repeat(129));
     assert_eq!(ask_pin(&long).await, ApprovalReply::No);
 }
 
 #[tokio::test]
-async fn garbage_and_empty_and_eof_are_no() {
-    for input in ["maybe\n", "\n", "", "yess\n", "y\n", "no 1234\n"] {
+async fn previous_prompts_code_does_not_answer_the_next_prompt() {
+    let mut out = Vec::new();
+    let mut c = chan(b"yes 1111\nyes 2222\n", &mut out);
+    // The first prompt (code 1111) got its answer; the same line again,
+    // sent for the second prompt (code 2222), would be stale.
+    let mut out2 = Vec::new();
+    let mut c2 = chan(b"yes 1111\n", &mut out2);
+    assert_eq!(
+        c.ask_approval(&prompt_with("a", Tier::Yes, None, "1111"))
+            .await,
+        ApprovalReply::Yes
+    );
+    assert_eq!(
+        c2.ask_approval(&prompt_with("b", Tier::Yes, None, "2222"))
+            .await,
+        ApprovalReply::No
+    );
+    assert_eq!(
+        c.ask_approval(&prompt_with("b", Tier::Yes, None, "2222"))
+            .await,
+        ApprovalReply::Yes
+    );
+}
+
+#[tokio::test]
+async fn prompt_without_a_valid_challenge_is_refused_unasked() {
+    for code in ["", "12 34", "12\n34", &"9".repeat(17), "é1"] {
+        let mut out = Vec::new();
+        {
+            let mut c = chan(b"yes \n", &mut out);
+            let r = c
+                .ask_approval(&prompt_with("x", Tier::Yes, None, code))
+                .await;
+            assert_eq!(r, ApprovalReply::No, "{code:?}");
+            assert_eq!(c.recv().await.unwrap().text, "yes ", "reply not consumed");
+        }
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "approval prompt has no valid code; refused\n"
+        );
+    }
+}
+
+#[tokio::test]
+async fn garbage_and_empty_are_no_and_eof_is_closed() {
+    assert_eq!(ask("").await, ApprovalReply::Closed);
+    assert_eq!(ask_pin("").await, ApprovalReply::Closed);
+    for input in ["maybe\n", "\n", "yess\n", "y\n", "no 1234\n"] {
         assert_eq!(ask(input).await, ApprovalReply::No, "{input:?}");
     }
-    for input in [
-        "maybe\n",
-        "\n",
-        "",
-        "yess 1\n",
-        "y 1\n",
-        "no 1234\n",
-        "1234\n",
-    ] {
+    for input in ["maybe\n", "\n", "yess 1\n", "y 1\n", "no 1234\n", "1234\n"] {
         assert_eq!(ask_pin(input).await, ApprovalReply::No, "{input:?}");
     }
 }
 
 #[tokio::test]
-async fn eof_in_the_middle_of_a_reply_line_is_no() {
-    assert_eq!(ask("yes").await, ApprovalReply::No);
-    assert_eq!(ask_pin("yes 1234").await, ApprovalReply::No);
+async fn eof_in_the_middle_of_a_reply_line_is_closed() {
+    assert_eq!(ask("yes 4821").await, ApprovalReply::Closed);
+    assert_eq!(ask_pin("yes 4821 1234").await, ApprovalReply::Closed);
 }
 
 #[tokio::test]
@@ -256,6 +314,7 @@ async fn truncated_summary_or_note_is_refused_without_prompting() {
                 summary,
                 tier: Tier::Yes,
                 model_note: note,
+                challenge: CODE.into(),
             };
             assert_eq!(c.ask_approval(&p).await, ApprovalReply::No);
             // The queued "yes" was not consumed as an answer.
@@ -273,6 +332,7 @@ fn debug_of_yes_pin_hides_the_pin() {
     let d = format!("{:?}", ApprovalReply::YesPin("123456".into()));
     assert_eq!(d, "YesPin(<redacted>)");
     assert_eq!(format!("{:?}", ApprovalReply::Yes), "Yes");
+    assert_eq!(format!("{:?}", ApprovalReply::Closed), "Closed");
 }
 
 #[tokio::test]
@@ -349,7 +409,7 @@ async fn crlf_split_across_buffer_boundaries() {
     assert_eq!(c.recv().await.unwrap().text, "ab");
     assert_eq!(c.recv().await.unwrap().text, "cd");
     assert!(c.recv().await.is_none());
-    let reader = BufReader::with_capacity(1, &b"yes\r\n"[..]);
+    let reader = BufReader::with_capacity(1, &b"yes 4821\r\n"[..]);
     let mut out = Vec::new();
     let mut c = StdioChannel::new(reader, &mut out);
     assert_eq!(
@@ -498,11 +558,12 @@ async fn stale_buffered_reply_is_discarded_before_a_prompt() {
     let (mut client, server) = tokio::io::duplex(1024);
     let mut c = StdioChannel::new(BufReader::new(server), tokio::io::sink());
     let p = prompt("write \"/r/b\" (4 bytes)", Tier::Yes, None);
-    client.write_all(b"yes\n").await.unwrap();
-    c.discard_pending_input().await;
+    client.write_all(b"yes 4821\n").await.unwrap();
+    assert_eq!(c.discard_pending_input().await, 9, "bytes dropped");
     let waited = tokio::time::timeout(Duration::from_secs(5), c.ask_approval(&p)).await;
     assert!(waited.is_err(), "the stale yes did not answer the prompt");
-    client.write_all(b"yes\n").await.unwrap();
+    assert_eq!(c.discard_pending_input().await, 0, "nothing new to drop");
+    client.write_all(b"yes 4821\n").await.unwrap();
     assert_eq!(
         c.ask_approval(&p).await,
         ApprovalReply::Yes,
@@ -518,7 +579,7 @@ async fn discarded_half_line_is_not_completed_by_later_input() {
     let mut c = StdioChannel::new(BufReader::new(server), tokio::io::sink());
     let p = prompt("write \"/r/b\" (4 bytes)", Tier::Yes, None);
     client.write_all(b"ye").await.unwrap();
-    c.discard_pending_input().await;
+    assert_eq!(c.discard_pending_input().await, 2);
     // "s" completes the dropped line and is skipped; only the next line counts.
     client.write_all(b"s\n").await.unwrap();
     let waited = tokio::time::timeout(Duration::from_secs(5), c.ask_approval(&p)).await;

@@ -43,6 +43,9 @@ pub enum ApprovalReply {
     No,
     /// "yes" together with a PIN. The engine ignores the PIN for `Tier::Yes`.
     YesPin(String),
+    /// No reply at all: the channel closed (EOF) before a complete reply
+    /// line. Treated as a refusal, audited distinctly.
+    Closed,
 }
 
 impl fmt::Debug for ApprovalReply {
@@ -51,6 +54,7 @@ impl fmt::Debug for ApprovalReply {
             ApprovalReply::Yes => f.write_str("Yes"),
             ApprovalReply::No => f.write_str("No"),
             ApprovalReply::YesPin(_) => f.write_str("YesPin(<redacted>)"),
+            ApprovalReply::Closed => f.write_str("Closed"),
         }
     }
 }
@@ -63,6 +67,11 @@ pub struct ApprovalPrompt {
     pub tier: Tier,
     /// Model prose, shown under an "unverified" label.
     pub model_note: Option<String>,
+    /// A fresh code chosen by the engine for THIS prompt and shown in it.
+    /// Only a reply containing it approves, so input typed before the
+    /// prompt was displayed (stale, typed ahead, in transit) never can.
+    /// 1-16 ASCII alphanumerics; anything else makes the prompt refuse.
+    pub challenge: String,
 }
 
 /// A two-way conversation with the owner.
@@ -76,11 +85,13 @@ pub trait Channel {
 
     /// Ask the owner to approve an action.
     ///
-    /// Reply rules (stdio): for tiers other than `YesPin`, only the exact
-    /// reply `yes` (case-insensitive, trimmed) is `Yes`; `yes <anything>` is
-    /// `No`. For `YesPin`, `yes <pin>` (1-128 chars) is `YesPin(pin)` and a
-    /// bare `yes` is `No`. A prompt whose summary or note would be truncated
-    /// is refused without asking.
+    /// Reply rules (stdio): the prompt shows `prompt.challenge`. For tiers
+    /// other than `YesPin`, only `yes <code>` (`yes` case-insensitive,
+    /// trimmed, exactly one token after it, equal to the code) is `Yes`. For
+    /// `YesPin`, `yes <code> <pin>` (pin 1-128 chars) is `YesPin(pin)`.
+    /// Everything else is `No`; EOF before a complete reply is `Closed`. A
+    /// prompt whose summary or note would be truncated, or whose challenge
+    /// is not 1-16 ASCII alphanumerics, is refused without asking.
     ///
     /// Freshness: stdin is one stream, so an approval is only as fresh as the
     /// stream. Input queued before the prompt can answer it. An interactive
@@ -99,10 +110,54 @@ pub trait Channel {
     ) -> impl Future<Output = ApprovalReply> + Send;
 
     /// Drop any input that is already waiting, so that it cannot answer the
-    /// next prompt. The engine calls this right before every
-    /// [`Channel::ask_approval`]. Must not block. Default: nothing to drop.
-    fn discard_pending_input(&mut self) -> impl Future<Output = ()> + Send {
-        async {}
+    /// next prompt, and return how many bytes were dropped (0 if none). The
+    /// engine calls this right before every [`Channel::ask_approval`] and
+    /// tells the owner when something was dropped. Must not block.
+    /// Default: nothing to drop.
+    fn discard_pending_input(&mut self) -> impl Future<Output = usize> + Send {
+        async { 0 }
+    }
+}
+
+/// A challenge code the channel will show: 1-16 ASCII alphanumerics.
+fn valid_challenge(c: &str) -> bool {
+    (1..=16).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Parse a reply line against the prompt's challenge `code`.
+///
+/// - not a PIN tier: exactly `yes <code>` (`yes` in any case, any
+///   whitespace) is `Yes`;
+/// - PIN tier: `yes <code> <PIN>` (the PIN is everything after the code,
+///   trimmed, 1-128 chars) is `YesPin(PIN)`;
+/// - anything else (bare `yes`, a wrong or previous code, `yes <PIN>`
+///   without the code) is `No`.
+fn parse_reply(text: &str, needs_pin: bool, code: &str) -> ApprovalReply {
+    let t = text.trim();
+    let Some((first, rest)) = t.split_once(char::is_whitespace) else {
+        return ApprovalReply::No;
+    };
+    if !first.eq_ignore_ascii_case("yes") {
+        return ApprovalReply::No;
+    }
+    let rest = rest.trim_start();
+    let (token, after) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    // The code is not secret (it is on screen); exact match is enough.
+    if token != code {
+        return ApprovalReply::No;
+    }
+    let after = after.trim();
+    if !needs_pin {
+        return if after.is_empty() {
+            ApprovalReply::Yes
+        } else {
+            ApprovalReply::No
+        };
+    }
+    if (1..=MAX_PIN_CHARS).contains(&after.chars().count()) {
+        ApprovalReply::YesPin(after.to_string())
+    } else {
+        ApprovalReply::No
     }
 }
 
@@ -333,8 +388,9 @@ where
     /// runs arrive later and are read as the reply; and an owner who
     /// answers a fresh prompt by completing a dropped half line must type
     /// the reply again.
-    async fn discard_pending_input(&mut self) {
+    async fn discard_pending_input(&mut self) -> usize {
         let mut mid_line = !self.partial.is_empty() || self.overflow || self.skip_line;
+        let mut dropped = self.partial.len() + usize::from(self.overflow);
         self.partial.clear();
         self.overflow = false;
         let mut budget = MAX_DISCARD_BYTES;
@@ -349,6 +405,7 @@ where
             match ready {
                 Some((n, last)) if n > 0 => {
                     self.reader.consume(n);
+                    dropped = dropped.saturating_add(n);
                     mid_line = last != Some(b'\n');
                     budget = budget.saturating_sub(n);
                     if budget == 0 {
@@ -359,6 +416,7 @@ where
             }
         }
         self.skip_line = mid_line;
+        dropped
     }
 
     async fn ask_approval(&mut self, prompt: &ApprovalPrompt) -> ApprovalReply {
@@ -369,15 +427,21 @@ where
                 .await;
             return ApprovalReply::No;
         };
+        if !valid_challenge(&prompt.challenge) {
+            self.write("approval prompt has no valid code; refused\n")
+                .await;
+            return ApprovalReply::No;
+        }
+        let code = prompt.challenge.as_str();
         let needs_pin = prompt.tier == Tier::YesPin;
         let mut s = format!("Approval needed ({:?}):\n  {}\n", prompt.tier, summary);
         if let Some(Some(note)) = note {
             s.push_str(&format!("  model says (unverified): {note}\n"));
         }
         if needs_pin {
-            s.push_str("Reply \"yes <PIN>\" or \"no\":\n");
+            s.push_str(&format!("Reply \"yes {code} <PIN>\" or \"no\":\n"));
         } else {
-            s.push_str("Reply \"yes\" or \"no\":\n");
+            s.push_str(&format!("Reply \"yes {code}\" or \"no\":\n"));
         }
         self.write(&s).await;
 
@@ -390,27 +454,14 @@ where
                 self.write("reply too long, treated as no\n").await;
                 return ApprovalReply::No;
             }
-            // EOF mid-line or no line at all: fail closed.
-            _ => return ApprovalReply::No,
+            // EOF mid-line or no line at all: no reply, fail closed.
+            Line::Text {
+                terminated: false, ..
+            }
+            | Line::Eof => return ApprovalReply::Closed,
         };
         let text = String::from_utf8_lossy(&bytes).into_owned();
         drop(bytes);
-        let text = text.trim();
-        if !needs_pin {
-            return if text.eq_ignore_ascii_case("yes") {
-                ApprovalReply::Yes
-            } else {
-                ApprovalReply::No
-            };
-        }
-        let mut parts = text.splitn(2, char::is_whitespace);
-        let first = parts.next().unwrap_or("");
-        let rest = parts.next().map(str::trim).unwrap_or("");
-        let n = rest.chars().count();
-        if first.eq_ignore_ascii_case("yes") && (1..=MAX_PIN_CHARS).contains(&n) {
-            ApprovalReply::YesPin(rest.to_string())
-        } else {
-            ApprovalReply::No
-        }
+        parse_reply(&text, needs_pin, code)
     }
 }
