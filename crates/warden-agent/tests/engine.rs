@@ -1113,11 +1113,11 @@ async fn prompt_timeout_counts_as_decline() {
         "{took:?}"
     );
     assert_eq!(fs::read_to_string(&f).unwrap(), "old");
+    // A prompt timeout ends the message: nothing else runs or is planned.
     let d = env.decisions();
-    assert_eq!(d, vec!["refused: approval timed out"]);
-    let (_, results) = blocks(&e.planner().requests()[1]);
-    assert_eq!(results[0].1, "owner declined");
-    assert_eq!(env.seen.sent().last().unwrap(), "ok");
+    assert_eq!(d, vec!["refused: approval timed out", "failed: timeout"]);
+    assert_eq!(e.planner().requests().len(), 1);
+    assert_eq!(env.seen.sent().last().unwrap(), "timed out");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1404,7 +1404,7 @@ async fn late_pin_after_timeout_never_reaches_planner() {
     e.run().await;
     assert!(f.exists());
     let reqs = e.planner().requests();
-    assert_eq!(reqs.len(), 2, "the late reply was not sent as chat");
+    assert_eq!(reqs.len(), 1, "the late reply was not sent as chat");
     let all = everything(&env, &reqs);
     assert!(!all.contains(PIN), "the late PIN leaked");
     assert_eq!(env.seen.sent().last().unwrap(), "no approval pending");
@@ -1757,5 +1757,411 @@ fn try_new_refuses_an_unprotected_home_inside_the_root() {
             std::slice::from_ref(&audit_dir)
         ),
         Ok(())
+    );
+}
+
+// ------------------------------------------------- review round 2 fixes
+
+type DuplexReader = tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>;
+
+/// An engine over a real `StdioChannel` fed by `lines` (delay ms, text).
+fn stdio_engine(
+    env: &Env,
+    planner: MockPlanner,
+    reader: DuplexReader,
+    out: SharedBuf,
+    tweak: impl FnOnce(&mut EngineConfig),
+) -> Engine<MockPlanner, StdioChannel<DuplexReader, SharedBuf>, RecSink> {
+    let store = ApproverStore::open(&env.home, NOW).unwrap();
+    let exec = Executor::new(
+        &env.root,
+        vec![env.home.clone(), env.snaps.clone()],
+        SnapshotStore::open(&env.snaps).unwrap(),
+    )
+    .unwrap();
+    let sink = RecSink {
+        entries: env.entries.clone(),
+        count: 0,
+        fail_on: None,
+        probe: None,
+    };
+    let mut cfg = EngineConfig::new(SenderId("local".into()), env.root.clone(), env.root.clone());
+    tweak(&mut cfg);
+    Engine::try_new(
+        cfg,
+        planner,
+        StdioChannel::new(reader, out),
+        sink,
+        store,
+        exec,
+        env.home.clone(),
+        &[],
+    )
+    .unwrap()
+}
+
+/// A reader fed by a task that writes each line after its delay, then
+/// closes the stream.
+fn drive(lines: Vec<(u64, String)>) -> (DuplexReader, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncWriteExt;
+    let (client, server) = tokio::io::duplex(4096);
+    let (srv_r, srv_w) = tokio::io::split(server);
+    let h = tokio::spawn(async move {
+        let _keep = srv_w;
+        let (_r, mut w) = tokio::io::split(client);
+        for (delay, l) in lines {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            w.write_all(l.as_bytes()).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        w.shutdown().await.unwrap();
+    });
+    (tokio::io::BufReader::new(srv_r), h)
+}
+
+fn two_writes() -> MockPlanner {
+    MockPlanner::scripted(vec![
+        reply(
+            Some("updating"),
+            vec![
+                call(
+                    "t1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "A-new"}),
+                ),
+                call(
+                    "t2",
+                    "write_file",
+                    json!({"path": "b.txt", "content": "EVIL"}),
+                ),
+            ],
+        ),
+        reply(Some("ok"), vec![]),
+        reply(Some("chat"), vec![]),
+    ])
+}
+
+fn out_text(out: &SharedBuf) -> String {
+    String::from_utf8_lossy(&out.0.lock().unwrap()).into_owned()
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_yes_after_a_prompt_timeout_never_approves_the_next_action() {
+    let env = env();
+    let a = env.file("a.txt", "A-old");
+    let b = env.file("b.txt", "B-old");
+    let (reader, h) = drive(vec![(0, "update a\n".into()), (300, "yes\n".into())]);
+    let out = SharedBuf::default();
+    let mut e = stdio_engine(&env, two_writes(), reader, out.clone(), |c| {
+        c.approval_timeout = Duration::from_millis(200)
+    });
+    e.run().await;
+    h.await.unwrap();
+    assert_eq!(fs::read_to_string(&a).unwrap(), "A-old");
+    assert_eq!(fs::read_to_string(&b).unwrap(), "B-old");
+    assert_eq!(
+        env.decisions(),
+        vec!["refused: approval timed out", "failed: timeout"]
+    );
+    let text = out_text(&out);
+    assert_eq!(text.matches("Approval needed").count(), 1, "{text}");
+    assert!(text.contains("no approval pending"), "{text}");
+    assert_eq!(e.planner().requests().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn partial_line_across_a_prompt_timeout_never_approves_the_next_action() {
+    let env = env();
+    let a = env.file("a.txt", "A-old");
+    let b = env.file("b.txt", "B-old");
+    let (reader, h) = drive(vec![
+        (0, "update a\n".into()),
+        (150, "ye".into()),
+        (150, "s\n".into()),
+    ]);
+    let out = SharedBuf::default();
+    let mut e = stdio_engine(&env, two_writes(), reader, out.clone(), |c| {
+        c.approval_timeout = Duration::from_millis(200)
+    });
+    e.run().await;
+    h.await.unwrap();
+    assert_eq!(fs::read_to_string(&a).unwrap(), "A-old");
+    assert_eq!(fs::read_to_string(&b).unwrap(), "B-old");
+    assert_eq!(
+        env.decisions(),
+        vec!["refused: approval timed out", "failed: timeout"]
+    );
+    assert_eq!(out_text(&out).matches("Approval needed").count(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_pin_reply_never_approves_the_next_delete_nor_leaks() {
+    let env = env();
+    env.set_pin();
+    let a = env.file("a.txt", "A");
+    let b = env.file("b.txt", "B");
+    let planner = MockPlanner::scripted(vec![
+        reply(
+            None,
+            vec![
+                call("t1", "delete_file", path_arg(&a)),
+                call("t2", "delete_file", path_arg(&b)),
+            ],
+        ),
+        reply(Some("ok"), vec![]),
+        reply(Some("chat"), vec![]),
+    ]);
+    let (reader, h) = drive(vec![
+        (0, "clean up\n".into()),
+        (300, format!("yes {PIN}\n")),
+    ]);
+    let out = SharedBuf::default();
+    let mut e = stdio_engine(&env, planner, reader, out.clone(), |c| {
+        c.approval_timeout = Duration::from_millis(200)
+    });
+    e.run().await;
+    h.await.unwrap();
+    assert!(a.exists() && b.exists());
+    let all = everything(&env, &e.planner().requests());
+    assert!(!all.contains(PIN) && !out_text(&out).contains(PIN));
+}
+
+#[tokio::test(start_paused = true)]
+async fn input_queued_before_a_prompt_cannot_answer_it() {
+    let env = env();
+    let a = env.file("a.txt", "A-old");
+    // "yes" is already buffered when the prompt appears.
+    // The stream stays open past the prompt timeout (EOF would be a No).
+    let (reader, h) = drive(vec![(0, "update a\nyes\n".into()), (1000, String::new())]);
+    let out = SharedBuf::default();
+    let planner = MockPlanner::scripted(vec![
+        reply(
+            None,
+            vec![call(
+                "t1",
+                "write_file",
+                json!({"path": "a.txt", "content": "A-new"}),
+            )],
+        ),
+        reply(Some("ok"), vec![]),
+    ]);
+    let mut e = stdio_engine(&env, planner, reader, out.clone(), |c| {
+        c.approval_timeout = Duration::from_millis(200)
+    });
+    e.run().await;
+    h.await.unwrap();
+    assert_eq!(fs::read_to_string(&a).unwrap(), "A-old");
+    assert_eq!(
+        env.decisions(),
+        vec!["refused: approval timed out", "failed: timeout"]
+    );
+}
+
+/// A root given through a symlink alias: the canonical spelling, the alias
+/// spelling and relative paths all work; `..` escapes are still refused.
+#[tokio::test]
+async fn root_alias_and_canonical_spellings_both_work() {
+    let env = env();
+    let link = env._tmp.path().join("rootlink");
+    std::os::unix::fs::symlink(&env.root, &link).unwrap();
+    let f = env.file("a.txt", "A");
+    let canon_f = fs::canonicalize(&f).unwrap();
+    let alias_f = link.join("a.txt");
+    let escape = format!("{}/../escape.txt", link.display());
+    let store = ApproverStore::open(&env.home, NOW).unwrap();
+    let exec = Executor::new(
+        &link,
+        vec![env.home.clone(), env.snaps.clone()],
+        SnapshotStore::open(&env.snaps).unwrap(),
+    )
+    .unwrap();
+    let sink = RecSink {
+        entries: env.entries.clone(),
+        count: 0,
+        fail_on: None,
+        probe: None,
+    };
+    let channel = TestChannel {
+        inbound: VecDeque::new(),
+        replies: vec![yes(), yes()].into(),
+        seen: env.seen.clone(),
+    };
+    let planner = MockPlanner::scripted(vec![
+        reply(
+            None,
+            vec![
+                call("t1", "read_file", path_arg(&canon_f)),
+                call("t2", "read_file", path_arg(&alias_f)),
+                call("t3", "read_file", json!({"path": "a.txt"})),
+                call(
+                    "t4",
+                    "write_file",
+                    json!({"path": canon_f.to_string_lossy(), "content": "B"}),
+                ),
+                call(
+                    "t5",
+                    "write_file",
+                    json!({"path": alias_f.to_string_lossy(), "content": "C"}),
+                ),
+                call("t6", "write_file", json!({"path": escape, "content": "x"})),
+            ],
+        ),
+        reply(Some("ok"), vec![]),
+    ]);
+    let mut e = Engine::try_new(
+        EngineConfig::new(owner(), link.clone(), link.clone()),
+        planner,
+        channel,
+        sink,
+        store,
+        exec,
+        env.home.clone(),
+        &[],
+    )
+    .unwrap();
+    e.handle(msg("go")).await;
+    let d = env.decisions();
+    assert_eq!(
+        d.iter().filter(|d| *d == "approved auto").count(),
+        3,
+        "all three reads are Auto: {d:?}"
+    );
+    assert_eq!(
+        d.iter().filter(|d| d.starts_with("executed")).count(),
+        5,
+        "{d:?}"
+    );
+    assert_eq!(d.last().unwrap(), "refused: outside root");
+    assert_eq!(fs::read_to_string(&f).unwrap(), "C");
+    assert!(!env._tmp.path().join("escape.txt").exists());
+    assert_eq!(env.seen.prompts().len(), 2);
+}
+
+#[test]
+fn try_new_detects_a_home_inside_an_aliased_root() {
+    use warden_agent::engine::EngineConfigError;
+    let env = env();
+    let link = env._tmp.path().join("rl");
+    std::os::unix::fs::symlink(&env.root, &link).unwrap();
+    // Home spelled through the real path, root given as the alias.
+    let h1 = env.root.join("h1");
+    fs::create_dir(&h1).unwrap();
+    let mk = |prot: Vec<PathBuf>| {
+        let store = ApproverStore::open(&h1, NOW).unwrap();
+        let exec = Executor::new(&link, prot, SnapshotStore::open(&env.snaps).unwrap()).unwrap();
+        let channel = TestChannel {
+            inbound: VecDeque::new(),
+            replies: VecDeque::new(),
+            seen: env.seen.clone(),
+        };
+        let sink = RecSink {
+            entries: env.entries.clone(),
+            count: 0,
+            fail_on: None,
+            probe: None,
+        };
+        Engine::try_new(
+            EngineConfig::new(owner(), link.clone(), link.clone()),
+            MockPlanner::scripted(vec![]),
+            channel,
+            sink,
+            store,
+            exec,
+            h1.clone(),
+            &[],
+        )
+        .map(drop)
+    };
+    assert_eq!(
+        mk(vec![]),
+        Err(EngineConfigError::UnprotectedHome(h1.clone()))
+    );
+    // Protected through the alias spelling: still recognised.
+    assert_eq!(mk(vec![link.join("h1")]), Ok(()));
+}
+
+#[test]
+fn executor_protects_matches_any_spelling() {
+    let env = env();
+    let link = env._tmp.path().join("rl2");
+    std::os::unix::fs::symlink(&env.root, &link).unwrap();
+    let h = env.root.join("state");
+    fs::create_dir(&h).unwrap();
+    let exec = Executor::new(
+        &env.root,
+        vec![h.clone()],
+        SnapshotStore::open(&env.snaps).unwrap(),
+    )
+    .unwrap();
+    assert!(exec.protects(&h));
+    assert!(exec.protects(&h.join("approver.key")));
+    assert!(exec.protects(&link.join("state")), "alias spelling");
+    assert!(
+        exec.protects(&fs::canonicalize(&h).unwrap()),
+        "canonical spelling"
+    );
+    assert!(!exec.protects(&env.root.join("other")));
+    assert!(!exec.protects(&link.join("other")));
+}
+
+#[tokio::test]
+async fn pin_like_chat_is_dropped_and_never_sent() {
+    let env = env();
+    env.set_pin();
+    let mut e = env.engine(vec![reply(Some("chat"), vec![])], Opts::default());
+    let texts = [
+        PIN.to_string(),
+        format!("pin {PIN}"),
+        format!("ok {PIN}"),
+        format!("{PIN} yes"),
+    ];
+    for t in &texts {
+        e.handle(msg(t)).await;
+    }
+    assert!(e.planner().requests().is_empty());
+    assert_eq!(
+        env.seen.sent(),
+        vec!["that message looks like your PIN; it was not sent"; 4]
+    );
+    assert_eq!(env.decisions(), vec!["ignored: pin-like message"; 4]);
+    assert!(!everything(&env, &[]).contains(PIN));
+    // Ordinary chat (even with a near-miss number) goes through.
+    e.handle(msg("what is in 48151623 please")).await;
+    assert_eq!(e.planner().requests().len(), 1);
+}
+
+#[tokio::test]
+async fn pin_like_check_is_skipped_without_a_pin_file() {
+    let env = env();
+    let mut e = env.engine(vec![reply(Some("chat"), vec![])], Opts::default());
+    e.handle(msg(PIN)).await;
+    assert_eq!(e.planner().requests().len(), 1);
+    assert!(env.decisions().is_empty());
+}
+
+#[tokio::test]
+async fn pin_like_check_does_not_feed_the_pin_guard() {
+    let env = env();
+    env.set_pin();
+    let f = env.file("a.txt", "A");
+    let mut script: Vec<_> = (0..5).map(|_| reply(Some("chat"), vec![])).collect();
+    script.push(reply(None, vec![call("t1", "delete_file", path_arg(&f))]));
+    script.push(reply(Some("deleted"), vec![]));
+    let mut e = env.engine(
+        script,
+        Opts {
+            replies: vec![yes_pin(PIN)],
+            ..Opts::default()
+        },
+    );
+    for i in 0..5 {
+        // Short messages whose tokens are all checked (and mismatch).
+        e.handle(msg(&format!("guess {i}11111 x"))).await;
+    }
+    e.handle(msg("delete a.txt")).await;
+    assert!(
+        !f.exists(),
+        "no lockout from chat checks: {:?}",
+        env.decisions()
     );
 }

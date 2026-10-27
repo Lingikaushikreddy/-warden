@@ -68,6 +68,10 @@ const PIN_MAX_FAILURES: u32 = 3;
 const PIN_LOCK_MS: u64 = 60_000;
 /// At most one `ignored: non-owner` audit entry per this many milliseconds.
 const NON_OWNER_AUDIT_EVERY_MS: u64 = 60_000;
+/// Owner messages with at most this many tokens are checked for the PIN.
+const MAX_PIN_LIKE_TOKENS: usize = 8;
+/// Longest token checked against the PIN, in characters.
+const MAX_PIN_TOKEN_CHARS: usize = 128;
 /// Longest sender id written to the audit log, in characters.
 const MAX_SENDER_CHARS: usize = 64;
 /// Tool-call arguments larger than this (serialized) are not echoed back
@@ -183,25 +187,32 @@ impl fmt::Display for EngineConfigError {
 
 impl std::error::Error for EngineConfigError {}
 
-/// Is `p` inside `root`, lexically or in canonical form (deepest existing
-/// ancestor resolved)?
+/// `x` normalized lexically, then its deepest existing ancestor
+/// canonicalized and the rest re-joined (the executor's rule).
+fn resolve_deepest(x: &Path) -> Option<PathBuf> {
+    let mut cur = normalize(x)?;
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(c) = std::fs::canonicalize(&cur) {
+            let mut out = c;
+            out.extend(rest.iter().rev());
+            return Some(out);
+        }
+        rest.push(cur.file_name()?.to_os_string());
+        cur = cur.parent()?.to_path_buf();
+    }
+}
+
+/// Is `p` inside `root` in EITHER sense: lexically, or with both resolved
+/// by [`resolve_deepest`]? Used to detect state directories that need
+/// protection, where over-detecting fails closed.
 fn inside(p: &Path, root: &Path) -> bool {
     let lexical =
         matches!((normalize(p), normalize(root)), (Some(a), Some(r)) if a.starts_with(&r));
-    let canon = |x: &Path| -> Option<PathBuf> {
-        let mut cur = normalize(x)?;
-        let mut rest = Vec::new();
-        loop {
-            if let Ok(c) = std::fs::canonicalize(&cur) {
-                let mut out = c;
-                out.extend(rest.iter().rev());
-                return Some(out);
-            }
-            rest.push(cur.file_name()?.to_os_string());
-            cur = cur.parent()?.to_path_buf();
-        }
-    };
-    let canonical = matches!((canon(p), canon(root)), (Some(a), Some(r)) if a.starts_with(&r));
+    let canonical = matches!(
+        (resolve_deepest(p), resolve_deepest(root)),
+        (Some(a), Some(r)) if a.starts_with(&r)
+    );
     lexical || canonical
 }
 
@@ -228,14 +239,15 @@ fn cap_note(note: &str) -> String {
     out
 }
 
-/// Every path capability of `action` lies inside `root` (lexically).
-fn paths_inside(action: &Action, root: &Path) -> bool {
-    let Some(r) = normalize(root) else {
-        return false;
-    };
+/// Every path capability of `action` lies inside the canonical root, by
+/// the executor's rule: `..` removed lexically, then the deepest existing
+/// ancestor canonicalized. Any spelling of the root (a symlink alias,
+/// `/tmp` vs `/private/tmp`) therefore works, and `..` escapes and
+/// symlinked parents pointing out are refused.
+fn paths_inside(action: &Action, root_canon: &Path) -> bool {
     action.capabilities.iter().all(|c| match c {
         Capability::ReadPath(p) | Capability::WritePath(p) | Capability::DeletePath(p) => {
-            normalize(p).is_some_and(|p| p.starts_with(&r))
+            resolve_deepest(p).is_some_and(|p| p.starts_with(root_canon))
         }
         _ => true,
     })
@@ -425,6 +437,8 @@ pub struct Engine<P: Planner, C: Channel, A: AuditSink> {
     pin_guard: PinGuard,
     clock: Clock,
     last_non_owner_audit_ms: Option<u64>,
+    /// Set when an owner prompt timed out: the current message ends.
+    end_message: bool,
 }
 
 impl<P: Planner, C: Channel, A: AuditSink> fmt::Debug for Engine<P, C, A> {
@@ -460,16 +474,29 @@ where
         home: PathBuf,
         state_dirs: &[PathBuf],
     ) -> Result<Engine<P, C, A>, EngineConfigError> {
+        let mut cfg = cfg;
+        // Keep the root as given (for the policy) and use its canonical
+        // form everywhere else, as the executor does.
+        let root_as_given = cfg.root.clone();
+        if let Ok(c) = std::fs::canonicalize(&cfg.root) {
+            cfg.root = c;
+        }
+        if let Ok(c) = std::fs::canonicalize(&cfg.cwd) {
+            cfg.cwd = c;
+        }
         let mut dirs = vec![home.clone(), approvals.home().to_path_buf()];
         dirs.extend(state_dirs.iter().cloned());
         for d in dirs {
-            if inside(&d, &cfg.root) && !executor.protects(&d) {
+            let in_root = inside(&d, &cfg.root) || inside(&d, &root_as_given);
+            if in_root && !executor.protects(&d) {
                 return Err(EngineConfigError::UnprotectedHome(d));
             }
         }
-        let policy = PolicyConfig {
-            allowed_roots: vec![cfg.root.clone()],
-        };
+        let mut allowed_roots = vec![cfg.root.clone()];
+        if normalize(&root_as_given).is_some_and(|r| r != cfg.root) {
+            allowed_roots.push(root_as_given);
+        }
+        let policy = PolicyConfig { allowed_roots };
         Ok(Engine {
             cfg,
             policy,
@@ -482,6 +509,7 @@ where
             pin_guard: PinGuard::new(),
             clock: Box::new(system_clock_ms),
             last_non_owner_audit_ms: None,
+            end_message: false,
         })
     }
 
@@ -571,13 +599,29 @@ where
             return;
         }
 
-        if is_approval_shaped(&inbound.text) {
+        let text = Zeroizing::new(inbound.text);
+        if is_approval_shaped(&text) {
             // Possibly a late approval reply (it may carry the PIN): never
             // chat, never sent to the planner, never logged.
-            drop(inbound);
+            drop(text);
             self.channel.send("no approval pending").await;
             return;
         }
+        if self.is_pin_like(&text).await {
+            drop(text);
+            self.channel
+                .send("that message looks like your PIN; it was not sent")
+                .await;
+            self.audit_or_warn(
+                &new_id(),
+                "message",
+                Tier::Auto,
+                "ignored: pin-like message",
+            )
+            .await;
+            return;
+        }
+        self.end_message = false;
 
         let msg_id = new_id();
         let started = Instant::now();
@@ -587,9 +631,9 @@ where
         let system = redact(&self.cfg.system_prompt).0;
         let mut turns = vec![Turn {
             role: Role::User,
-            blocks: vec![Block::Text(redact(&inbound.text).0)],
+            blocks: vec![Block::Text(redact(&text).0)],
         }];
-        drop(inbound);
+        drop(text);
         let mut calls_used = 0usize;
         let mut seen_ids: HashSet<ToolId> = HashSet::new();
 
@@ -648,6 +692,11 @@ where
                     calls_used += 1;
                     self.process_call(c, resp.text.as_deref()).await
                 };
+                if self.end_message {
+                    // A prompt timed out: a late reply must never answer a
+                    // later prompt, so nothing else in this message runs.
+                    return self.timed_out(&msg_id).await;
+                }
                 results.push(self.result_block(id, outcome));
             }
             if excess > 0 {
@@ -672,6 +721,34 @@ where
         self.channel.send("step limit reached").await;
         self.audit_or_warn(&msg_id, "message", Tier::Auto, "failed: step limit")
             .await;
+    }
+
+    /// Does a short owner message contain the PIN as a whole token? Checked
+    /// with `check_pin` (constant time) on a blocking thread; no PIN file or
+    /// an unreadable one means "no". Never touches the [`PinGuard`].
+    async fn is_pin_like(&self, text: &str) -> bool {
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        if tokens.is_empty() || tokens.len() > MAX_PIN_LIKE_TOKENS {
+            return false;
+        }
+        let candidates: Zeroizing<Vec<String>> = Zeroizing::new(
+            tokens
+                .into_iter()
+                .filter(|t| (1..=MAX_PIN_TOKEN_CHARS).contains(&t.chars().count()))
+                .map(str::to_owned)
+                .collect(),
+        );
+        if candidates.is_empty() {
+            return false;
+        }
+        let path = self.pin_path.clone();
+        tokio::task::spawn_blocking(move || {
+            candidates
+                .iter()
+                .any(|t| matches!(check_pin(&path, t), Ok(PinCheck::Match)))
+        })
+        .await
+        .unwrap_or(false)
     }
 
     async fn timed_out(&mut self, msg_id: &str) {
@@ -805,6 +882,8 @@ where
             tier,
             model_note: note.map(cap_note),
         };
+        // Input already waiting cannot be a reply to a prompt not yet shown.
+        self.channel.discard_pending_input().await;
         let reply = timeout(
             self.cfg.approval_timeout,
             self.channel.ask_approval(&prompt),
@@ -812,6 +891,7 @@ where
         .await
         .ok();
         let Some(reply) = reply else {
+            self.end_message = true;
             return self
                 .refuse(
                     &action,

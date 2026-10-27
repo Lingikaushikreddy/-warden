@@ -425,9 +425,10 @@ exists at the time of the check.
   in the middle of a reply line, over-long replies and a truncated summary or
   note (the prompt is refused without asking) are all No.
 - Freshness: stdin is one stream, so an approval is only as fresh as the
-  stream. An interactive terminal front end should discard pending input
-  before prompting, and the engine must treat chat text and approvals as
-  separate states.
+  stream. The engine calls `discard_pending_input` before every prompt
+  (see "Engine", "Late replies" for what it can and cannot drop), ends the
+  message on a prompt timeout, and never treats approval-shaped text as
+  chat.
 - The PIN comes back as a plain `String` (not zeroized); the engine must
   compare it in constant time.
 - Display also escapes blank-looking spaces (NBSP, U+2000-200A, U+202F,
@@ -469,8 +470,11 @@ planner and the executor are wired together.
   through one running engine, not offline guessing of the PIN file (see
   "CLI PIN").
 - **Consent only for runnable actions.** Before any prompt, an action
-  with a path capability outside `cfg.root` (lexical check with
-  `normalize` + `starts_with`; the executor still checks canonically) is
+  with a path capability outside the root (by the executor's rule: `..`
+  removed lexically, then the deepest existing ancestor canonicalized and
+  compared with the canonical root, so a symlink alias of the root such as
+  `/tmp` for `/private/tmp` works and a symlinked parent pointing out does
+  not) is
   refused (`refused: outside root`, tool result `outside the allowed
   folder`) without asking: the owner is never asked to approve something
   that cannot run. A summary longer than 3000 characters after display
@@ -481,22 +485,56 @@ planner and the executor are wired together.
   never the content to be written.
 - **Late replies and the PIN.** Each owner prompt has its own timeout
   (`approval_timeout`, default 120 s), independent of the message deadline.
-  The hazard: a prompt times out, then the owner types `yes <PIN>`; that
-  line would arrive as the next chat message and, forwarded as chat, send
-  the PIN to the remote planner. Mitigations: (1) an owner message that is
-  approval-shaped (after trimming, case-insensitive: exactly `yes`, `no`,
-  or `yes` followed by whitespace and anything) is NEVER sent to the
-  planner, at any time; the engine drops it unlogged and replies `no
-  approval pending`; (2) `StdioChannel` line reads are cancel-safe (the
-  partial line lives in the channel, not the future), so a prompt cancelled
-  by its timeout mid-line does not split `yes 1234` into a lost `yes 12`
-  and a chat message `34`. Cost: a chat message such as `yes please do it`
-  is dropped too.
+  Two hazards follow from a prompt that times out while the owner is still
+  typing: the late `yes` (or `yes <PIN>`) could answer the NEXT prompt of
+  the same message, approving an action the owner never saw; or it could
+  arrive as the next chat message and send the PIN to the remote planner.
+  Mitigations:
+  1. **A prompt timeout ends the message.** The owner is told `timed out`,
+     the action is audited `refused: approval timed out`, then the message
+     `failed: timeout`; no further call of that message is processed or
+     prompted, and the planner is not called again. A late reply can
+     therefore only arrive as a new message.
+  2. **Approval-shaped messages never reach the planner.** An owner
+     message that, after trimming and ignoring ASCII case, is exactly
+     `yes`, `no`, or `yes` followed by whitespace and anything is dropped
+     unlogged with the reply `no approval pending`, at any time. Cost: chat
+     such as `yes please do it` is dropped too.
+  3. **Stale input is discarded before every prompt.**
+     `Channel::discard_pending_input` (default: no-op) runs right before
+     each `ask_approval`. `StdioChannel` drops its partial line and every
+     chunk the reader has ready right now (polled once per chunk, never
+     waiting, at most 1 MiB); if the dropped input ended mid-line, the rest
+     of that line is skipped when it arrives, so `ye` (dropped) + `s\n`
+     (typed after the prompt appears) is not read as a reply.
+  4. **Cancel-safe reads.** `StdioChannel` keeps a partially read line in
+     the channel, not in the read future, so a prompt cancelled by its
+     timeout mid-line does not split `yes 1234` into a lost `yes 12` and a
+     chat message `34`; the whole line arrives as one (dropped) message.
+  5. **PIN-like chat is dropped.** An owner message of at most 8
+     whitespace-separated tokens is checked token by token (tokens of
+     1-128 characters) against the stored PIN with `check_pin` (constant
+     time, on a blocking thread). On a match the message is dropped, the
+     owner is told `that message looks like your PIN; it was not sent`, and
+     `ignored: pin-like message` is audited with no content. The check is
+     skipped silently when no PIN is set or the file cannot be read, and it
+     never feeds the `PinGuard` lockout.
+
+  Limits of discarding on a stream: `discard_pending_input` sees only bytes
+  that have reached this process. Input still in a pipe, a terminal's line
+  buffer or a network path when it runs arrives later and is read as the
+  reply. A pure `AsyncBufRead` cannot tell "nothing typed" from "typed but
+  not yet delivered". An owner who completes a dropped half line after the
+  prompt appears must type the reply again.
 - **Executor and audit state must be protected.** `Engine::try_new`
   refuses (`EngineConfigError::UnprotectedHome`) when the PIN home, the
   approver store's home or any state directory the caller passes (audit
   log, snapshot store) lies inside `cfg.root` and is not protected by the
-  executor (`Executor::protects`, lexical and canonical).
+  executor (`Executor::protects`, lexical and canonical). "Inside" is
+  checked both lexically and canonically (either one counts), against the
+  root as given and its canonical form. `try_new` stores the canonical
+  `cfg.root` and `cfg.cwd`; the policy allows both the canonical root and
+  the root as given, so either spelling classifies the same.
 - **Non-owners get nothing.** A message whose sender is not
   `cfg.owner` causes no planner call and no reply. It is audited
   `ignored: non-owner` at most once per 60 s, with the sender id
@@ -557,7 +595,7 @@ whole message: each planner call runs under the time left, and the
 deadline is checked between steps and before each call (a call reached
 after the deadline gets `timed out` and no prompt). Each owner prompt runs
 under `approval_timeout` instead; a prompt that times out is a refusal
-(`refused: approval timed out`). `Executor::run` and the audit
+(`refused: approval timed out`) and ends the message (see "Late replies"). `Executor::run` and the audit
 appends run on blocking threads and are never wrapped in a timeout: a tool
 that started finishes and its outcome is audited, after which the message
 stops with `timed out`. Limits: `max_steps` planner calls (`step limit
@@ -574,12 +612,13 @@ reached`) and `max_calls_per_message` tool calls per message.
   an approval prompt.
 - The model note in a prompt is model prose (labelled unverified); a
   persuasive note can still socially engineer the owner.
-- Freshness of approvals is only as good as the channel (see "Channel");
-  stdin input queued before a prompt can answer it. A late reply typed
-  after a prompt timed out is dropped (above), but a reply typed early,
-  before the next prompt appears, can still answer that prompt.
-- The approval-shaped filter is lexical: a PIN typed in some other shape
-  (`ok 1234`, the PIN alone) is ordinary chat and goes to the planner after
-  redaction, which does not recognize PINs.
+- Freshness of approvals is only as good as the channel (see "Channel"):
+  input that has not reached the process when the stale-input discard runs
+  (see its limits above) can still answer the prompt.
+- The PIN-like filter matches whole whitespace-separated tokens of short
+  messages only: a PIN glued to punctuation (`1234.`), inside a longer
+  message (more than 8 tokens), or after the PIN file was changed is
+  ordinary chat and goes to the planner after redaction, which does not
+  recognize PINs.
 - `AuditLog` appends and `ApproverStore` share the engine's lifetime; the
   engine holds both behind mutexes and processes one message at a time.

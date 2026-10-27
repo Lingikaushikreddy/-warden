@@ -8,6 +8,8 @@
 
 use std::fmt;
 use std::future::Future;
+use std::pin::Pin;
+use std::task::Poll;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use warden_core::Tier;
@@ -20,6 +22,8 @@ const MAX_DISPLAY_CHARS: usize = 4096;
 const MAX_LINE_BYTES: usize = 65_536;
 /// Longest accepted PIN, in characters.
 const MAX_PIN_CHARS: usize = 128;
+/// Most bytes `discard_pending_input` drops in one call.
+const MAX_DISCARD_BYTES: usize = 1 << 20;
 
 /// Identity of the party that sent a message, as vouched for by the channel.
 #[derive(PartialEq, Eq, Clone, Debug)]
@@ -93,6 +97,13 @@ pub trait Channel {
         &mut self,
         prompt: &ApprovalPrompt,
     ) -> impl Future<Output = ApprovalReply> + Send;
+
+    /// Drop any input that is already waiting, so that it cannot answer the
+    /// next prompt. The engine calls this right before every
+    /// [`Channel::ask_approval`]. Must not block. Default: nothing to drop.
+    fn discard_pending_input(&mut self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 /// Blank-looking spaces escaped for display only. They are legal in paths
@@ -190,6 +201,9 @@ pub struct StdioChannel<R, W> {
     partial: Vec<u8>,
     /// The current line is over the cap and is being discarded.
     overflow: bool,
+    /// The rest of the current line belongs to input that
+    /// `discard_pending_input` dropped part of; skip it up to its newline.
+    skip_line: bool,
 }
 
 impl<R, W> StdioChannel<R, W>
@@ -203,6 +217,7 @@ where
             writer,
             partial: Vec::new(),
             overflow: false,
+            skip_line: false,
         }
     }
 
@@ -217,12 +232,13 @@ where
         // One extra byte is allowed while reading so a trailing `\r` fits.
         let limit = MAX_LINE_BYTES + 1;
         loop {
-            let (used, done) = {
+            let (used, done, skipped) = {
                 let chunk = match self.reader.fill_buf().await {
                     Ok(c) => c,
                     Err(_) => &[],
                 };
                 if chunk.is_empty() {
+                    self.skip_line = false;
                     let overflow = std::mem::take(&mut self.overflow);
                     let line = std::mem::take(&mut self.partial);
                     if overflow {
@@ -237,17 +253,27 @@ where
                     Some(p) => (&chunk[..p], p + 1, true),
                     None => (chunk, chunk.len(), false),
                 };
-                if !self.overflow {
-                    if self.partial.len() + data.len() > limit {
-                        self.overflow = true;
-                        self.partial = Vec::new();
-                    } else {
-                        self.partial.extend_from_slice(data);
+                if self.skip_line {
+                    (used, done, true)
+                } else {
+                    if !self.overflow {
+                        if self.partial.len() + data.len() > limit {
+                            self.overflow = true;
+                            self.partial = Vec::new();
+                        } else {
+                            self.partial.extend_from_slice(data);
+                        }
                     }
+                    (used, done, false)
                 }
-                (used, done)
             };
             self.reader.consume(used);
+            if skipped {
+                if done {
+                    self.skip_line = false;
+                }
+                continue;
+            }
             if done {
                 let overflow = std::mem::take(&mut self.overflow);
                 let line = std::mem::take(&mut self.partial);
@@ -295,6 +321,44 @@ where
         let mut s = sanitize_for_display(text);
         s.push('\n');
         self.write(&s).await;
+    }
+
+    /// Drops the partial line and whatever the reader has ready right now
+    /// (polled once per chunk, never waiting), up to 1 MiB. If the dropped
+    /// input ended mid-line, the rest of that line is skipped when it
+    /// arrives, so `ye` (dropped) + `s\n` (later) is not read as `s`.
+    ///
+    /// Limits: an `AsyncBufRead` only shows what has reached this process.
+    /// Bytes still in a pipe, terminal line buffer or network path when this
+    /// runs arrive later and are read as the reply; and an owner who
+    /// answers a fresh prompt by completing a dropped half line must type
+    /// the reply again.
+    async fn discard_pending_input(&mut self) {
+        let mut mid_line = !self.partial.is_empty() || self.overflow || self.skip_line;
+        self.partial.clear();
+        self.overflow = false;
+        let mut budget = MAX_DISCARD_BYTES;
+        loop {
+            let ready = std::future::poll_fn(|cx| {
+                Poll::Ready(match Pin::new(&mut self.reader).poll_fill_buf(cx) {
+                    Poll::Ready(Ok(b)) => Some((b.len(), b.last().copied())),
+                    Poll::Ready(Err(_)) | Poll::Pending => None,
+                })
+            })
+            .await;
+            match ready {
+                Some((n, last)) if n > 0 => {
+                    self.reader.consume(n);
+                    mid_line = last != Some(b'\n');
+                    budget = budget.saturating_sub(n);
+                    if budget == 0 {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        self.skip_line = mid_line;
     }
 
     async fn ask_approval(&mut self, prompt: &ApprovalPrompt) -> ApprovalReply {

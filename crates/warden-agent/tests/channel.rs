@@ -490,3 +490,47 @@ async fn cancelled_ask_approval_keeps_the_partial_line() {
     assert_eq!(m.text, "yes 1234", "the whole line, not just its tail");
     assert_eq!(c.recv().await.unwrap().text, "next");
 }
+
+#[tokio::test(start_paused = true)]
+async fn stale_buffered_reply_is_discarded_before_a_prompt() {
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    let (mut client, server) = tokio::io::duplex(1024);
+    let mut c = StdioChannel::new(BufReader::new(server), tokio::io::sink());
+    let p = prompt("write \"/r/b\" (4 bytes)", Tier::Yes, None);
+    client.write_all(b"yes\n").await.unwrap();
+    c.discard_pending_input().await;
+    let waited = tokio::time::timeout(Duration::from_secs(5), c.ask_approval(&p)).await;
+    assert!(waited.is_err(), "the stale yes did not answer the prompt");
+    client.write_all(b"yes\n").await.unwrap();
+    assert_eq!(
+        c.ask_approval(&p).await,
+        ApprovalReply::Yes,
+        "a fresh reply does"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn discarded_half_line_is_not_completed_by_later_input() {
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    let (mut client, server) = tokio::io::duplex(1024);
+    let mut c = StdioChannel::new(BufReader::new(server), tokio::io::sink());
+    let p = prompt("write \"/r/b\" (4 bytes)", Tier::Yes, None);
+    client.write_all(b"ye").await.unwrap();
+    c.discard_pending_input().await;
+    // "s" completes the dropped line and is skipped; only the next line counts.
+    client.write_all(b"s\n").await.unwrap();
+    let waited = tokio::time::timeout(Duration::from_secs(5), c.ask_approval(&p)).await;
+    assert!(waited.is_err(), "\"s\" is not a reply");
+    client.write_all(b"no\n").await.unwrap();
+    assert_eq!(c.ask_approval(&p).await, ApprovalReply::No);
+}
+
+#[tokio::test]
+async fn discard_on_an_empty_reader_does_not_block() {
+    let mut out = Vec::new();
+    let mut c = chan(b"", &mut out);
+    c.discard_pending_input().await;
+    assert!(c.recv().await.is_none());
+}
