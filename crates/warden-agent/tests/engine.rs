@@ -1582,6 +1582,33 @@ async fn secret_straddling_the_result_cut_never_survives() {
         assert!(r.ends_with("\n[truncated]"), "{r}");
         assert!(!r.contains("sk-ant"), "prefix {prefix}: {r}");
         assert!(!reqs.join("").contains("sk-ant-api03"), "prefix {prefix}");
+
+        // The same cut chosen by the model through `max_bytes` (with a
+        // result cap that does not bite) never survives either.
+        let env2 = self::env();
+        let f = env2.file("a.txt", &format!("{pad}{ANTHROPIC_KEY}\n{tail}"));
+        let n = pad.len() + prefix;
+        let mut e = env2.engine(
+            vec![
+                reply(
+                    None,
+                    vec![call(
+                        "t1",
+                        "read_file",
+                        json!({"path": f.to_string_lossy(), "max_bytes": n}),
+                    )],
+                ),
+                reply(Some("ok"), vec![]),
+            ],
+            Opts::default(),
+        );
+        e.handle(msg("go")).await;
+        let reqs = e.planner().requests();
+        let (_, results) = blocks(&reqs[1]);
+        let r = &results[0].1;
+        assert!(r.ends_with(&format!("\n[truncated at {n} bytes]")), "{r}");
+        assert!(!r.contains("sk-ant"), "max_bytes prefix {prefix}: {r}");
+        assert!(!reqs.join("").contains("sk-ant-api03"), "prefix {prefix}");
     }
 }
 
@@ -2564,4 +2591,151 @@ async fn pin_like_check_is_bounded_on_a_long_message() {
     assert!(checks > 0);
     // Not PIN-like: it went to the planner.
     assert_eq!(e.planner().requests().len(), 1);
+}
+
+// ------------------------------------------- redaction oracle via max_bytes
+
+/// A Luhn-valid 16-digit card number starting with `prefix15` (15 digits).
+fn luhn_card(prefix15: &str) -> String {
+    let digits: Vec<u32> = prefix15.chars().map(|c| c.to_digit(10).unwrap()).collect();
+    // Double every second digit from the right of the full number, i.e.
+    // starting with the last digit of the 15-digit prefix.
+    let sum: u32 = digits
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(i, d)| {
+            if i % 2 == 0 {
+                let x = d * 2;
+                if x > 9 {
+                    x - 9
+                } else {
+                    x
+                }
+            } else {
+                *d
+            }
+        })
+        .sum();
+    format!("{prefix15}{}", (10 - sum % 10) % 10)
+}
+
+/// Secrets built at run time, so no key-shaped literal is in the source.
+fn oracle_secrets() -> Vec<(&'static str, String)> {
+    let alnum36: String = "Zq8LmN3pR7sT1vW5xY9aB2cD4eF6gH0jK8nP"
+        .chars()
+        .take(36)
+        .collect();
+    vec![
+        ("card", luhn_card("453201511283036")),
+        ("ghp", format!("{}{}", concat!("gh", "p_"), alnum36)),
+        (
+            "akia",
+            format!("{}{}", concat!("AK", "IA"), "Q7RZ4M2KX9TB3WJP"),
+        ),
+        (
+            "stripe",
+            format!(
+                "{}{}",
+                concat!("sk", "_li", "ve_"),
+                "Wq3Lx9Zr2Tm6Pv8Kd4Hs1Bn7"
+            ),
+        ),
+    ]
+}
+
+/// Every 12-character window of `secret` that appears in `hay`.
+fn leaked_windows(secret: &str, hay: &str) -> Vec<String> {
+    let chars: Vec<char> = secret.chars().collect();
+    chars
+        .windows(12)
+        .map(|w| w.iter().collect::<String>())
+        .filter(|w| hay.contains(w.as_str()))
+        .collect()
+}
+
+#[tokio::test]
+async fn model_chosen_max_bytes_never_reveals_a_secret_prefix() {
+    for (kind, secret) in oracle_secrets() {
+        let env = env();
+        let f = env.file("a.txt", &format!("card: {secret}\nmore text here\n"));
+        let len = fs::metadata(&f).unwrap().len();
+        let calls: Vec<ToolCall> = (1..=len + 5)
+            .map(|n| {
+                call(
+                    &format!("t{n}"),
+                    "read_file",
+                    json!({"path": f.to_string_lossy(), "max_bytes": n}),
+                )
+            })
+            .collect();
+        let mut e = env.engine(
+            vec![reply(None, calls), reply(Some("ok"), vec![])],
+            Opts {
+                tweak: Box::new(|c| c.max_calls_per_message = 1000),
+                ..Opts::default()
+            },
+        );
+        e.handle(msg("go")).await;
+        let reqs = e.planner().requests();
+        assert_eq!(reqs.len(), 2, "{kind}");
+        let (_, results) = blocks(&reqs[1]);
+        assert_eq!(results.len() as u64, len + 5, "{kind}");
+        let all = everything(&env, &reqs);
+        let leaks = leaked_windows(&secret, &all);
+        assert!(leaks.is_empty(), "{kind} leaked: {leaks:?}");
+        // The cut still applies (to the redacted text) and is marked.
+        assert!(
+            results[0].1.ends_with("\n[truncated at 1 bytes]"),
+            "{kind}: {}",
+            results[0].1
+        );
+        assert!(
+            !results[(len + 4) as usize].1.contains("[truncated"),
+            "{kind}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn secret_straddling_the_largest_read_cut_never_leaks() {
+    let env = env();
+    let max = warden_agent::tools::MAX_READ_BYTES as usize;
+    let token = oracle_secrets().remove(1).1; // ghp_, 40 chars
+    let start = max - 20; // straddles byte 1,048,576
+    let filler = "lorem ipsum ".repeat(max / 12 + 1);
+    let mut content = filler[..start].to_string();
+    content.push_str(&token);
+    content.push_str(&filler[..max + 100 - content.len()]);
+    assert_eq!(content.len(), max + 100);
+    let f = env.file("big.txt", &content);
+    let calls: Vec<ToolCall> = [max as u64, max as u64 - 1, max as u64 - 8, 5_000_000]
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            call(
+                &format!("t{i}"),
+                "read_file",
+                json!({"path": f.to_string_lossy(), "max_bytes": n}),
+            )
+        })
+        .collect();
+    let mut e = env.engine(
+        vec![reply(None, calls), reply(Some("ok"), vec![])],
+        Opts {
+            tweak: Box::new(move |c| c.result_max_bytes = 2 * max),
+            ..Opts::default()
+        },
+    );
+    e.handle(msg("go")).await;
+    let reqs = e.planner().requests();
+    let (_, results) = blocks(&reqs[1]);
+    assert_eq!(results.len(), 4);
+    let expect = [max, max - 1, max - 8, max];
+    for ((_, r, is_error), n) in results.iter().zip(expect) {
+        assert!(!is_error, "{}", &r[r.len().saturating_sub(200)..]);
+        assert!(r.ends_with(&format!("\n[truncated at {n} bytes]")), "{n}");
+    }
+    let leaks = leaked_windows(&token, &reqs.join("\n"));
+    assert!(leaks.is_empty(), "leaked: {leaks:?}");
 }

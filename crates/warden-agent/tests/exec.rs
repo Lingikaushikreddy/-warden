@@ -241,17 +241,34 @@ fn no_write_happens_on_token_mismatch() {
 // ---- read_file ----
 
 #[test]
-fn read_file_returns_text_and_truncates_at_max_bytes() {
+fn read_file_returns_the_whole_buffer_whatever_max_bytes_says() {
+    // The cut to `max_bytes` happens in the engine, after redaction; the
+    // executor never cuts inside the buffer.
     let mut e = env();
     fs::write(e.p("a.txt"), "hello world").unwrap();
-    let out = e.run(read(e.p("a.txt"), 100)).unwrap();
-    assert_eq!(out.text, "hello world");
-    assert!(out.snapshot.is_none());
-    let out = e.run(read(e.p("a.txt"), 5)).unwrap();
-    assert_eq!(out.text, "hello\n[truncated at 5 bytes]");
-    // Exactly max_bytes long: not truncated.
-    let out = e.run(read(e.p("a.txt"), 11)).unwrap();
-    assert_eq!(out.text, "hello world");
+    for n in [1, 5, 11, 100] {
+        let out = e.run(read(e.p("a.txt"), n)).unwrap();
+        assert_eq!(out.text, "hello world", "{n}");
+        assert!(!out.truncated);
+        assert!(out.snapshot.is_none());
+    }
+}
+
+#[test]
+fn read_file_reads_past_max_read_bytes_by_the_overlap_and_flags_longer_files() {
+    use warden_agent::exec::{READ_BUFFER_BYTES, READ_OVERLAP_BYTES};
+    use warden_agent::tools::MAX_READ_BYTES;
+    assert_eq!(READ_BUFFER_BYTES, MAX_READ_BYTES + READ_OVERLAP_BYTES);
+    let mut e = env();
+    let exact = "y".repeat(READ_BUFFER_BYTES as usize);
+    fs::write(e.p("exact.txt"), &exact).unwrap();
+    let out = e.run(read(e.p("exact.txt"), 1)).unwrap();
+    assert_eq!(out.text.len() as u64, READ_BUFFER_BYTES);
+    assert!(!out.truncated);
+    fs::write(e.p("long.txt"), format!("{exact}z")).unwrap();
+    let out = e.run(read(e.p("long.txt"), MAX_READ_BYTES)).unwrap();
+    assert_eq!(out.text.len() as u64, READ_BUFFER_BYTES);
+    assert!(out.truncated);
 }
 
 #[test]

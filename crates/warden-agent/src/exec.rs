@@ -37,8 +37,13 @@
 //!
 //! - `read_file`: opened with `O_NOFOLLOW | O_NONBLOCK` (a FIFO cannot block
 //!   the open), `fstat` through the handle must say regular file, at most
-//!   `max_bytes` are read through that handle and converted lossily to
-//!   UTF-8; a longer file gets a trailing `\n[truncated at <n> bytes]`.
+//!   [`READ_BUFFER_BYTES`] (`MAX_READ_BYTES` + [`READ_OVERLAP_BYTES`]) are
+//!   read through that handle and converted lossily to UTF-8, and
+//!   [`ToolOutput::truncated`] says whether the file was longer. The tool's
+//!   `max_bytes` is NOT applied here: the engine redacts the whole text first
+//!   and only then cuts the redacted text to `max_bytes`, so a model-chosen
+//!   cut can never end inside a secret before redaction sees it (a cut-first
+//!   order made `max_bytes` an oracle for secret prefixes).
 //! - `list_dir`: at most [`MAX_LIST_ENTRIES`] names, sorted by raw bytes,
 //!   with control and invisible/format characters escaped as `\u{..}`, a
 //!   trailing `/` for directories and `@` for symlinks (never followed). A
@@ -102,6 +107,12 @@ pub const MAX_LIST_ENTRIES: usize = 500;
 
 const TMP_PREFIX: &str = ".warden-tmp-";
 
+/// Bytes read past [`MAX_READ_BYTES`], so a secret that straddles the
+/// largest cut the model can ask for is whole when the engine redacts it.
+pub const READ_OVERLAP_BYTES: u64 = 4096;
+/// Most bytes `read_file` reads from one file.
+pub const READ_BUFFER_BYTES: u64 = MAX_READ_BYTES + READ_OVERLAP_BYTES;
+
 /// What a successful tool run produced.
 #[derive(Debug)]
 pub struct ToolOutput {
@@ -109,6 +120,9 @@ pub struct ToolOutput {
     pub text: String,
     /// The snapshot taken before a write or delete.
     pub snapshot: Option<SnapshotId>,
+    /// `read_file` only: the file is longer than [`READ_BUFFER_BYTES`] and
+    /// `text` holds only its beginning.
+    pub truncated: bool,
 }
 
 /// Why a tool run was refused or failed.
@@ -518,19 +532,18 @@ impl Executor {
             return Err(ExecError::NotAFile);
         }
         let mut buf = Vec::new();
-        // One extra byte tells whether the file is longer than max_bytes.
-        f.take(max_bytes + 1)
+        // `max_bytes` is deliberately not applied: the engine cuts only
+        // after redacting. One extra byte tells whether the file is longer
+        // than the buffer.
+        f.take(READ_BUFFER_BYTES + 1)
             .read_to_end(&mut buf)
             .map_err(|e| io_err(&e))?;
-        let truncated = buf.len() as u64 > max_bytes;
-        buf.truncate(max_bytes as usize);
-        let mut text = String::from_utf8_lossy(&buf).into_owned();
-        if truncated {
-            text.push_str(&format!("\n[truncated at {max_bytes} bytes]"));
-        }
+        let truncated = buf.len() as u64 > READ_BUFFER_BYTES;
+        buf.truncate(READ_BUFFER_BYTES as usize);
         Ok(ToolOutput {
-            text,
+            text: String::from_utf8_lossy(&buf).into_owned(),
             snapshot: None,
+            truncated,
         })
     }
 
@@ -576,6 +589,7 @@ impl Executor {
         Ok(ToolOutput {
             text: lines.join("\n"),
             snapshot: None,
+            truncated: false,
         })
     }
 
@@ -622,6 +636,7 @@ impl Executor {
         Ok(ToolOutput {
             text,
             snapshot: Some(id),
+            truncated: false,
         })
     }
 
@@ -650,6 +665,7 @@ impl Executor {
         Ok(ToolOutput {
             text,
             snapshot: Some(id),
+            truncated: false,
         })
     }
 

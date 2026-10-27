@@ -20,8 +20,13 @@
 //! 6. the outcome is audited; if that append fails, the owner is told,
 //!    with the snapshot id so the change can still be undone.
 //!
-//! Everything sent to the planner is redacted (the types enforce it), and
-//! tool results are truncated to `result_max_bytes`. The planner is
+//! Everything sent to the planner is redacted (the types enforce it). A
+//! `read_file` result is redacted WHOLE (the executor reads up to
+//! `MAX_READ_BYTES` + 4096 bytes whatever the model asked for), then the
+//! redacted text is cut to the model's `max_bytes`, then every tool result
+//! is cut to `result_max_bytes` and redacted again. No cut ever applies to
+//! unredacted text, so `max_bytes` cannot be used to read a secret's
+//! prefix. The planner is
 //! untrusted: the system prompt asks it to treat file content as data, but
 //! no safety property depends on that prompt.
 //!
@@ -400,6 +405,27 @@ fn bounded(text: &str, max: usize) -> Redacted {
     }
     let head = s.get(..cut).unwrap_or("");
     redact(&format!("{head}\n[truncated]")).0
+}
+
+/// A `read_file` result for the model: the whole text read is redacted
+/// FIRST, then the redacted text is cut to `max_bytes` on a char boundary,
+/// with `\n[truncated at <max_bytes> bytes]` when it was cut or when the
+/// file was longer than what the executor read (`longer`). Cutting before
+/// redacting would let the model choose a cut inside a secret and read its
+/// prefix.
+fn read_result(raw: &str, max_bytes: u64, longer: bool) -> String {
+    let red = redact(raw).0.into_string();
+    let max = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    if red.len() <= max && !longer {
+        return red;
+    }
+    let mut cut = max.min(red.len());
+    while cut > 0 && !red.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = red.get(..cut).unwrap_or("").to_string();
+    out.push_str(&format!("\n[truncated at {max_bytes} bytes]"));
+    out
 }
 
 /// What a tool call produced for the model.
@@ -1122,8 +1148,14 @@ where
                     Some(id) => format!("executed snapshot={id}"),
                     None => "executed".to_string(),
                 };
+                let text = match tool {
+                    Tool::ReadFile { max_bytes, .. } => {
+                        read_result(&out.text, *max_bytes, out.truncated)
+                    }
+                    _ => out.text,
+                };
                 let o = Outcome {
-                    text: out.text,
+                    text,
                     is_error: false,
                     untrusted,
                 };
@@ -1293,6 +1325,19 @@ mod tests {
         assert_eq!(n.chars().count(), MAX_NOTE_CHARS);
         assert!(n.ends_with('…'));
         assert_eq!(cap_note("short"), "short");
+    }
+
+    #[test]
+    fn read_result_redacts_before_cutting() {
+        let key = format!("{}{}", concat!("AK", "IA"), "Q7RZ4M2KX9TB3WJP");
+        let raw = format!("k: {key} tail");
+        for n in 1..=raw.len() as u64 + 3 {
+            let r = read_result(&raw, n, false);
+            assert!(!r.contains(&key[..12]), "{n}: {r}");
+        }
+        assert_eq!(read_result("abc", 3, false), "abc");
+        assert_eq!(read_result("abc", 3, true), "abc\n[truncated at 3 bytes]");
+        assert_eq!(read_result("éé", 3, false), "é\n[truncated at 3 bytes]");
     }
 
     #[test]

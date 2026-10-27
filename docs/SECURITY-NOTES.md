@@ -660,10 +660,34 @@ thread.
   refusal append is reported to the owner (`warning: audit append failed`).
 
 **What reaches the planner.** The system prompt, the owner text and every
-tool result go through `redact`. Tool results for `read_file` and
-`list_dir` start with `[untrusted file content]`, are redacted, cut to
-`result_max_bytes` on a char boundary with `\n[truncated]`, and redacted
-again (a cut can turn an unmatched longer digit run into a matchable one).
+tool result go through `redact`. For `read_file`, the order is fixed and no
+cut ever applies to unredacted text:
+
+1. the executor reads up to `MAX_READ_BYTES + 4096` bytes (1 MiB + 4 KiB)
+   whatever `max_bytes` the model asked for, and flags a file longer than
+   that;
+2. the engine redacts that whole text;
+3. the engine cuts the REDACTED text to the model's `max_bytes` on a char
+   boundary, appending `\n[truncated at <max_bytes> bytes]` when it cut or
+   when the file was longer than the buffer (the count is of redacted
+   bytes);
+4. like every tool result, it is prefixed with `[untrusted file content]`,
+   redacted, cut to `result_max_bytes` on a char boundary with
+   `\n[truncated]`, and redacted again (a cut can turn an unmatched longer
+   digit run into a matchable one).
+
+Why: `read_file` is an `Auto` action, and with the cut made BEFORE
+redaction the model could read a file once to see `[REDACTED:card]` at byte
+6, then ask for `max_bytes: 21` and receive the first 15 digits (Luhn gives
+the 16th), or 35 of 36 characters of a `ghp_` token, 19 of 20 of an AKIA
+id. Redacting first means every cut the model can choose is a prefix of
+text that no longer contains the secret. Residual limit: a secret that
+starts before byte 1,048,576 and runs past the 4096-byte overlap, and whose
+pattern needs its end to match (for example an unterminated quoted value
+longer than 4 KiB), is cut by the buffer before redaction and may be partly
+visible; fixed-length tokens, cards and key prefixes are far shorter than
+the overlap. `list_dir` output is already bounded (500 names) and is
+redacted as a whole.
 Error results use fixed texts (`invalid call: <kind>`, `blocked by policy`,
 `owner declined`, `bad pin`, `pin locked`, `pin unavailable`, `audit
 unavailable`, `approval unavailable`, `too many calls`, `error: <ExecError

@@ -58,7 +58,9 @@ anything that matters.
   File contents and PINs are never written to it.
 - **Redaction.** Everything sent to the model (your messages, file
   contents, tool results) first goes through a pattern-based secret
-  redactor.
+  redactor. A file read is redacted as a whole (up to 1 MiB + 4 KiB)
+  before it is cut to the size the model asked for, so the model cannot
+  choose a cut that ends inside a secret.
 - **Key handling.** The API key is read only from an environment variable.
   It is never stored in the config file (a config that contains a key-like
   field is refused), and never printed, logged or audited.
@@ -141,7 +143,10 @@ which has the details.
 - **Redaction is pattern-based.** Secret formats it has no pattern for,
   obfuscated or split secrets, and anything else it does not recognize in
   files the agent reads still reach the model. Reads inside the root need
-  no prompt.
+  no prompt. A file is redacted only up to 1 MiB + 4 KiB: a secret that
+  starts before the 1 MiB mark, runs more than 4 KiB past it and needs its
+  end to be recognized (such as a very long unterminated quoted value) may
+  be partly visible.
 - **The model is a remote service.** The planner runs at Anthropic and sees
   the redacted text of your messages and of every file the agent reads. Its
   output is treated as untrusted, but it can still word an approval note
