@@ -7,7 +7,8 @@
 //! without reading the body, and tool-use ids and names are restricted to
 //! `[A-Za-z0-9_-]{1,64}` because they are echoed back into later requests.
 
-use crate::planner::{Block, PlanRequest, PlanResponse, Planner, PlannerError, Role, Turn};
+use crate::planner::{Block, PlanRequest, PlanResponse, Planner, PlannerError, Role, ToolId, Turn};
+use crate::redact::redact;
 use crate::tools::ToolCall;
 use reqwest::header::{HeaderValue, CONTENT_TYPE};
 use reqwest::redirect::Policy;
@@ -57,8 +58,17 @@ impl fmt::Debug for AnthropicPlanner {
     }
 }
 
-fn config_err(m: &str) -> PlannerError {
-    PlannerError::Malformed(m.to_string())
+fn config_err(m: &'static str) -> PlannerError {
+    PlannerError::Config(m)
+}
+
+/// `^[A-Za-z0-9._:-]{1,100}$`, and nothing the redactor would touch (a
+/// secret-shaped model string is refused rather than sent).
+fn valid_model(m: &str) -> bool {
+    (1..=100).contains(&m.len())
+        && m.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+        && redact(m).1.count == 0
 }
 
 fn check_base_url(base_url: &str) -> Result<Url, PlannerError> {
@@ -86,9 +96,14 @@ fn check_base_url(base_url: &str) -> Result<Url, PlannerError> {
 }
 
 impl AnthropicPlanner {
-    /// Build a planner. `api_key` and `model` must be non-empty; `base_url`
-    /// must be `https://`, or `http://` to `127.0.0.1`, `localhost` or
-    /// `[::1]`. A trailing slash is ignored.
+    /// Build a planner. `api_key` must be non-empty; `model` must match
+    /// `[A-Za-z0-9._:-]{1,100}` and not look like a secret; `base_url` must be
+    /// `https://`, or `http://` to `127.0.0.1`, `localhost` or `[::1]`. A
+    /// trailing slash is ignored. Errors are [`PlannerError::Config`].
+    ///
+    /// Proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`,
+    /// `ALL_PROXY`) are ignored: the client always connects directly.
+    /// Corporate-proxy support would be a later, explicit opt-in.
     pub fn new(
         api_key: String,
         model: String,
@@ -97,8 +112,11 @@ impl AnthropicPlanner {
         if api_key.is_empty() {
             return Err(config_err("empty api key"));
         }
-        if model.trim().is_empty() {
+        if model.is_empty() {
             return Err(config_err("empty model"));
+        }
+        if !valid_model(&model) {
+            return Err(config_err("invalid model id"));
         }
         let url = check_base_url(&base_url)?;
         let base = url.as_str().trim_end_matches('/').to_string();
@@ -112,6 +130,7 @@ impl AnthropicPlanner {
 
         let client = reqwest::Client::builder()
             .redirect(Policy::none())
+            .no_proxy()
             .use_rustls_tls()
             .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(USER_AGENT_VALUE)
@@ -139,7 +158,7 @@ impl AnthropicPlanner {
             .tools
             .iter()
             .map(
-                |t| json!({"name": t.name, "description": t.description, "input_schema": t.schema}),
+                |t| json!({"name": t.name(), "description": t.description(), "input_schema": t.schema()}),
             )
             .collect();
         json!({
@@ -227,7 +246,7 @@ fn block_json(b: &Block) -> Value {
     match b {
         Block::Text(t) => json!({"type": "text", "text": t.as_str()}),
         Block::ToolUse { id, name, args } => {
-            json!({"type": "tool_use", "id": id, "name": name, "input": args.as_value()})
+            json!({"type": "tool_use", "id": id.as_str(), "name": name.as_str(), "input": args.as_value()})
         }
         Block::ToolResult {
             id,
@@ -235,33 +254,35 @@ fn block_json(b: &Block) -> Value {
             is_error,
         } => json!({
             "type": "tool_result",
-            "tool_use_id": id,
+            "tool_use_id": id.as_str(),
             "content": content.as_str(),
             "is_error": is_error,
         }),
     }
 }
 
-/// API messages, with consecutive turns of the same role merged so roles
-/// alternate as the API requires.
+/// API messages. Turns with no blocks are dropped; consecutive turns of the
+/// same role are merged so roles alternate as the API requires; within a
+/// user message, `tool_result` blocks are moved (stably) before everything
+/// else, as the API requires. Pairing each `tool_use` with a `tool_result`
+/// is the engine's job, not checked here.
 fn messages(turns: &[Turn]) -> Vec<Value> {
-    let mut out: Vec<(Role, Vec<Value>)> = Vec::new();
-    for t in turns {
-        let blocks = t.blocks.iter().map(block_json);
+    let mut out: Vec<(Role, Vec<&Block>)> = Vec::new();
+    for t in turns.iter().filter(|t| !t.blocks.is_empty()) {
         match out.last_mut() {
-            Some((role, content)) if *role == t.role => content.extend(blocks),
-            _ => out.push((t.role, blocks.collect())),
+            Some((role, blocks)) if *role == t.role => blocks.extend(&t.blocks),
+            _ => out.push((t.role, t.blocks.iter().collect())),
         }
     }
     out.into_iter()
-        .map(|(role, content)| json!({"role": role_str(role), "content": content}))
+        .map(|(role, mut blocks)| {
+            if role == Role::User {
+                blocks.sort_by_key(|b| !matches!(b, Block::ToolResult { .. }));
+            }
+            let content: Vec<Value> = blocks.into_iter().map(block_json).collect();
+            json!({"role": role_str(role), "content": content})
+        })
         .collect()
-}
-
-fn clean_ident(s: &str) -> bool {
-    (1..=64).contains(&s.len())
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 fn str_field<'a>(o: &'a Map<String, Value>, k: &str) -> Result<&'a str, PlannerError> {
@@ -310,15 +331,15 @@ fn parse_response(body: &[u8]) -> Result<PlanResponse, PlannerError> {
                 let input = o
                     .get("input")
                     .ok_or_else(|| PlannerError::Malformed("bad content block".into()))?;
-                if !clean_ident(id) || !clean_ident(name) {
-                    return Err(PlannerError::Malformed("bad tool id".into()));
-                }
+                // Validated as ToolIds: they are echoed back into history.
+                let id = ToolId::new(id)?;
+                let name = ToolId::new(name)?;
                 if calls.len() == MAX_TOOL_CALLS {
                     return Err(PlannerError::Malformed("too many tool calls".into()));
                 }
                 calls.push(ToolCall {
-                    id: id.to_string(),
-                    name: name.to_string(),
+                    id: id.as_str().to_string(),
+                    name: name.as_str().to_string(),
                     args: input.clone(),
                 });
             }

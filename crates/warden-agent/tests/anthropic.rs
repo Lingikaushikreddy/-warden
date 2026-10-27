@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::time::Duration;
 use warden_agent::anthropic::AnthropicPlanner;
-use warden_agent::planner::{Block, PlanRequest, Planner, PlannerError, Role, Turn};
+use warden_agent::planner::{Block, PlanRequest, Planner, PlannerError, Role, ToolId, Turn};
 use warden_agent::redact::redact;
 use warden_agent::tools::tool_specs;
 use wiremock::matchers::{header, method, path};
@@ -24,6 +24,10 @@ fn request() -> PlanRequest {
         }],
         tools: tool_specs(),
     }
+}
+
+fn tid(s: &str) -> ToolId {
+    ToolId::new(s).unwrap()
 }
 
 fn ok_body() -> Value {
@@ -118,15 +122,15 @@ async fn merges_consecutive_same_role_turns() {
             },
             Turn {
                 role: Role::Assistant,
-                blocks: vec![Block::tool_use("tu_1", "list_dir", &json!({"path": "."}))],
+                blocks: vec![Block::tool_use(
+                    &tid("tu_1"),
+                    &tid("list_dir"),
+                    &json!({"path": "."}),
+                )],
             },
             Turn {
                 role: Role::User,
-                blocks: vec![Block::ToolResult {
-                    id: "tu_1".into(),
-                    content: redact("a.txt").0,
-                    is_error: false,
-                }],
+                blocks: vec![Block::tool_result(&tid("tu_1"), redact("a.txt").0, false)],
             },
         ],
         tools: tool_specs(),
@@ -479,18 +483,18 @@ async fn request_contains_no_unredacted_secret() {
             Turn {
                 role: Role::Assistant,
                 blocks: vec![Block::tool_use(
-                    "t1",
-                    "write_file",
+                    &tid("t1"),
+                    &tid("write_file"),
                     &json!({"path": "k.txt", "content": secret}),
                 )],
             },
             Turn {
                 role: Role::User,
-                blocks: vec![Block::ToolResult {
-                    id: "t1".into(),
-                    content: redact(&format!("wrote {secret}")).0,
-                    is_error: false,
-                }],
+                blocks: vec![Block::tool_result(
+                    &tid("t1"),
+                    redact(&format!("wrote {secret}")).0,
+                    false,
+                )],
             },
         ],
         tools: tool_specs(),
@@ -569,7 +573,10 @@ fn http_non_loopback_base_url_is_rejected() {
         "https://api.anthropic.com/?q=1",
         "https://api.anthropic.com/#frag",
     ] {
-        assert!(mk(bad).is_err(), "accepted {bad:?}");
+        assert!(
+            matches!(mk(bad).unwrap_err(), PlannerError::Config(_)),
+            "accepted {bad:?}"
+        );
     }
     for good in [
         "https://api.anthropic.com",
@@ -586,10 +593,126 @@ fn http_non_loopback_base_url_is_rejected() {
 #[test]
 fn empty_key_or_model_rejected() {
     let base = "https://api.anthropic.com".to_string();
-    assert!(AnthropicPlanner::new(String::new(), MODEL.into(), base.clone()).is_err());
-    assert!(AnthropicPlanner::new(KEY.into(), String::new(), base.clone()).is_err());
-    assert!(AnthropicPlanner::new("bad\nkey".into(), MODEL.into(), base.clone()).is_err());
-    assert!(AnthropicPlanner::new(KEY.into(), MODEL.into(), base).is_ok());
+    let mk = |k: &str, m: &str| AnthropicPlanner::new(k.into(), m.into(), base.clone());
+    assert_eq!(
+        mk("", MODEL).unwrap_err(),
+        PlannerError::Config("empty api key")
+    );
+    assert!(matches!(mk(KEY, "").unwrap_err(), PlannerError::Config(_)));
+    assert!(matches!(
+        mk("bad\nkey", MODEL).unwrap_err(),
+        PlannerError::Config(_)
+    ));
+    assert!(mk(KEY, MODEL).is_ok());
+    let e = mk("", MODEL).unwrap_err();
+    assert!(e.to_string().contains("empty api key"), "{e}");
+}
+
+#[test]
+fn invalid_model_is_rejected() {
+    let base = "https://api.anthropic.com".to_string();
+    let mk = |m: &str| AnthropicPlanner::new(KEY.into(), m.into(), base.clone());
+    for ok in [
+        "claude-sonnet-5-5",
+        "claude-3-5-haiku-20241022",
+        "us.anthropic.claude-sonnet-4-5-v1:0",
+        &"m".repeat(100),
+    ] {
+        assert!(mk(ok).is_ok(), "rejected {ok:?}");
+    }
+    for bad in [
+        "claude sonnet",
+        "claude\nsonnet",
+        "claude\"}",
+        "claude/sonnet",
+        &"m".repeat(101),
+        // Valid characters, but secret-shaped: refused rather than sent.
+        "AKIAIOSFODNN7EXAMPLE",
+        "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+        "ghp_0123456789abcdefghijABCDEFGHIJ012345",
+    ] {
+        assert_eq!(
+            mk(bad).unwrap_err(),
+            PlannerError::Config("invalid model id"),
+            "{bad:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_results_come_first_and_empty_turns_are_dropped() {
+    let server = MockServer::start().await;
+    mount_ok(&server, ok_body()).await;
+    let req = PlanRequest {
+        system: redact("s").0,
+        turns: vec![
+            Turn {
+                role: Role::User,
+                blocks: vec![Block::Text(redact("go").0)],
+            },
+            Turn {
+                role: Role::Assistant,
+                blocks: vec![
+                    Block::tool_use(&tid("a"), &tid("list_dir"), &json!({"path": "."})),
+                    Block::tool_use(&tid("b"), &tid("list_dir"), &json!({"path": "x"})),
+                ],
+            },
+            Turn {
+                role: Role::User,
+                blocks: vec![Block::Text(redact("note before results").0)],
+            },
+            Turn {
+                role: Role::User,
+                blocks: vec![],
+            },
+            Turn {
+                role: Role::User,
+                blocks: vec![
+                    Block::tool_result(&tid("a"), redact("r-a").0, false),
+                    Block::Text(redact("between").0),
+                    Block::tool_result(&tid("b"), redact("r-b").0, true),
+                ],
+            },
+            Turn {
+                role: Role::Assistant,
+                blocks: vec![],
+            },
+            Turn {
+                role: Role::User,
+                blocks: vec![Block::Text(redact("more").0)],
+            },
+        ],
+        tools: tool_specs(),
+    };
+    planner(&server.uri()).plan(&req).await.unwrap();
+    let body = sent_body(&server).await;
+    let msgs = body["messages"].as_array().unwrap();
+    // The empty assistant turn does not split the user messages.
+    assert_eq!(msgs.len(), 3, "{body}");
+    let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["user", "assistant", "user"]);
+    let last: Vec<String> = msgs[2]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| match b["type"].as_str().unwrap() {
+            "tool_result" => format!("result:{}", b["tool_use_id"].as_str().unwrap()),
+            _ => format!("text:{}", b["text"].as_str().unwrap()),
+        })
+        .collect();
+    assert_eq!(
+        last,
+        [
+            "result:a",
+            "result:b",
+            "text:note before results",
+            "text:between",
+            "text:more"
+        ]
+    );
+    // Assistant blocks are never reordered.
+    assert_eq!(msgs[1]["content"][0]["id"], "a");
+    assert_eq!(msgs[1]["content"][1]["id"], "b");
 }
 
 #[tokio::test]

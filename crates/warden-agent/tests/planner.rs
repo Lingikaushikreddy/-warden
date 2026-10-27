@@ -1,6 +1,6 @@
 use serde_json::json;
 use warden_agent::planner::{
-    Block, MockPlanner, PlanRequest, PlanResponse, Planner, PlannerError, Role, Turn,
+    Block, MockPlanner, PlanRequest, PlanResponse, Planner, PlannerError, Role, ToolId, Turn,
 };
 use warden_agent::redact::redact;
 use warden_agent::tools::{tool_specs, ToolCall};
@@ -14,6 +14,10 @@ fn request(text: &str) -> PlanRequest {
         }],
         tools: tool_specs(),
     }
+}
+
+fn tid(s: &str) -> ToolId {
+    ToolId::new(s).unwrap()
 }
 
 fn reply(text: &str) -> PlanResponse {
@@ -58,7 +62,11 @@ async fn requests_are_recorded_as_serialized_strings() {
     let mut second = request("second question");
     second.turns.push(Turn {
         role: Role::Assistant,
-        blocks: vec![Block::tool_use("t1", "read_file", &json!({"path": "a"}))],
+        blocks: vec![Block::tool_use(
+            &tid("t1"),
+            &tid("read_file"),
+            &json!({"path": "a"}),
+        )],
     });
     mock.plan(&second).await.unwrap();
 
@@ -92,12 +100,12 @@ async fn exhausted_script_is_malformed() {
 #[test]
 fn tool_use_args_are_redacted_by_constructor() {
     let raw = json!({"path": "/tmp/x", "password": "hunter2hunter2hunter2"});
-    let block = Block::tool_use("t1", "write_file", &raw);
+    let block = Block::tool_use(&tid("t1"), &tid("write_file"), &raw);
     let Block::ToolUse { id, name, args } = &block else {
         panic!("not a tool_use block");
     };
-    assert_eq!(id, "t1");
-    assert_eq!(name, "write_file");
+    assert_eq!(id.as_str(), "t1");
+    assert_eq!(name.as_str(), "write_file");
     assert_eq!(args.as_value()["path"], "/tmp/x");
     assert_ne!(args.as_value()["password"], "hunter2hunter2hunter2");
     let s = serde_json::to_string(&block).unwrap();
@@ -110,7 +118,7 @@ fn raw_value_cannot_be_used_in_tool_use() {
     // The type-level guarantee is the compile_fail doctest on
     // `warden_agent::planner::RedactedJson`; here we check the only public
     // way in goes through redaction.
-    let block = Block::tool_use("t1", "x", &json!({"token": "abcd1234abcd1234"}));
+    let block = Block::tool_use(&tid("t1"), &tid("x"), &json!({"token": "abcd1234abcd1234"}));
     let Block::ToolUse { args, .. } = block else {
         panic!()
     };
@@ -150,4 +158,44 @@ async fn from_script_file_loads() {
     let bad = dir.path().join("bad.json");
     std::fs::write(&bad, r#"[{"error": "nonsense"}]"#).unwrap();
     assert!(MockPlanner::from_script_file(&bad).is_err());
+}
+
+#[test]
+fn tool_id_accepts_only_clean_identifiers() {
+    for ok in ["t1", "toolu_01A", "a-b_c", &"A".repeat(64)] {
+        assert_eq!(ToolId::new(ok).unwrap().as_str(), ok);
+    }
+    let long = "a".repeat(65);
+    for bad in [
+        "",
+        "a b",
+        "a\nb",
+        "lïst",
+        "x/y",
+        "AKIAIOSFODNN7EXAMPLE\u{0}",
+        long.as_str(),
+        "AKIAIOSFODNN7EXAMPLE secret",
+    ] {
+        assert_eq!(
+            ToolId::new(bad).unwrap_err(),
+            PlannerError::Malformed("bad tool id".into()),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn tool_result_constructor_keeps_redacted_content() {
+    let b = Block::tool_result(&tid("t9"), redact("password=hunter2hunter2").0, true);
+    let Block::ToolResult {
+        id,
+        content,
+        is_error,
+    } = &b
+    else {
+        panic!()
+    };
+    assert_eq!(id.as_str(), "t9");
+    assert!(!content.as_str().contains("hunter2"));
+    assert!(*is_error);
 }

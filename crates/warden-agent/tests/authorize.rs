@@ -1,5 +1,8 @@
 //! Tests for the persisted approver store and the `Authorized` token.
 //! Needs the `test-hooks` feature (enabled by the crate's self dev-dependency).
+// Local exception to the crate's `forbid(unsafe_code)`: `libc::mkfifo`
+// replaces spawning `mkfifo` (see `make_fifo`).
+#![allow(unsafe_code)]
 
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
@@ -374,18 +377,27 @@ fn symlinked_spent_log_is_refused() {
     assert!(ApproverStore::open(&home, NOW).is_err());
 }
 
+/// `mkfifo` without spawning a process: a forked child would share the open
+/// file description of another test's `approver.lock` (and its `flock`) until
+/// it execs, so a concurrent reopen could see `WouldBlock`.
+fn make_fifo(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+    if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 #[test]
 fn fifo_spent_log_is_refused_without_hanging() {
     let (_d, home) = new_home();
     drop(ApproverStore::open(&home, NOW).unwrap());
     fs::remove_file(spent_path(&home)).unwrap();
-    let made = std::process::Command::new("mkfifo")
-        .arg(spent_path(&home))
-        .status();
-    if !matches!(made, Ok(s) if s.success()) {
-        eprintln!("skipping: mkfifo unavailable");
-        return;
-    }
+    make_fifo(&spent_path(&home)).unwrap();
     let h = home.clone();
     let res = within_timeout(move || ApproverStore::open(&h, NOW).map(|_| ()));
     assert_eq!(res.unwrap_err().kind(), ErrorKind::InvalidData);

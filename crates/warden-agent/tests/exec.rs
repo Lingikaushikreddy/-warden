@@ -1,10 +1,12 @@
 //! Tests for the executor: the only agent code that touches the disk.
+// Local exception to the crate's `forbid(unsafe_code)`: `libc::mkfifo`
+// replaces spawning `mkfifo` (see `make_fifo`).
+#![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use warden_agent::authorize::{ApproverStore, Authorized};
 use warden_agent::exec::{ExecError, ExecFailure, Executor, ToolOutput};
 use warden_agent::tools::{to_action, Tool};
@@ -136,12 +138,27 @@ fn mode(p: &Path) -> u32 {
     fs::metadata(p).unwrap().permissions().mode() & 0o7777
 }
 
+/// Root check without spawning `id` (see `make_fifo` for why tests here
+/// do not spawn processes): a file we create is owned by our effective uid.
 fn is_root_user() -> bool {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
-        .unwrap_or(false)
+    use std::os::unix::fs::MetadataExt;
+    let f = tempfile::NamedTempFile::new().unwrap();
+    f.as_file().metadata().unwrap().uid() == 0
+}
+
+/// `mkfifo` without spawning a process: a forked child would share the open
+/// file description of another test's `approver.lock` (and its `flock`) until
+/// it execs, so a concurrent reopen could see `WouldBlock`.
+fn make_fifo(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+    if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 fn no_temp_files(dir: &Path) -> bool {
@@ -281,13 +298,7 @@ fn read_binary_file_is_lossy_not_panic() {
 fn read_fifo_is_not_a_file_and_does_not_hang() {
     let mut e = env();
     let fifo = e.p("fifo");
-    match Command::new("mkfifo").arg(&fifo).status() {
-        Ok(s) if s.success() => {}
-        _ => {
-            eprintln!("mkfifo unavailable; skipping");
-            return;
-        }
-    }
+    make_fifo(&fifo).unwrap();
     let t = read(fifo, 100);
     let (a, tok) = e.auth(&t, "a1");
     let (tx, rx) = std::sync::mpsc::channel();

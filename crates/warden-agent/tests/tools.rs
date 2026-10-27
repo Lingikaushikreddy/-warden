@@ -197,7 +197,7 @@ fn capabilities_match_tools() {
 fn tool_specs_have_object_schemas_and_unique_names() {
     let specs = tool_specs();
     assert_eq!(specs.len(), 4);
-    let mut names: Vec<_> = specs.iter().map(|s| s.name).collect();
+    let mut names: Vec<_> = specs.iter().map(|s| s.name()).collect();
     names.sort();
     names.dedup();
     assert_eq!(
@@ -205,11 +205,11 @@ fn tool_specs_have_object_schemas_and_unique_names() {
         ["delete_file", "list_dir", "read_file", "write_file"]
     );
     for s in &specs {
-        assert_eq!(s.schema["type"], "object");
-        assert!(s.schema["properties"].is_object());
-        assert!(s.schema["required"].is_array());
-        assert_eq!(s.schema["additionalProperties"], false);
-        assert!(!s.description.is_empty());
+        assert_eq!(s.schema()["type"], "object");
+        assert!(s.schema()["properties"].is_object());
+        assert!(s.schema()["required"].is_array());
+        assert_eq!(s.schema()["additionalProperties"], false);
+        assert!(!s.description().is_empty());
     }
 }
 

@@ -160,12 +160,28 @@ pattern-based, so its known limits (see `redact.rs`) apply to everything
 sent: unknown secret formats, obfuscated or split secrets and so on still
 leave the machine.
 
+The other fields are validated, not redacted, so arbitrary text cannot
+ride along in them: tool-use ids and names (`ToolUse`, `ToolResult`) are
+`ToolId`s, built only by `ToolId::new`, which allows `[A-Za-z0-9_-]{1,64}`;
+`ToolSpec` fields are private and specs come only from `tools::tool_specs`;
+the model id must match `[A-Za-z0-9._:-]{1,100}` and is refused if the
+redactor would change it (an `AKIA...` or `sk-ant-...` string passed as the
+model is an error, not a request).
+
+Message assembly: empty turns are dropped, consecutive same-role turns are
+merged, and in each user message `tool_result` blocks are moved (stably)
+before other blocks, as the API requires. Pairing every `tool_use` with
+its `tool_result` is the engine's job; the provider does not check it.
+
 - **Responses are untrusted.** Text is truncated at 64 KiB. Tool calls go
   through `parse_call`, `classify` and approval like any other model output.
   Tool-use ids and names must match `[A-Za-z0-9_-]{1,64}` (they are echoed
   into later requests), and at most 64 calls are accepted per response;
   otherwise the whole response is `Malformed`. Unknown block types
-  (thinking, server tools) are ignored.
+  (thinking, server tools) are ignored. Response text is passed through
+  unchanged: NUL, ANSI escapes, bidi controls and other terminal control
+  sequences are NOT stripped here and must be sanitized by whatever
+  displays it (the channel, Task 8).
 - **Bounded reads.** The body is read chunk by chunk and abandoned past
   1 MiB (`TooLarge`); Content-Length is not consulted. A non-2xx status is
   returned as `Status(code)` without reading the body. Parse errors use
@@ -173,7 +189,11 @@ leave the machine.
 - **Transport.** HTTPS only (rustls), except `http://` to `127.0.0.1`,
   `localhost` or `[::1]` for tests and local proxies; base URLs with
   credentials, a query or a fragment are refused. Redirects are not
-  followed (a 3xx is a `Status` error). Timeouts: 10 s connect, 60 s for the
+  followed (a 3xx is a `Status` error). Proxies are disabled
+  (`no_proxy()`): `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` are ignored, so the
+  key cannot be routed through a proxy from the environment (with an http
+  loopback base it would otherwise travel in cleartext). Corporate-proxy
+  support is a later, explicit opt-in config. Timeouts: 10 s connect, 60 s for the
   whole request by default (`with_timeout`). Transport errors are a short
   category plus reqwest's message with the URL removed (`without_url`);
   the source chain is dropped.
@@ -184,7 +204,8 @@ leave the machine.
   is held only as a `HeaderValue` marked sensitive, and the `String` it
   came from is zeroized (the header's own buffer is not). `Debug` of the
   planner shows the model, base URL and timeout, never the key; no error
-  carries it.
+  carries it. Constructor problems are `PlannerError::Config` with fixed
+  messages.
 
 ## Agent approver store
 
@@ -223,6 +244,14 @@ be on a local filesystem, because the single-owner guarantee is an advisory
   `redeem`'s. Pruning trusts `now_ms`: a clock that jumps forward on open
   prunes early, and if it then goes back those approvals could be replayed
   within their window.
+- **Locks and child processes.** The `flock` belongs to the open file
+  description. A child forked by any thread while a store is open shares
+  it until the child execs (the descriptor is close-on-exec), so the lock
+  can briefly outlive dropping the store and an immediate reopen sees
+  `WouldBlock`. This made tests that spawned `mkfifo`/`id` flaky; they now
+  call `libc::mkfifo` in-process (the only `unsafe` in the workspace, in
+  test files only). A long-running engine that spawns processes should not
+  rely on drop-then-reopen being instant.
 
 Deferred (Plan 3): persist a high-water mark of the largest `now_ms` seen
 (next to the log) and refuse to open or prune with an earlier clock, closing

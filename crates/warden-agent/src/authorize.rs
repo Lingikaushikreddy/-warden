@@ -16,6 +16,12 @@
 //!
 //! - `approver.lock`: an exclusive advisory lock held for the store's
 //!   lifetime, so two agents cannot share one store (`WouldBlock`).
+//!   The lock belongs to the open file description, not the process: if
+//!   any thread forks a child (`std::process::Command`) while a store is
+//!   open, the child holds the description until it execs (the descriptor
+//!   is close-on-exec), so the lock can briefly outlive dropping the store
+//!   and an immediate reopen can see `WouldBlock`. Avoid spawning processes
+//!   around a store reopen, or retry the open.
 //! - `approver.key`: the ed25519 signing key, exactly 32 raw bytes, 0600.
 //!   Created atomically from the OS RNG (temp file, `sync_all`, `hard_link`,
 //!   directory fsync) only when missing; a leftover `approver.key.tmp` from a

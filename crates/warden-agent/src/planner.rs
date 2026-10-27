@@ -1,19 +1,26 @@
 //! The planner boundary: the only place the agent talks to a model.
 //!
 //! Everything sent to a planner is typed so that it has gone through the
-//! redactor: text and tool results are [`Redacted`], and tool-call arguments
-//! echoed back into history are [`RedactedJson`], which only
-//! [`Block::tool_use`] can build (it runs [`redact_json`]). Everything a
-//! planner returns ([`PlanResponse`]) is UNTRUSTED model output: tool calls
-//! must still go through `tools::parse_call`, `classify` and approval.
+//! redactor or a strict validator: text and tool results are [`Redacted`];
+//! tool-call arguments echoed back into history are [`RedactedJson`], which
+//! only [`Block::tool_use`] can build (it runs [`redact_json`]); tool-use ids
+//! and names are [`ToolId`]s, which only [`ToolId::new`] can build (it allows
+//! `[A-Za-z0-9_-]{1,64}` and nothing else); tool specs come only from
+//! `tools::tool_specs`. Everything a planner returns ([`PlanResponse`]) is
+//! UNTRUSTED model output: tool calls must still go through
+//! `tools::parse_call`, `classify` and approval.
+//!
+//! Pairing every `tool_use` with exactly one `tool_result` in the next user
+//! turn is the engine's job; providers only merge and order what they get.
 //!
 //! A raw `serde_json::Value` cannot be placed in a tool-use block:
 //!
 //! ```compile_fail
-//! use warden_agent::planner::Block;
+//! use warden_agent::planner::{Block, ToolId};
+//! let id = ToolId::new("t1").unwrap();
 //! let _ = Block::ToolUse {
-//!     id: "t1".into(),
-//!     name: "write_file".into(),
+//!     id: id.clone(),
+//!     name: id,
 //!     args: serde_json::json!({"password": "hunter2"}),
 //! };
 //! ```
@@ -24,13 +31,49 @@
 //! let _ = warden_agent::planner::RedactedJson(serde_json::json!({}));
 //! ```
 //!
-//! The constructor is the way in:
+//! A raw `String` cannot be a tool-use id or name:
+//!
+//! ```compile_fail
+//! use warden_agent::planner::{Block, ToolId};
+//! let id = ToolId::new("t1").unwrap();
+//! let Block::ToolUse { name, args, .. } = Block::tool_use(&id, &id, &serde_json::json!({}))
+//! else { unreachable!() };
+//! let _ = Block::ToolUse { id: String::from("AKIAIOSFODNN7EXAMPLE"), name, args };
+//! ```
+//!
+//! nor a tool-result id:
+//!
+//! ```compile_fail
+//! use warden_agent::planner::Block;
+//! let _ = Block::ToolResult {
+//!     id: String::from("AKIAIOSFODNN7EXAMPLE"),
+//!     content: warden_agent::redact::redact("x").0,
+//!     is_error: false,
+//! };
+//! ```
+//!
+//! and a `ToolId` cannot be wrapped by hand:
+//!
+//! ```compile_fail
+//! let _ = warden_agent::planner::ToolId(String::from("a b"));
+//! ```
+//!
+//! The constructors are the way in (same shapes as above, so the failures
+//! are about the types, not the surrounding code):
 //!
 //! ```
-//! use warden_agent::planner::Block;
-//! let b = Block::tool_use("t1", "write_file", &serde_json::json!({"password": "hunter2"}));
-//! let Block::ToolUse { args, .. } = b else { unreachable!() };
+//! use warden_agent::planner::{Block, ToolId};
+//! let id = ToolId::new("t1").unwrap();
+//! let b = Block::tool_use(&id, &id, &serde_json::json!({"password": "hunter2"}));
+//! let Block::ToolUse { name, args, .. } = b else { unreachable!() };
 //! assert_ne!(args.as_value()["password"], "hunter2");
+//! let _ = Block::ToolUse { id: id.clone(), name, args };
+//! let _ = Block::ToolResult {
+//!     id,
+//!     content: warden_agent::redact::redact("x").0,
+//!     is_error: false,
+//! };
+//! assert!(ToolId::new("a b").is_err());
 //! ```
 
 use crate::redact::{redact_json, Redacted};
@@ -66,6 +109,34 @@ impl RedactedJson {
     }
 }
 
+/// Is `s` 1-64 chars of `[A-Za-z0-9_-]`?
+pub(crate) fn clean_ident(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// A tool-use id or tool name: 1-64 chars of `[A-Za-z0-9_-]`. Validated,
+/// not redacted: only [`ToolId::new`] builds one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ToolId(String);
+
+impl ToolId {
+    /// `Malformed("bad tool id")` unless `s` matches `^[A-Za-z0-9_-]{1,64}$`.
+    pub fn new(s: &str) -> Result<ToolId, PlannerError> {
+        if clean_ident(s) {
+            Ok(ToolId(s.to_string()))
+        } else {
+            Err(PlannerError::Malformed("bad tool id".into()))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// One piece of a turn.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Block {
@@ -73,12 +144,12 @@ pub enum Block {
     /// A tool call the assistant made, echoed back into history. `args`
     /// has been through `redact_json`; build it with [`Block::tool_use`].
     ToolUse {
-        id: String,
-        name: String,
+        id: ToolId,
+        name: ToolId,
         args: RedactedJson,
     },
     ToolResult {
-        id: String,
+        id: ToolId,
         content: Redacted,
         is_error: bool,
     },
@@ -86,11 +157,20 @@ pub enum Block {
 
 impl Block {
     /// A tool-use block whose arguments are redacted with `redact_json`.
-    pub fn tool_use(id: impl Into<String>, name: impl Into<String>, args: &Value) -> Block {
+    pub fn tool_use(id: &ToolId, name: &ToolId, args: &Value) -> Block {
         Block::ToolUse {
-            id: id.into(),
-            name: name.into(),
+            id: id.clone(),
+            name: name.clone(),
             args: RedactedJson::redact(args),
+        }
+    }
+
+    /// A tool-result block for the call `id`.
+    pub fn tool_result(id: &ToolId, content: Redacted, is_error: bool) -> Block {
+        Block::ToolResult {
+            id: id.clone(),
+            content,
+            is_error,
         }
     }
 }
@@ -125,6 +205,8 @@ pub enum PlannerError {
     Status(u16),
     Malformed(String),
     TooLarge,
+    /// The planner could not be built (bad key, model or base URL).
+    Config(&'static str),
 }
 
 impl fmt::Display for PlannerError {
@@ -134,6 +216,7 @@ impl fmt::Display for PlannerError {
             PlannerError::Status(c) => write!(f, "planner returned HTTP status {c}"),
             PlannerError::Malformed(m) => write!(f, "malformed planner response: {m}"),
             PlannerError::TooLarge => write!(f, "planner response too large"),
+            PlannerError::Config(m) => write!(f, "invalid planner configuration: {m}"),
         }
     }
 }
@@ -169,6 +252,13 @@ impl MockPlanner {
     }
 
     /// Every request seen so far, serialized with `serde_json` at call time.
+    ///
+    /// This is the internal serialized form of [`PlanRequest`] (serde's
+    /// default enum tagging, e.g. `{"Text": "..."}`, and `ToolSpec` fields),
+    /// NOT the Anthropic wire body: merging of same-role turns, block
+    /// ordering and the `messages`/`input_schema` layout happen only in
+    /// `AnthropicPlanner`. Assert on what is present or redacted here, not on
+    /// the provider's format.
     pub fn requests(&self) -> Vec<String> {
         self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }

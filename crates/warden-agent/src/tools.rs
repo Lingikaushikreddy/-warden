@@ -27,12 +27,42 @@ pub struct ToolCall {
     pub args: Value,
 }
 
-/// A tool the model may be offered.
+/// A tool the model may be offered. Built only by [`tool_specs`], so
+/// nothing outside this module can put arbitrary text into a planner
+/// request through a spec:
+///
+/// ```compile_fail
+/// let _ = warden_agent::tools::ToolSpec {
+///     name: "x",
+///     description: "AKIAIOSFODNN7EXAMPLE",
+///     schema: serde_json::json!({}),
+/// };
+/// ```
+///
+/// ```compile_fail
+/// let mut s = warden_agent::tools::tool_specs().remove(0);
+/// s.schema = serde_json::json!({"secret": "x"});
+/// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolSpec {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub schema: Value,
+    name: &'static str,
+    description: &'static str,
+    schema: Value,
+}
+
+impl ToolSpec {
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub fn description(&self) -> &'static str {
+        self.description
+    }
+
+    /// JSON schema of the arguments (an object schema).
+    pub fn schema(&self) -> &Value {
+        &self.schema
+    }
 }
 
 /// A validated tool invocation with an absolute, lexically normalized path.
