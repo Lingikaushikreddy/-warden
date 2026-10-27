@@ -79,7 +79,7 @@ you pass `--home`; the file must not be writable by group or others):
 root = "/Users/you/warden-folder"
 
 # Optional, with their defaults:
-# owner = "local"                  # the stdio channel's sender id
+# owner = "local"                  # must be "local" with the stdio channel
 # provider = "anthropic"
 # model = "claude-sonnet-5-5"
 # base_url = "https://api.anthropic.com"
@@ -104,12 +104,28 @@ Reply "yes 4821" or "no":
 
 Press Ctrl-D (end of input) to stop; the agent exits 0.
 
-Startup fails closed with exit code 1 and a one-line message if the config
-is missing or invalid, the key variable is unset, the audit log is broken
-or locked, or `root` is `/`, missing, or your home directory itself (the
-last is allowed only with the deliberately unadvertised
-`--allow-home-root` flag, because it exposes every dotfile to `Auto`
-reads).
+Startup fails closed with exit code 1 and a short message on stderr
+(usually one line, sometimes two) if:
+
+- the data dir is a symlink, not yours, or writable by group or others;
+- the config is missing or invalid, or `owner` is anything but `local`
+  (the stdio channel has only one sender, `local`; other values are kept
+  in the schema for future channels);
+- `root` is `/`, missing, not a directory, or your home directory or any
+  folder that contains it (such as `/Users`), because that would expose
+  `~/.ssh` and every dotfile to `Auto` reads. The deliberately unadvertised
+  `--allow-home-root` flag overrides this, and is also required when
+  `HOME` is not set, since the check cannot be made then;
+- the API key variable is unset or empty;
+- the audit log is broken or locked.
+
+Config, root and key problems are caught before the audit log, approver
+key or snapshot store are created, so they leave nothing behind but the
+data dir.
+
+**One process at a time.** While `warden agent` runs it holds the audit
+log's lock, so `warden run`, `warden undo` and the other writing commands
+in another terminal fail with a lock error. Stop the agent (Ctrl-D) first.
 
 ## Honest limits
 
@@ -141,8 +157,25 @@ which has the details.
 - **Stdio trust.** Whoever controls stdin is the owner, and input already
   in transit when a prompt appears can still answer it if it carries that
   prompt's code.
+- **The API key stays in the process environment** for the life of the
+  agent (Warden zeroizes its own copy, but cannot safely remove the
+  variable), so anything that can read the process's environment can read
+  it.
 - The standalone CLI (`run`, `undo`) uses `--yes` and PIN flags, not signed
   approvals.
+
+## Verifying a release build
+
+```sh
+scripts/check-release-strings.sh
+```
+
+It builds `cargo build --release -p warden-cli --locked` and fails if the
+binary contains any test-only string (`mock`, `from_script`,
+`WARDEN_TEST_FAIL`, `test-hooks`), or if a config with `provider = "mock"`
+is not rejected. Test-only code (the scripted planner, audit fault
+injection) is compiled only with the `test-hooks` Cargo feature, which
+`cargo test` enables and release builds must not.
 
 ## Not built
 

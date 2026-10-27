@@ -464,17 +464,30 @@ agent engine on stdin/stdout. The pieces, each with its own section here:
   environment variable named by `api_key_env`. Errors never quote values.
   `provider = "mock"` (a scripted planner) exists only in builds with the
   `test-hooks` feature; a default or release build has no reference to it.
-- **Startup fails closed** (exit 1, nothing runs): data dir not creatable
-  or group/other-writable; config missing or invalid; `root` missing, not
-  a directory, `/`, or `$HOME` itself (unless the hidden
-  `--allow-home-root`); audit log broken or locked; approver store,
-  snapshot store or executor unavailable; key variable unset or empty;
-  planner config invalid; `Engine::try_new` refusing an unprotected state
-  dir. The CLI always protects the data dir and `<home>/snapshots`, so a
-  root that contains the data dir starts, and every tool call into it is
-  refused `Protected`. Sessions are audited (`agent session started` /
-  `agent session ended`, action id `session`, tier `Auto`; the end entry
-  is best effort).
+- **Startup fails closed** (exit 1, nothing runs), in this order: data
+  dir not creatable, a symlink, not owned by the current user (learned from
+  the owner of a freshly created probe file, no `geteuid`), or
+  group/other-writable; config missing or invalid (the config is opened
+  `O_NONBLOCK` and checked through the handle, so a FIFO is refused, not
+  waited on); `owner` other than `local` (the stdio channel's only
+  sender); `root` missing, not a directory, `/`, or `$HOME` or an ANCESTOR
+  of it (unless the hidden `--allow-home-root`; an unset or unresolvable
+  `HOME` also needs the flag); key variable unset or empty (named only
+  when it is the default or a conventional `UPPER_SNAKE` name of at most
+  40 characters); planner config invalid. Only then are the audit log
+  (broken or locked: refused), the approver store, the snapshot store and
+  the executor opened, so the earlier failures leave no files but the data
+  dir. Last, `Engine::try_new` refuses an unprotected state dir. The CLI
+  always protects the data dir and `<home>/snapshots` (inside the data
+  dir, so protecting it separately is defense in depth), so a root that
+  contains the data dir starts, and every tool call into it is refused
+  `Protected`. Sessions are audited (`agent session started` / `agent
+  session ended`, action id `session`, tier `Auto`; the end entry is best
+  effort). While the agent runs it holds the audit log lock, so other
+  writing `warden` commands fail until it exits. The API key stays in the
+  process environment (the planner zeroizes its own copy).
+- **Owner values are never echoed raw**: `owner` must be
+  `[A-Za-z0-9._@:-]{1,64}` and unchanged by the redactor.
 - **Planner trust model**: see "Planner boundary" (what is sent, transport,
   the API key) and "Engine" (the planner is untrusted; tiers come from
   `classify`).

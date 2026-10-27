@@ -30,6 +30,8 @@ warden-agent = { path = "../warden-agent" }
 # Runtime for `warden agent` only (built inside that subcommand).
 tokio = { version = "1", features = ["rt-multi-thread", "io-std", "io-util"] }
 clap = { version = "4", features = ["derive"] }
+# Constants only (O_NOFOLLOW); no unsafe calls.
+libc = "0.2"
 rand = "0.8"
 hex = "0.4"
 

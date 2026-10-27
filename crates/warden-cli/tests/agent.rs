@@ -7,12 +7,17 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use serde_json::{json, Value};
 
 const KEY_VAR: &str = "ANTHROPIC_API_KEY";
 const FAKE_KEY: &str = "sk-ant-testkey-Zx9QwErTyUiOp1234567890AbCdEf";
+/// Every agent run in these tests must finish within this, or the test
+/// fails instead of hanging.
+const RUN_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Env {
     _tmp: tempfile::TempDir,
@@ -62,6 +67,7 @@ impl Env {
             .env_remove("WARDEN_PIN")
             .env_remove("WARDEN_TEST_FAIL_AUDIT_APPEND")
             .current_dir(&self.root)
+            .timeout(RUN_TIMEOUT)
             .arg("--home")
             .arg(&self.home)
             .arg("agent");
@@ -137,6 +143,8 @@ fn agent_runs_a_scripted_conversation_on_stdio() {
 
 /// Spawn the agent with piped stdio, send `first`, wait for the approval
 /// prompt, answer with `answer(code)`, close stdin and collect the output.
+/// Output is read on a thread with [`RUN_TIMEOUT`]: if the agent never
+/// prompts or never exits, the child is killed and the test fails.
 fn answer_prompt(e: &Env, first: &str, answer: impl Fn(&str) -> String) -> (i32, String) {
     let re = regex::Regex::new(r#"Reply "yes (\d{4})"#).unwrap();
     let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("warden"))
@@ -154,23 +162,65 @@ fn answer_prompt(e: &Env, first: &str, answer: impl Fn(&str) -> String) -> (i32,
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(first.as_bytes()).unwrap();
     stdin.flush().unwrap();
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let (tx, rx) = mpsc::channel::<String>();
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(n) if n > 0 => {
+                    if tx.send(line).is_err() {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+    });
+    let deadline = Instant::now() + RUN_TIMEOUT;
     let mut seen = String::new();
+    let fail = |child: &mut std::process::Child, seen: &str, why: &str| -> ! {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("{why}: {seen}");
+    };
     let code = loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).unwrap();
-        assert!(n > 0, "agent exited before prompting: {seen}");
-        seen.push_str(&line);
-        if let Some(c) = re.captures(&line) {
-            break c[1].to_string();
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(line) => {
+                seen.push_str(&line);
+                if let Some(c) = re.captures(&line) {
+                    break c[1].to_string();
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => fail(&mut child, &seen, "agent never prompted"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                fail(&mut child, &seen, "agent exited before prompting")
+            }
         }
     };
     stdin.write_all(answer(&code).as_bytes()).unwrap();
     drop(stdin);
-    let mut rest = String::new();
-    std::io::Read::read_to_string(&mut reader, &mut rest).unwrap();
-    seen.push_str(&rest);
-    let status = child.wait().unwrap();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(line) => seen.push_str(&line),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                fail(&mut child, &seen, "agent did not exit after stdin closed")
+            }
+        }
+    }
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if Instant::now() >= deadline {
+            fail(&mut child, &seen, "agent did not exit");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     (status.code().unwrap_or(-1), seen)
 }
 
@@ -505,4 +555,172 @@ fn agent_config_flag_overrides_the_default_path() {
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(0), "{}", out(&o).1);
+}
+
+// ------------------------------------------------- review round 1
+
+/// `<base>/a/b/user` as a fake $HOME (created).
+fn fake_home(e: &Env) -> PathBuf {
+    let h = e.base.join("a").join("b").join("user");
+    fs::create_dir_all(&h).unwrap();
+    h
+}
+
+fn run_with_home(e: &Env, home_env: Option<&Path>, root: &Path, flag: bool) -> (i32, String) {
+    e.mock(root, json!([]));
+    let mut c = e.cmd();
+    match home_env {
+        Some(h) => c.env("HOME", h),
+        None => c.env_remove("HOME"),
+    };
+    if flag {
+        c.arg("--allow-home-root");
+    }
+    let o = c.write_stdin("").output().unwrap();
+    (o.status.code().unwrap_or(-1), out(&o).1)
+}
+
+#[test]
+fn agent_refuses_home_and_its_ancestors_as_root() {
+    let e = Env::new();
+    let h = fake_home(&e);
+    let parent = h.parent().unwrap().to_path_buf();
+    let grandparent = parent.parent().unwrap().to_path_buf();
+    for root in [&h, &parent, &grandparent] {
+        let before = e.decisions().len();
+        let (code, se) = run_with_home(&e, Some(&h), root, false);
+        assert_eq!(code, 1, "{}: {se}", root.display());
+        assert!(se.contains("--allow-home-root"), "{se}");
+        assert_eq!(e.decisions().len(), before, "nothing logged when refused");
+        let (code, se) = run_with_home(&e, Some(&h), root, true);
+        assert_eq!(code, 0, "{}: {se}", root.display());
+    }
+    // A sibling of the home is fine.
+    let sibling = parent.join("other");
+    fs::create_dir(&sibling).unwrap();
+    let (code, se) = run_with_home(&e, Some(&h), &sibling, false);
+    assert_eq!(code, 0, "{se}");
+}
+
+#[test]
+fn agent_catches_home_spelled_through_a_symlink() {
+    let e = Env::new();
+    let h = fake_home(&e);
+    let link = e.base.join("homelink");
+    std::os::unix::fs::symlink(&h, &link).unwrap();
+    let (code, se) = run_with_home(&e, Some(&link), h.parent().unwrap(), false);
+    assert_eq!(code, 1, "{se}");
+    assert!(se.contains("--allow-home-root"), "{se}");
+}
+
+#[test]
+fn agent_refuses_to_start_without_home_env() {
+    let e = Env::new();
+    let (code, se) = run_with_home(&e, None, &e.root.clone(), false);
+    assert_eq!(code, 1, "{se}");
+    assert!(
+        se.contains("HOME is not set; pass --allow-home-root to continue"),
+        "{se}"
+    );
+    let (code, se) = run_with_home(&e, None, &e.root.clone(), true);
+    assert_eq!(code, 0, "{se}");
+}
+
+#[test]
+fn agent_refuses_a_group_writable_data_dir() {
+    let e = Env::new();
+    e.mock(&e.root, json!([]));
+    fs::set_permissions(&e.home, fs::Permissions::from_mode(0o775)).unwrap();
+    let o = e.cmd().write_stdin("").output().unwrap();
+    let (so, se) = out(&o);
+    assert_eq!(o.status.code(), Some(1), "{so}\n{se}");
+    assert!(se.contains("writable by group or others"), "{se}");
+    assert!(!e.home.join("audit.jsonl").exists());
+}
+
+#[test]
+fn agent_refuses_a_symlinked_data_dir() {
+    let e = Env::new();
+    e.mock(&e.root, json!([]));
+    let link = e.base.join("homelink");
+    std::os::unix::fs::symlink(&e.home, &link).unwrap();
+    let o = Command::cargo_bin("warden")
+        .unwrap()
+        .env_remove(KEY_VAR)
+        .current_dir(&e.root)
+        .timeout(RUN_TIMEOUT)
+        .arg("--home")
+        .arg(&link)
+        .arg("agent")
+        .write_stdin("")
+        .output()
+        .unwrap();
+    let (so, se) = out(&o);
+    assert_eq!(o.status.code(), Some(1), "{so}\n{se}");
+    assert!(se.contains("symlink"), "{se}");
+    assert!(!e.home.join("audit.jsonl").exists());
+}
+
+#[test]
+fn agent_refuses_an_owner_other_than_local() {
+    let e = Env::new();
+    let s = e.base.join("script.json");
+    fs::write(&s, "[]").unwrap();
+    e.config(&format!(
+        "root = \"{}\"\nowner = \"alice\"\nprovider = \"mock\"\nscript = \"{}\"\n",
+        e.root.display(),
+        s.display()
+    ));
+    let o = e.cmd().write_stdin("hi\n").output().unwrap();
+    let (so, se) = out(&o);
+    assert_eq!(o.status.code(), Some(1), "{so}\n{se}");
+    assert!(
+        se.contains("the stdio channel only supports owner = \"local\""),
+        "{se}"
+    );
+    assert!(e.decisions().is_empty());
+}
+
+#[test]
+fn agent_missing_key_creates_nothing_but_the_home() {
+    let e = Env::new();
+    e.config(&format!("root = \"{}\"\n", e.root.display()));
+    let o = e.cmd().write_stdin("hi\n").output().unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    let mut names: Vec<String> = fs::read_dir(&e.home)
+        .unwrap()
+        .map(|d| d.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["config.toml"]);
+}
+
+#[test]
+fn agent_does_not_name_an_odd_key_variable() {
+    let e = Env::new();
+    let hex64 = "deadbeef".repeat(8);
+    let base62 = "Qx7pLm2ZrT9vBn4KcW8sYh3DfJ6gAe1Uo5RiNt0EyMq";
+    for name in [hex64.as_str(), base62] {
+        e.config(&format!(
+            "root = \"{}\"\napi_key_env = \"{name}\"\n",
+            e.root.display()
+        ));
+        let o = e.cmd().env_remove(name).write_stdin("").output().unwrap();
+        let (so, se) = out(&o);
+        assert_eq!(o.status.code(), Some(1), "{so}\n{se}");
+        assert!(!se.contains(name) && !so.contains(name), "{se}");
+    }
+    // A conventional name is named.
+    e.config(&format!(
+        "root = \"{}\"\napi_key_env = \"MY_TEAM_KEY\"\n",
+        e.root.display()
+    ));
+    let o = e
+        .cmd()
+        .env_remove("MY_TEAM_KEY")
+        .write_stdin("")
+        .output()
+        .unwrap();
+    let se = out(&o).1;
+    assert!(se.contains("MY_TEAM_KEY"), "{se}");
 }

@@ -21,13 +21,18 @@
 //! - **`root` is required** and must be absolute; there is no default, so
 //!   the agent never falls back to `$HOME` or `/`.
 //! - Unknown fields and nested tables are refused.
-//! - The file must be a regular file (symlinks are followed) that is not
-//!   writable by group or others, and at most 64 KiB.
+//! - The file must be a regular file (symlinks are followed; it is opened
+//!   with `O_NONBLOCK` and checked through the handle, so a FIFO is refused
+//!   instead of hanging) that is not writable by group or others, and at
+//!   most 64 KiB.
+//! - `owner` must be `[A-Za-z0-9._@:-]{1,64}` and must not look like a
+//!   secret to the redactor.
 
 use std::fmt;
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{self, Read};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -229,11 +234,27 @@ fn valid_env_name(s: &str) -> bool {
         && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
 }
 
+/// `[A-Za-z0-9._@:-]{1,64}` and left unchanged by the redactor, so it is
+/// safe to show (banner, logs) and cannot be a pasted secret.
+fn valid_owner(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._@:-".contains(&b))
+        && redact(s).0.as_str() == s
+}
+
 fn read_file(path: &Path) -> Result<String, ConfigError> {
-    let mut f = File::open(path).map_err(|e| match e.kind() {
-        io::ErrorKind::NotFound => ConfigError::NotFound(path.to_path_buf()),
-        k => ConfigError::Io(path.to_path_buf(), k),
-    })?;
+    // O_NONBLOCK: opening a FIFO (or a device) must not wait for a writer;
+    // the handle is then checked to be a regular file before any read.
+    let mut f: File = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => ConfigError::NotFound(path.to_path_buf()),
+            k => ConfigError::Io(path.to_path_buf(), k),
+        })?;
     // Checked through the open handle, so the file read is the one checked.
     let m = f
         .metadata()
@@ -302,8 +323,11 @@ impl Config {
             return Err(ConfigError::Invalid("root", "must be an absolute path"));
         }
         let owner = raw.owner.unwrap_or_else(|| DEFAULT_OWNER.to_string());
-        if owner.trim().is_empty() || owner.chars().count() > 64 {
-            return Err(ConfigError::Invalid("owner", "must be 1-64 characters"));
+        if !valid_owner(&owner) {
+            return Err(ConfigError::Invalid(
+                "owner",
+                "must be 1-64 characters from [A-Za-z0-9._@:-] and must not look like a secret",
+            ));
         }
         let model = raw.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let api_key_env = raw

@@ -1,35 +1,43 @@
 //! `warden agent`: the agent engine on stdin/stdout.
 //!
-//! Startup fails closed: every step below that fails prints one line to
-//! stderr and exits 1 before anything is executed.
+//! Startup fails closed: every step below that fails prints a message to
+//! stderr and exits 1 before anything is executed. Steps 1-4 have no side
+//! effects beyond creating the data dir, so a bad config, root or missing
+//! key leaves no audit log, approver key or snapshot store behind.
 //!
-//! 1. create the data dir (0700) and refuse it if group/other-writable;
-//! 2. load the config (`<home>/config.toml` or `--config`);
+//! 1. create the data dir (0700); refuse it if it is a symlink, not owned by
+//!    the current user, or writable by group or others;
+//! 2. load the config (`<home>/config.toml` or `--config`); refuse an owner
+//!    other than `local` (the stdio channel's only sender);
 //! 3. resolve `root`: it must exist, be a directory, not be `/`, and not be
-//!    `$HOME` itself unless `--allow-home-root`;
-//! 4. open the audit log (a broken or locked log is refused);
-//! 5. open the approver store and the snapshot store, build the executor
-//!    with the data dir and the snapshot dir protected;
-//! 6. build the planner (Anthropic: key from the environment variable named
-//!    by `api_key_env`, never from the file);
+//!    `$HOME` or an ancestor of it unless `--allow-home-root` (an unset or
+//!    unresolvable `HOME` also needs the flag);
+//! 4. build the planner (Anthropic: the key from the environment variable
+//!    named by `api_key_env`, never from the file);
+//! 5. open the audit log (a broken or locked log is refused);
+//! 6. open the approver store and the snapshot store, build the executor
+//!    with the data dir and the snapshot dir protected (the snapshot dir is
+//!    inside the data dir; protecting it too is defense in depth);
 //! 7. `Engine::try_new` (refuses unprotected state dirs inside the root);
 //! 8. audit `agent session started`, run until stdin closes, audit `agent
 //!    session ended` (best effort), exit 0.
 //!
 //! Secrets policy: the API key, the config file's contents and environment
 //! values are never printed or audited. Errors name fields, paths and
-//! variable names only.
+//! conventional variable names only.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rand::rngs::OsRng;
+use rand::RngCore;
 use warden_agent::authorize::ApproverStore;
 use warden_agent::channel::{sanitize_for_display, SenderId, StdioChannel};
-use warden_agent::config::{Config, Provider};
+use warden_agent::config::{Config, Provider, DEFAULT_API_KEY_ENV};
 use warden_agent::engine::{AuditSink, Engine, EngineConfig};
 use warden_agent::exec::Executor;
 use warden_agent::planner::Planner;
@@ -42,6 +50,8 @@ use crate::{EXIT_ERROR, EXIT_OK};
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 /// Audit action id of the session start/end entries.
 const SESSION_ID: &str = "session";
+/// The only sender the stdio channel produces.
+const STDIO_OWNER: &str = "local";
 
 macro_rules! err {
     ($($t:tt)*) => {{
@@ -96,26 +106,86 @@ pub fn cmd_agent(home: &Path, config: Option<PathBuf>, allow_home_root: bool) ->
     }
 }
 
-fn start(home: &Path, config: Option<PathBuf>, allow_home_root: bool) -> Result<u8, u8> {
-    // 1. Data dir.
+/// A conventional variable name, safe to show: the default, or
+/// `^[A-Z][A-Z0-9]*(_[A-Z0-9]+)+$` with at most 40 characters. Anything else
+/// might be a value pasted into `api_key_env` and is not shown.
+fn showable_env_name(name: &str) -> bool {
+    if name == DEFAULT_API_KEY_ENV {
+        return true;
+    }
+    let b = name.as_bytes();
+    let upper_digit = |c: &u8| c.is_ascii_uppercase() || c.is_ascii_digit();
+    name.len() <= 40
+        && b.first().is_some_and(u8::is_ascii_uppercase)
+        && name.contains('_')
+        && name
+            .split('_')
+            .all(|part| !part.is_empty() && part.bytes().all(|c| upper_digit(&c)))
+}
+
+/// Step 1: the data dir exists, is a real directory (not a symlink), is
+/// owned by the current user and is not writable by group or others.
+fn check_home(home: &Path) -> Result<(), u8> {
     if let Err(e) = ensure_home(home) {
         err!("error: cannot create data dir {}: {e}", shown(home));
         return Err(EXIT_ERROR);
     }
-    match fs::metadata(home) {
-        Ok(m) if m.is_dir() && m.mode() & 0o022 == 0 => {}
-        Ok(m) if m.is_dir() => {
+    let m = match fs::symlink_metadata(home) {
+        Ok(m) => m,
+        Err(e) => {
+            err!("error: cannot inspect data dir {}: {e}", shown(home));
+            return Err(EXIT_ERROR);
+        }
+    };
+    if m.file_type().is_symlink() {
+        err!(
+            "error: data dir {} is a symlink; pass the real directory with --home",
+            shown(home)
+        );
+        return Err(EXIT_ERROR);
+    }
+    if !m.is_dir() {
+        err!("error: data dir {} is not a directory", shown(home));
+        return Err(EXIT_ERROR);
+    }
+    if m.mode() & 0o022 != 0 {
+        err!(
+            "error: data dir {} is writable by group or others; run `chmod 700` on it",
+            shown(home)
+        );
+        return Err(EXIT_ERROR);
+    }
+    // Our effective uid, learned without libc: the owner of a file we just
+    // created. It is removed right away.
+    let probe = home.join(format!(".uid-check-{:016x}", OsRng.next_u64()));
+    let my_uid = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&probe)
+        .and_then(|f| f.metadata())
+        .map(|pm| pm.uid());
+    let _ = fs::remove_file(&probe);
+    match my_uid {
+        Ok(uid) if uid == m.uid() => Ok(()),
+        Ok(_) => {
             err!(
-                "error: data dir {} is writable by group or others; run `chmod 700` on it",
+                "error: data dir {} is not owned by the current user",
                 shown(home)
             );
-            return Err(EXIT_ERROR);
+            Err(EXIT_ERROR)
         }
-        _ => {
-            err!("error: data dir {} is not a directory", shown(home));
-            return Err(EXIT_ERROR);
+        Err(e) => {
+            err!("error: cannot write in data dir {}: {e}", shown(home));
+            Err(EXIT_ERROR)
         }
     }
+}
+
+fn start(home: &Path, config: Option<PathBuf>, allow_home_root: bool) -> Result<u8, u8> {
+    // 1. Data dir.
+    check_home(home)?;
 
     // 2. Config.
     let config_path = config.unwrap_or_else(|| home.join("config.toml"));
@@ -123,14 +193,59 @@ fn start(home: &Path, config: Option<PathBuf>, allow_home_root: bool) -> Result<
         err!("error: {}", sanitize_for_display(&e.to_string()));
         EXIT_ERROR
     })?;
+    if cfg.owner != STDIO_OWNER {
+        err!("error: the stdio channel only supports owner = \"local\"; remove `owner` from the config");
+        return Err(EXIT_ERROR);
+    }
 
     // 3. Root.
     let root = resolve_root(&cfg.root, allow_home_root)?;
 
-    // 4. Audit log (fail closed; same helper as `run`/`undo`).
-    let audit = Arc::new(Mutex::new(open_audit(home)?));
+    // 4. Planner (no files touched), then 5-8.
+    match &cfg.provider {
+        Provider::Anthropic => {
+            let key = match std::env::var(&cfg.api_key_env) {
+                Ok(k) if !k.is_empty() => k,
+                _ => {
+                    if showable_env_name(&cfg.api_key_env) {
+                        err!(
+                            "error: environment variable {} is not set or is empty; put your Anthropic API key in it",
+                            cfg.api_key_env
+                        );
+                    } else {
+                        err!("error: the configured API key environment variable is not set or is empty");
+                    }
+                    return Err(EXIT_ERROR);
+                }
+            };
+            let base = cfg
+                .base_url
+                .clone()
+                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+            let planner =
+                warden_agent::anthropic::AnthropicPlanner::new(key, cfg.model.clone(), base)
+                    .map_err(|e| {
+                        err!("error: cannot set up the planner: {e}");
+                        EXIT_ERROR
+                    })?;
+            run(planner, open_parts(home, &cfg, root)?)
+        }
+        #[cfg(feature = "test-hooks")]
+        Provider::Mock { script } => {
+            let planner =
+                warden_agent::planner::MockPlanner::from_script_file(script).map_err(|e| {
+                    err!("error: cannot load the planner script: {e}");
+                    EXIT_ERROR
+                })?;
+            run(planner, open_parts(home, &cfg, root)?)
+        }
+    }
+}
 
-    // 5. Approver store, snapshots, executor.
+/// Steps 5-6: the audit log first (a broken log stops everything), then the
+/// approver store, the snapshot store and the executor.
+fn open_parts(home: &Path, cfg: &Config, root: PathBuf) -> Result<Parts, u8> {
+    let audit = Arc::new(Mutex::new(open_audit(home)?));
     let approvals = ApproverStore::open(home, now_ms()).map_err(|e| {
         err!(
             "error: cannot open the approver store in {}: {e}",
@@ -151,61 +266,25 @@ fn start(home: &Path, config: Option<PathBuf>, allow_home_root: bool) -> Result<
             );
             EXIT_ERROR
         })?;
-
     let cwd = std::env::current_dir()
         .and_then(fs::canonicalize)
         .map_err(|e| {
             err!("error: cannot resolve the current directory: {e}");
             EXIT_ERROR
         })?;
-    let parts = Parts {
+    Ok(Parts {
         cfg: EngineConfig::new(SenderId(cfg.owner.clone()), root, cwd),
         audit,
         approvals,
         executor,
         home: home.to_path_buf(),
         snapshots,
-    };
-
-    // 6. Planner, then 7-8.
-    match &cfg.provider {
-        Provider::Anthropic => {
-            let key = match std::env::var(&cfg.api_key_env) {
-                Ok(k) if !k.is_empty() => k,
-                _ => {
-                    err!(
-                        "error: environment variable {} is not set or is empty; put your Anthropic API key in it",
-                        cfg.api_key_env
-                    );
-                    return Err(EXIT_ERROR);
-                }
-            };
-            let base = cfg
-                .base_url
-                .clone()
-                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-            let planner =
-                warden_agent::anthropic::AnthropicPlanner::new(key, cfg.model.clone(), base)
-                    .map_err(|e| {
-                        err!("error: cannot set up the planner: {e}");
-                        EXIT_ERROR
-                    })?;
-            run(planner, parts)
-        }
-        #[cfg(feature = "test-hooks")]
-        Provider::Mock { script } => {
-            let planner =
-                warden_agent::planner::MockPlanner::from_script_file(script).map_err(|e| {
-                    err!("error: cannot load the planner script: {e}");
-                    EXIT_ERROR
-                })?;
-            run(planner, parts)
-        }
-    }
+    })
 }
 
-/// Canonical root, refusing `/`, a non-directory, and `$HOME` itself
-/// unless allowed.
+/// Canonical root, refusing a non-directory, `/`, and `$HOME` or any
+/// ancestor of it unless allowed. An unset or unresolvable `HOME` cannot be
+/// checked, so it also needs the flag.
 fn resolve_root(root: &Path, allow_home_root: bool) -> Result<PathBuf, u8> {
     let canon = fs::canonicalize(root).map_err(|e| {
         err!("error: root {} cannot be resolved: {e}", shown(root));
@@ -219,10 +298,19 @@ fn resolve_root(root: &Path, allow_home_root: bool) -> Result<PathBuf, u8> {
         err!("error: refusing root `/`: set `root` to the one folder the agent may use");
         return Err(EXIT_ERROR);
     }
-    let user_home = std::env::var_os("HOME").and_then(|h| fs::canonicalize(h).ok());
-    if !allow_home_root && user_home.as_deref() == Some(canon.as_path()) {
+    if allow_home_root {
+        return Ok(canon);
+    }
+    let user_home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .and_then(|h| fs::canonicalize(h).ok());
+    let Some(user_home) = user_home else {
+        err!("error: HOME is not set; pass --allow-home-root to continue");
+        return Err(EXIT_ERROR);
+    };
+    if user_home.starts_with(&canon) {
         err!(
-            "error: refusing root {}: it is your home directory; set `root` to a narrower folder (or pass --allow-home-root)",
+            "error: refusing root {}: it is your home directory or contains it; set `root` to a narrower folder (or pass --allow-home-root)",
             shown(&canon)
         );
         return Err(EXIT_ERROR);

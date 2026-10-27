@@ -202,3 +202,58 @@ fn mock_provider_parses_with_test_hooks() {
     let p = write(d.path(), "root = \"/srv\"\nprovider = \"mock\"\n");
     assert!(Config::load(&p).is_err());
 }
+
+// ------------------------------------------------- review round 1
+
+#[test]
+fn a_fifo_config_is_refused_without_hanging() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("config.toml");
+    let c = std::ffi::CString::new(p.as_os_str().to_str().unwrap()).unwrap();
+    // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+    assert_eq!(rc, 0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let q = p.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(Config::load(&q).map(drop).map_err(|e| e.to_string()));
+    });
+    let r = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("Config::load hung on a FIFO");
+    let e = r.unwrap_err();
+    assert!(e.contains("not a regular file"), "{e}");
+}
+
+#[test]
+fn owner_must_be_a_plain_identifier_and_is_never_echoed() {
+    let d = tempfile::tempdir().unwrap();
+    for bad in [
+        "sk-ant-api03-SuperSecretValue0123456789",
+        "AKIAIOSFODNN7EXAMPLE",
+        "has space",
+        "evil\u{1b}[2J",
+        "x/../y",
+        "",
+    ] {
+        let p = write(
+            d.path(),
+            &format!(
+                "root = \"/srv\"\nowner = \"{}\"\n",
+                bad.replace('\u{1b}', "\\u001b")
+            ),
+        );
+        let e = Config::load(&p).unwrap_err().to_string();
+        assert!(e.contains("owner"), "{bad:?}: {e}");
+        assert!(bad.is_empty() || !e.contains(bad), "{e}");
+        assert!(!e.contains("SuperSecret") && !e.contains("AKIA"), "{e}");
+    }
+    let long = "a".repeat(65);
+    let p = write(d.path(), &format!("root = \"/srv\"\nowner = \"{long}\"\n"));
+    assert!(Config::load(&p).is_err());
+    for good in ["local", "alice@example.com", "user.name:1", "A-b_c"] {
+        let p = write(d.path(), &format!("root = \"/srv\"\nowner = \"{good}\"\n"));
+        assert_eq!(Config::load(&p).unwrap().owner, good);
+    }
+}
