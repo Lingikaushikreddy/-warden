@@ -151,6 +151,7 @@ fn reply(text: Option<&str>, calls: Vec<ToolCall>) -> Result<PlanResponse, Plann
     Ok(PlanResponse {
         text: text.map(str::to_string),
         calls,
+        truncated: false,
     })
 }
 
@@ -1057,6 +1058,7 @@ impl Planner for SlowPlanner {
         Ok(PlanResponse {
             text: Some("too late".into()),
             calls: vec![],
+            truncated: false,
         })
     }
 }
@@ -2776,4 +2778,50 @@ async fn system_prompt_names_the_root_and_relative_paths_resolve_inside_it() {
     assert!(results[1].1.contains("notes.txt"), "{}", results[1].1);
     assert_eq!(results[2].1, "outside the allowed folder");
     assert!(results[2].2);
+}
+
+#[tokio::test]
+async fn truncated_text_reply_is_marked_for_the_owner() {
+    let env = env();
+    let mut e = env.engine(
+        vec![Ok(PlanResponse {
+            text: Some("half an ans".into()),
+            calls: vec![],
+            truncated: true,
+        })],
+        Opts::default(),
+    );
+    e.handle(msg("go")).await;
+    let sent = env.seen.sent();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains("half an ans"), "{sent:?}");
+    assert!(sent[0].ends_with("\n[reply truncated]"), "{sent:?}");
+}
+
+#[tokio::test]
+async fn truncated_response_with_a_call_never_prompts_or_runs() {
+    let env = env();
+    let mut e = env.engine(
+        vec![Ok(PlanResponse {
+            text: None,
+            calls: vec![call(
+                "t1",
+                "write_file",
+                json!({"path": "a.txt", "content": "partial"}),
+            )],
+            truncated: true,
+        })],
+        Opts {
+            replies: vec![yes()],
+            ..Opts::default()
+        },
+    );
+    e.handle(msg("go")).await;
+    assert!(env.seen.prompts().is_empty());
+    assert!(!env.root.join("a.txt").exists());
+    assert_eq!(env.decisions(), vec!["failed: planner".to_string()]);
+    assert!(env
+        .seen
+        .sent()
+        .contains(&"planner unavailable (malformed)".to_string()));
 }

@@ -706,6 +706,17 @@ placeholder rather than echoed. Every `tool_use` gets exactly one
 Planner errors are shown as `planner unavailable (<kind>)` with a fixed
 word per variant, never the error text.
 
+**Output limit.** Requests ask for `max_tokens` 4096. A response with
+`stop_reason: "max_tokens"` was cut off: if it contains any `tool_use`
+block the Anthropic planner returns `Malformed("response truncated")` (and
+the engine independently refuses a `truncated` response with calls as
+`malformed`), so a possibly partial `write_file` is never offered for
+approval. A cut-off text-only reply is shown with `[reply truncated]`
+appended. Other and unknown stop reasons are ignored. Consequence:
+`write_file` content larger than the model's output budget (about 16 KB of
+text) cannot be produced in one call, and the approval prompt for any write
+shows only the path and byte count, never the content.
+
 **No memory between messages.** Each owner message starts a fresh
 conversation; nothing from an earlier message, file or tool result is
 carried into the next one.

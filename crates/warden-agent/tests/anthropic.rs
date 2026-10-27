@@ -79,7 +79,7 @@ async fn sends_key_version_and_tools() {
     assert!(ua.starts_with("warden-agent/"), "{ua}");
     let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
     assert_eq!(body["model"], MODEL);
-    assert_eq!(body["max_tokens"], 1024);
+    assert_eq!(body["max_tokens"], 4096);
     assert_eq!(body["system"], "system prompt here");
     let names: Vec<&str> = body["tools"]
         .as_array()
@@ -755,4 +755,70 @@ async fn transport_error_message_has_no_url() {
     };
     assert!(!msg.is_empty());
     assert_clean(&err, &["127.0.0.1", &port, "http://", "/v1/messages", KEY]);
+}
+
+// ---- stop_reason
+
+fn body_with(stop_reason: Value, content: Value) -> Value {
+    json!({
+        "id": "msg_1", "type": "message", "role": "assistant",
+        "content": content,
+        "stop_reason": stop_reason
+    })
+}
+
+fn tool_use_block() -> Value {
+    json!({"type": "tool_use", "id": "toolu_1", "name": "write_file",
+           "input": {"path": "a.txt", "content": "partial"}})
+}
+
+#[tokio::test]
+async fn max_tokens_with_a_tool_call_is_malformed() {
+    for content in [
+        json!([tool_use_block()]),
+        json!([{"type": "text", "text": "writing"}, tool_use_block()]),
+    ] {
+        let server = MockServer::start().await;
+        mount_ok(&server, body_with(json!("max_tokens"), content)).await;
+        let err = planner(&server.uri()).plan(&request()).await.unwrap_err();
+        assert_eq!(err, PlannerError::Malformed("response truncated".into()));
+    }
+}
+
+#[tokio::test]
+async fn max_tokens_with_text_only_is_returned_flagged() {
+    let server = MockServer::start().await;
+    mount_ok(
+        &server,
+        body_with(
+            json!("max_tokens"),
+            json!([{"type": "text", "text": "a long answer that was cut"}]),
+        ),
+    )
+    .await;
+    let out = planner(&server.uri()).plan(&request()).await.unwrap();
+    assert_eq!(out.text.as_deref(), Some("a long answer that was cut"));
+    assert!(out.calls.is_empty());
+    assert!(out.truncated);
+}
+
+#[tokio::test]
+async fn other_stop_reasons_are_unchanged_and_unknown_ones_ignored() {
+    let text = json!([{"type": "text", "text": "hi"}]);
+    let with_call = json!([{"type": "text", "text": "hi"}, tool_use_block()]);
+    for (reason, content, calls) in [
+        (json!("end_turn"), text.clone(), 0),
+        (json!("tool_use"), with_call.clone(), 1),
+        (json!("stop_sequence"), text.clone(), 0),
+        (json!("some_future_reason"), with_call.clone(), 1),
+        (json!(null), with_call.clone(), 1),
+        (json!(7), text.clone(), 0),
+    ] {
+        let server = MockServer::start().await;
+        mount_ok(&server, body_with(reason.clone(), content)).await;
+        let out = planner(&server.uri()).plan(&request()).await.unwrap();
+        assert_eq!(out.text.as_deref(), Some("hi"), "{reason}");
+        assert_eq!(out.calls.len(), calls, "{reason}");
+        assert!(!out.truncated, "{reason}");
+    }
 }

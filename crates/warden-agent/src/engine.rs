@@ -741,6 +741,11 @@ where
             };
             drop(req);
 
+            // A cut-off response must never offer a call (its arguments may
+            // be partial); providers refuse it, this is depth.
+            if resp.truncated && !resp.calls.is_empty() {
+                return self.planner_failed(&msg_id, "malformed").await;
+            }
             // Validate every id and name before acting on any call.
             let mut ids = Vec::with_capacity(resp.calls.len());
             for c in &resp.calls {
@@ -752,11 +757,15 @@ where
 
             if resp.calls.is_empty() {
                 let text = resp.text.unwrap_or_default();
-                if text.trim().is_empty() {
-                    self.channel.send("(no reply)").await;
+                let mut out = if text.trim().is_empty() {
+                    "(no reply)".to_string()
                 } else {
-                    self.channel.send(&text).await;
+                    text
+                };
+                if resp.truncated {
+                    out.push_str("\n[reply truncated]");
                 }
+                self.channel.send(&out).await;
                 return;
             }
 

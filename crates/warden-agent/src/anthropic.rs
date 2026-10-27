@@ -24,8 +24,11 @@ pub const DEFAULT_MODEL: &str = "claude-sonnet-5-5";
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 /// `anthropic-version` header value.
 pub const API_VERSION: &str = "2023-06-01";
-/// `max_tokens` sent with every request.
-pub const MAX_TOKENS: u32 = 1024;
+/// `max_tokens` sent with every request. A response cut at this limit
+/// (`stop_reason: "max_tokens"`) that contains a tool call is refused, so
+/// `write_file` content longer than the output budget (roughly 16 KB of
+/// text) cannot be produced in one call.
+pub const MAX_TOKENS: u32 = 4096;
 /// Largest response body read, in bytes.
 pub const MAX_RESPONSE_BYTES: usize = 1 << 20;
 /// Longest text kept from one response, in bytes (longer text is truncated).
@@ -306,6 +309,13 @@ fn push_truncated(text: &mut String, add: &str) {
 
 /// Parse a 2xx response body. Error messages are fixed text: the body is
 /// never quoted.
+///
+/// `stop_reason: "max_tokens"` means the output was cut at [`MAX_TOKENS`]:
+/// with any `tool_use` block the whole response is
+/// `Malformed("response truncated")` (a cut-off call could carry partial
+/// write content the owner would approve by path and size only); text only
+/// is returned with `truncated` set. Other or unknown stop reasons, and a
+/// missing one, are ignored.
 fn parse_response(body: &[u8]) -> Result<PlanResponse, PlannerError> {
     let v: Value = serde_json::from_slice(body)
         .map_err(|_| PlannerError::Malformed("response is not valid JSON".into()))?;
@@ -346,6 +356,14 @@ fn parse_response(body: &[u8]) -> Result<PlanResponse, PlannerError> {
             _ => {} // thinking, server tools, ...: ignored
         }
     }
+    let truncated = v.get("stop_reason").and_then(Value::as_str) == Some("max_tokens");
+    if truncated && !calls.is_empty() {
+        return Err(PlannerError::Malformed("response truncated".into()));
+    }
     let text = (saw_text && !text.is_empty()).then_some(text);
-    Ok(PlanResponse { text, calls })
+    Ok(PlanResponse {
+        text,
+        calls,
+        truncated,
+    })
 }

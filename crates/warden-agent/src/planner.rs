@@ -195,6 +195,11 @@ pub struct PlanRequest {
 pub struct PlanResponse {
     pub text: Option<String>,
     pub calls: Vec<ToolCall>,
+    /// The model stopped at its output limit. A provider must never return
+    /// tool calls with this set (a cut-off call could carry partial write
+    /// content); the engine refuses such a response as malformed and marks
+    /// a truncated text reply `[reply truncated]` for the owner.
+    pub truncated: bool,
 }
 
 /// Why a plan call failed. Messages never contain response bodies, request
@@ -264,7 +269,7 @@ impl MockPlanner {
     }
 
     /// Load a script: a JSON array of `{"text": "...", "calls": [{"id",
-    /// "name", "args"}]}` entries, or `{"error": "transport" | "too_large" |
+    /// "name", "args"}], "truncated": false}` entries (all fields optional), or `{"error": "transport" | "too_large" |
     /// "malformed"}` / `{"error": "status", "code": 500}`.
     #[cfg(feature = "test-hooks")]
     pub fn from_script_file(path: impl AsRef<std::path::Path>) -> std::io::Result<MockPlanner> {
@@ -281,6 +286,8 @@ impl MockPlanner {
                 text: Option<String>,
                 #[serde(default)]
                 calls: Vec<ToolCall>,
+                #[serde(default)]
+                truncated: bool,
             },
         }
         let invalid = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
@@ -290,7 +297,15 @@ impl MockPlanner {
         let mut script = Vec::with_capacity(entries.len());
         for e in entries {
             script.push(match e {
-                Entry::Reply { text, calls } => Ok(PlanResponse { text, calls }),
+                Entry::Reply {
+                    text,
+                    calls,
+                    truncated,
+                } => Ok(PlanResponse {
+                    text,
+                    calls,
+                    truncated,
+                }),
                 Entry::Error { error, code } => Err(match (error.as_str(), code) {
                     ("transport", None) => {
                         PlannerError::Transport("scripted transport error".into())

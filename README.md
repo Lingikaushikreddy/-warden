@@ -176,6 +176,11 @@ which has the details.
   it.
 - The standalone CLI (`run`, `undo`) uses `--yes` and PIN flags, not signed
   approvals.
+- **Large writes.** The model's output is capped at 4096 tokens per step,
+  so `write_file` content larger than about 16 KB cannot be produced in one
+  call (a cut-off call is refused, never offered for approval). A write
+  approval shows only the path and byte count, not the content. A cut-off
+  text reply ends with `[reply truncated]`.
 
 ## Verifying a release build
 

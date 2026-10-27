@@ -24,6 +24,7 @@ fn reply(text: &str) -> PlanResponse {
     PlanResponse {
         text: Some(text.to_string()),
         calls: vec![],
+        truncated: false,
     }
 }
 
@@ -39,6 +40,7 @@ async fn scripted_responses_in_order() {
         Ok(PlanResponse {
             text: None,
             calls: vec![call],
+            truncated: false,
         }),
         Err(PlannerError::Status(500)),
     ]);
