@@ -272,12 +272,9 @@ fn open_parts(home: &Path, cfg: &Config, root: PathBuf) -> Result<Parts, u8> {
             );
             EXIT_ERROR
         })?;
-    let cwd = std::env::current_dir()
-        .and_then(fs::canonicalize)
-        .map_err(|e| {
-            err!("error: cannot resolve the current directory: {e}");
-            EXIT_ERROR
-        })?;
+    // Relative tool paths resolve against the (canonical) root, never the
+    // process's working directory, and the system prompt names the root.
+    let cwd = root.clone();
     Ok(Parts {
         cfg: EngineConfig::new(SenderId(cfg.owner.clone()), root, cwd),
         audit,

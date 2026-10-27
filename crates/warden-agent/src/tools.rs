@@ -275,7 +275,7 @@ fn spec(
 
 /// The four tools offered to the model.
 pub fn tool_specs() -> Vec<ToolSpec> {
-    let path = json!({"type": "string", "description": "Absolute path, or relative to the working directory."});
+    let path = json!({"type": "string", "description": "Absolute path, or relative to the folder named in the system prompt."});
     vec![
         spec(
             "list_dir",

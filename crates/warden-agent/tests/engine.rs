@@ -2739,3 +2739,41 @@ async fn secret_straddling_the_largest_read_cut_never_leaks() {
     let leaks = leaked_windows(&token, &reqs.join("\n"));
     assert!(leaks.is_empty(), "leaked: {leaks:?}");
 }
+
+#[tokio::test]
+async fn system_prompt_names_the_root_and_relative_paths_resolve_inside_it() {
+    let env = env();
+    env.file("notes.txt", "inside");
+    let mut e = env.engine(
+        vec![
+            reply(
+                None,
+                vec![
+                    call("t1", "read_file", json!({"path": "notes.txt"})),
+                    call("t2", "list_dir", json!({"path": "."})),
+                    call("t3", "read_file", json!({"path": "../x"})),
+                ],
+            ),
+            reply(Some("ok"), vec![]),
+        ],
+        Opts::default(),
+    );
+    e.handle(msg("go")).await;
+    let reqs = e.planner().requests();
+    let v: Value = serde_json::from_str(&reqs[0]).unwrap();
+    let system = v["system"].as_str().unwrap();
+    let canon = fs::canonicalize(&env.root).unwrap();
+    assert!(
+        system.contains(&format!("{:?}", canon.to_string_lossy())),
+        "{system}"
+    );
+    assert!(
+        system.contains("Relative paths resolve against"),
+        "{system}"
+    );
+    let (_, results) = blocks(&reqs[1]);
+    assert_eq!(results[0].1, "[untrusted file content]\ninside");
+    assert!(results[1].1.contains("notes.txt"), "{}", results[1].1);
+    assert_eq!(results[2].1, "outside the allowed folder");
+    assert!(results[2].2);
+}

@@ -95,7 +95,9 @@ export ANTHROPIC_API_KEY=...       # never put the key in the config file
 ./target/release/warden agent      # or: warden agent --config <path>
 ```
 
-Type a request, for example `list the files and summarize notes.txt`. When
+Type a request, for example `list the files and summarize notes.txt`.
+Relative paths are taken inside `root` (wherever you started `warden
+agent`), and the model is told which folder that is. When
 the model wants to change something you see a prompt such as:
 
 ```text

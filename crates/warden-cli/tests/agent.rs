@@ -769,3 +769,46 @@ fn agent_does_not_name_a_key_variable_that_carries_data() {
     let o = e.cmd().write_stdin("").output().unwrap();
     assert!(out(&o).1.contains(KEY_VAR));
 }
+
+#[test]
+fn relative_paths_resolve_against_the_root_not_the_process_cwd() {
+    let e = Env::new();
+    fs::write(e.root.join("notes.txt"), "inside the root").unwrap();
+    // Same name next to the root, where the process cwd will be.
+    fs::write(e.base.join("notes.txt"), "outside the root").unwrap();
+    e.mock(
+        &e.root,
+        json!([
+            {"text": "looking", "calls": [
+                {"id": "t1", "name": "read_file", "args": {"path": "notes.txt"}},
+                {"id": "t2", "name": "list_dir", "args": {"path": "."}},
+                {"id": "t3", "name": "read_file", "args": {"path": "../notes.txt"}}
+            ]},
+            {"text": "done looking"}
+        ]),
+    );
+    let o = e
+        .cmd()
+        .current_dir(&e.base)
+        .write_stdin("read notes\n")
+        .output()
+        .unwrap();
+    let (so, se) = out(&o);
+    assert_eq!(o.status.code(), Some(0), "{so}\n{se}");
+    let root = e.root.display().to_string();
+    assert!(
+        so.contains(&format!("done: read \"{root}/notes.txt\"")),
+        "{so}"
+    );
+    assert!(so.contains(&format!("done: list \"{root}\"")), "{so}");
+    // `..` still leaves the root and is refused before any prompt.
+    let outside = e.base.join("notes.txt").display().to_string();
+    assert!(so.contains(&format!("refused: read \"{outside}\"")), "{so}");
+    let d = e.decisions();
+    assert!(d.contains(&"refused: outside root".to_string()), "{d:?}");
+    assert_eq!(
+        d.iter().filter(|x| x.as_str() == "executed").count(),
+        2,
+        "{d:?}"
+    );
+}

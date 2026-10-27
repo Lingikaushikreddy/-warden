@@ -622,6 +622,14 @@ planner and the executor are wired together.
   root as given and its canonical form. `try_new` stores the canonical
   `cfg.root` and `cfg.cwd`; the policy allows both the canonical root and
   the root as given, so either spelling classifies the same.
+- **Relative paths resolve against the root.** `warden agent` sets the
+  engine's `cwd` to the canonical root, never the process's working
+  directory (which used to make `notes.txt` resolve outside the root and be
+  refused when the agent was started elsewhere). `EngineConfig::new` builds
+  the system prompt with `default_system_prompt(root, cwd)`, which names
+  the folder (quoted) and what relative paths resolve against; the whole
+  prompt is redacted before it is sent. `..` is still resolved lexically
+  and anything that leaves the root is refused before any prompt.
 - **Non-owners get nothing.** A message whose sender is not
   `cfg.owner` causes no planner call and no reply. It is audited
   `ignored: non-owner` at most once per 60 s, with the sender id
