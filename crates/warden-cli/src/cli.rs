@@ -113,6 +113,21 @@ pub enum Command {
         #[arg(long, default_value_t = 30)]
         days: u64,
     },
+    /// Run the agent engine on stdin/stdout (one owner message per line).
+    ///
+    /// Reads `<home>/config.toml` (or --config): `root` is required; the API
+    /// key comes only from the environment variable named by `api_key_env`
+    /// (default ANTHROPIC_API_KEY). Any startup problem exits 1 and nothing
+    /// runs. Exits 0 when stdin closes.
+    Agent {
+        /// Config file. Default: <home>/config.toml
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        /// Allow `root` to be your home directory itself (refused by default:
+        /// it exposes every dotfile to Auto reads).
+        #[arg(long, hide = true)]
+        allow_home_root: bool,
+    },
     /// Set the PIN for YesPin actions (from the argument or WARDEN_PIN).
     InitPin {
         pin: Option<String>,

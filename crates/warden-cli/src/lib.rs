@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
-//! Library behind the `warden` binary; `main.rs` only parses and maps the
+//! Library behind the `warden` binary (`run`, `undo`, `audit verify`,
+//! `prune`, `init-pin` and `agent`); `main.rs` only parses and maps the
 //! returned code to an exit status.
 //!
 //! Exit codes: 0 ok, 1 error or broken audit log, 2 approval missing or bad
 //! (or arguments invalid by policy), 3 blocked.
 
+pub mod agent;
 pub mod cli;
 pub mod commands;
 

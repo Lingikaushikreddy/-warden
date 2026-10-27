@@ -95,6 +95,10 @@ pub fn dispatch(cli: Cli) -> u8 {
             force,
             current_pin,
         } => cmd_init_pin(&home, pin, force, current_pin),
+        Command::Agent {
+            config,
+            allow_home_root,
+        } => crate::agent::cmd_agent(&home, config, allow_home_root),
     }
 }
 
@@ -136,7 +140,7 @@ fn random_hex16() -> String {
 }
 
 /// Create the data directory `0o700` if it does not exist.
-fn ensure_home(home: &Path) -> io::Result<()> {
+pub(crate) fn ensure_home(home: &Path) -> io::Result<()> {
     if home.is_dir() {
         return Ok(());
     }
@@ -152,7 +156,7 @@ fn ensure_home(home: &Path) -> io::Result<()> {
 
 /// Open the audit log, failing closed: any error (including a broken log)
 /// is reported and the caller must stop without changing anything.
-fn open_audit(home: &Path) -> Result<AuditLog, u8> {
+pub(crate) fn open_audit(home: &Path) -> Result<AuditLog, u8> {
     if let Err(e) = ensure_home(home) {
         err!("error: cannot create data dir {}: {e}", home.display());
         return Err(EXIT_ERROR);

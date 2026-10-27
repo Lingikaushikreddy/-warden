@@ -452,6 +452,40 @@ exists at the time of the check.
   escaped, so literal `\u{1b}` text looks like an escaped ESC (noise only).
   Confusables and tab alignment are not solvable by filtering.
 
+## Agent engine (overview)
+
+`warden agent` (in `warden-cli`, `crates/warden-cli/src/agent.rs`) runs the
+agent engine on stdin/stdout. The pieces, each with its own section here:
+
+- **Config** (`warden_agent::config`): `<home>/config.toml`, `root`
+  required (no default), unknown fields refused, refused if group/other
+  writable, and refused if it contains a key-like field (`api_key`,
+  `token`, `secret`, `password`, ...): the API key comes only from the
+  environment variable named by `api_key_env`. Errors never quote values.
+  `provider = "mock"` (a scripted planner) exists only in builds with the
+  `test-hooks` feature; a default or release build has no reference to it.
+- **Startup fails closed** (exit 1, nothing runs): data dir not creatable
+  or group/other-writable; config missing or invalid; `root` missing, not
+  a directory, `/`, or `$HOME` itself (unless the hidden
+  `--allow-home-root`); audit log broken or locked; approver store,
+  snapshot store or executor unavailable; key variable unset or empty;
+  planner config invalid; `Engine::try_new` refusing an unprotected state
+  dir. The CLI always protects the data dir and `<home>/snapshots`, so a
+  root that contains the data dir starts, and every tool call into it is
+  refused `Protected`. Sessions are audited (`agent session started` /
+  `agent session ended`, action id `session`, tier `Auto`; the end entry
+  is best effort).
+- **Planner trust model**: see "Planner boundary" (what is sent, transport,
+  the API key) and "Engine" (the planner is untrusted; tiers come from
+  `classify`).
+- **Redaction limits**: pattern-based (see "Planner boundary" and
+  `redact.rs` "Known limits"); it will miss unknown secret formats, and the
+  remote planner sees whatever it misses.
+- **Consent and the PIN**: see "Channel" (per-prompt challenge code) and
+  "Engine" (PIN lockout in memory, late replies, PIN-like chat).
+- **Approvals and execution**: see "Agent approver store" and "Agent
+  executor".
+
 ## Engine
 
 `warden_agent::engine::Engine` is the gated tool loop: the only place where
