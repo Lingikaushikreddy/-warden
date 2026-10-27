@@ -402,3 +402,20 @@ exists at the time of the check.
   process holds the log. A long-running service must not hold a store lock
   across slow work, and should expect `AuditLog::open` to fail rather than
   wait.
+
+## Channel
+
+- Display sanitization is visible-escaping, not deletion: control, C1, DEL,
+  `\r`, bidi, zero-width and other format characters are shown as `\u{hex}`
+  so an injected ANSI/OSC sequence is visible and cannot hide or rewrite the
+  screen. `\n` and `\t` are kept; output is capped at 4096 characters.
+- Multi-line summaries and model notes in an approval prompt have every line
+  after the first prefixed with `  | `, so model or file-name text cannot
+  forge a `Reply "yes"...` line.
+- `Channel::ask_approval` must only return a reply that came from the owner;
+  the engine does not re-check. Any doubt must yield `No`.
+- Input lines are capped at 65,536 bytes read with a bounded buffer; an
+  over-long line is discarded up to its newline with a notice. Over-long or
+  missing approval replies are `No`.
+- `StdioChannel` is local-only: whoever controls the process's stdin is the
+  owner. It is not suitable for any network-exposed transport.
