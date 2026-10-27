@@ -434,3 +434,106 @@ exists at the time of the check.
   U+205F, U+3000), which stay legal in paths. A literal backslash is not
   escaped, so literal `\u{1b}` text looks like an escaped ESC (noise only).
   Confusables and tab alignment are not solvable by filtering.
+
+## Engine
+
+`warden_agent::engine::Engine` is the gated tool loop: the only place where
+owner consent, the policy tier, the signed approval, the audit log, the
+planner and the executor are wired together.
+
+**Trust model.**
+
+- **The planner is untrusted.** Its text, tool names, ids and arguments are
+  model output. Ids and names must be valid `ToolId`s (and unique within a
+  message), otherwise the whole response is treated as a `malformed` planner
+  error and nothing in it runs. Arguments go through `parse_call`; the
+  action and its summary are built only from validated fields; the tier is
+  computed by `classify` from capabilities in one place (`Engine::decide`).
+  `Blocked` never runs. The system prompt tells the model that tool results
+  are untrusted data, but no safety property depends on it.
+- **The owner prompt is the only consent.** `Yes` actions need the reply
+  `Yes`; `YesPin` actions need `YesPin(pin)` and a PIN that matches
+  `<home>/pin` (`warden_core::pin`, constant-time). The wrong kind of reply
+  (a PIN reply at a Yes prompt, a bare yes at a PIN prompt) is refused
+  (`refused: bad reply`), even though the channel already guarantees it. A
+  missing, unreadable or malformed PIN file fails closed (`refused: pin
+  unavailable`). The PIN is held in `Zeroizing<String>` and dropped right
+  after the check; it never appears in the audit log, tool results,
+  channel messages or error text.
+- **PIN lockout is in memory only.** Three consecutive bad PINs lock
+  PIN-tier approvals for 60 s of the injected wall clock; while locked the
+  PIN file is not even read (`refused: pin locked`); a correct PIN resets
+  the count. A restart clears the lockout, so it limits online guessing
+  through one running engine, not offline guessing of the PIN file (see
+  "CLI PIN").
+- **Non-owners get nothing.** A message whose sender is not
+  `cfg.owner` causes no planner call and no reply. It is audited
+  `ignored: non-owner` at most once per 60 s, with the sender id
+  display-sanitized and cut to 64 characters. The engine trusts the
+  channel's `SenderId`.
+
+**What is audited, and when.** Every audit append runs on a blocking
+thread.
+
+- `approved auto` (Auto) or `approved` (Yes/YesPin, after consent) is
+  appended BEFORE the token is issued and the tool runs; if that append
+  fails nothing runs and the model gets `audit unavailable`.
+- Then `executed snapshot=<id>` / `executed`, or `failed: <ExecError
+  variant>`, or `failed: authorize` (token could not be issued; nothing
+  ran). If the append AFTER a run fails, the change has happened: the owner
+  is told `warning: audit append failed after the action` with the snapshot
+  id, so it can still be undone, and the model still gets its result.
+- Refusals: `refused: invalid call` (fixed summary, nothing from the
+  arguments), `refused: blocked`, `refused: owner declined`, `refused: bad
+  reply`, `refused: approval timed out`, `refused: pin locked`, `refused:
+  bad pin`, `refused: pin unavailable`, and one aggregated `refused: too
+  many calls` entry per planner response for calls beyond
+  `max_calls_per_message`.
+- Per message: `failed: planner`, `failed: timeout`, `failed: step limit`.
+- Summaries are the validated action summaries (kind, quoted path, sizes);
+  file content and write content never enter the audit log. A failed
+  refusal append is reported to the owner (`warning: audit append failed`).
+
+**What reaches the planner.** The system prompt, the owner text and every
+tool result go through `redact`. Tool results for `read_file` and
+`list_dir` start with `[untrusted file content]`, are redacted, cut to
+`result_max_bytes` on a char boundary with `\n[truncated]`, and redacted
+again (a cut can turn an unmatched longer digit run into a matchable one).
+Error results use fixed texts (`invalid call: <kind>`, `blocked by policy`,
+`owner declined`, `bad pin`, `pin locked`, `pin unavailable`, `audit
+unavailable`, `approval unavailable`, `too many calls`, `error: <ExecError
+Display>`), never argument values. Tool-call arguments echoed into history
+go through `redact_json`; arguments over 64 KiB are replaced by a fixed
+placeholder rather than echoed. Every `tool_use` gets exactly one
+`tool_result` in the next user turn, in order, including refused calls.
+Planner errors are shown as `planner unavailable (<kind>)` with a fixed
+word per variant, never the error text.
+
+**No memory between messages.** Each owner message starts a fresh
+conversation; nothing from an earlier message, file or tool result is
+carried into the next one.
+
+**Timeouts never cancel a running tool.** `message_timeout` bounds the
+whole message: each planner call and each owner prompt runs under the time
+left, and the deadline is checked between steps and before each call. An
+owner prompt that times out is a refusal. `Executor::run` and the audit
+appends run on blocking threads and are never wrapped in a timeout: a tool
+that started finishes and its outcome is audited, after which the message
+stops with `timed out`. Limits: `max_steps` planner calls (`step limit
+reached`) and `max_calls_per_message` tool calls per message.
+
+**Residual risks.**
+
+- Redaction recall: redaction is pattern-based (see `redact.rs` "Known
+  limits"); unknown or obfuscated secret formats in files the owner lets
+  the agent read still reach the model. Auto reads inside the root need no
+  prompt.
+- Confusables: summaries are escaped for display, but visually confusable
+  paths (Cyrillic lookalikes, mixed scripts) can still mislead the owner at
+  an approval prompt.
+- The model note in a prompt is model prose (labelled unverified); a
+  persuasive note can still socially engineer the owner.
+- Freshness of approvals is only as good as the channel (see "Channel");
+  stdin input queued before a prompt can answer it.
+- `AuditLog` appends and `ApproverStore` share the engine's lifetime; the
+  engine holds both behind mutexes and processes one message at a time.
