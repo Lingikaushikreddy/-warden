@@ -178,9 +178,18 @@ enum Line {
 }
 
 /// A channel over any async reader and writer (line oriented, local only).
+///
+/// Line reading is cancel-safe: the part of a line read so far lives in the
+/// struct, not in the future, so a read cancelled by a timeout (for example
+/// an `ask_approval` the engine gave up on) loses nothing and the rest of
+/// the line is not mistaken for a new line.
 pub struct StdioChannel<R, W> {
     reader: R,
     writer: W,
+    /// Bytes of the current line read so far.
+    partial: Vec<u8>,
+    /// The current line is over the cap and is being discarded.
+    overflow: bool,
 }
 
 impl<R, W> StdioChannel<R, W>
@@ -189,17 +198,24 @@ where
     W: AsyncWrite + Unpin + Send,
 {
     pub fn new(reader: R, writer: W) -> Self {
-        Self { reader, writer }
+        Self {
+            reader,
+            writer,
+            partial: Vec::new(),
+            overflow: false,
+        }
     }
 
     /// Read one line with a bounded buffer. The cap applies to the content
     /// excluding the trailing `\r\n`/`\n`. An over-long line is consumed up
     /// to its newline without being stored.
+    ///
+    /// Cancel-safe: the only await is `fill_buf` (which consumes nothing);
+    /// bytes are moved into `self.partial` and consumed with no await in
+    /// between, so dropping this future keeps the line intact.
     async fn read_line(&mut self) -> Line {
         // One extra byte is allowed while reading so a trailing `\r` fits.
         let limit = MAX_LINE_BYTES + 1;
-        let mut line: Vec<u8> = Vec::new();
-        let mut overflow = false;
         loop {
             let (used, done) = {
                 let chunk = match self.reader.fill_buf().await {
@@ -207,6 +223,8 @@ where
                     Err(_) => &[],
                 };
                 if chunk.is_empty() {
+                    let overflow = std::mem::take(&mut self.overflow);
+                    let line = std::mem::take(&mut self.partial);
                     if overflow {
                         return Line::TooLong;
                     }
@@ -219,18 +237,20 @@ where
                     Some(p) => (&chunk[..p], p + 1, true),
                     None => (chunk, chunk.len(), false),
                 };
-                if !overflow {
-                    if line.len() + data.len() > limit {
-                        overflow = true;
-                        line = Vec::new();
+                if !self.overflow {
+                    if self.partial.len() + data.len() > limit {
+                        self.overflow = true;
+                        self.partial = Vec::new();
                     } else {
-                        line.extend_from_slice(data);
+                        self.partial.extend_from_slice(data);
                     }
                 }
                 (used, done)
             };
             self.reader.consume(used);
             if done {
+                let overflow = std::mem::take(&mut self.overflow);
+                let line = std::mem::take(&mut self.partial);
                 return if overflow {
                     Line::TooLong
                 } else {

@@ -461,16 +461,48 @@ planner and the executor are wired together.
   after the check; it never appears in the audit log, tool results,
   channel messages or error text.
 - **PIN lockout is in memory only.** Three consecutive bad PINs lock
-  PIN-tier approvals for 60 s of the injected wall clock; while locked the
-  PIN file is not even read (`refused: pin locked`); a correct PIN resets
-  the count. A restart clears the lockout, so it limits online guessing
+  PIN-tier approvals for 60 s of the injected wall clock. The lock is
+  checked BEFORE prompting: while locked, a `YesPin` action is refused
+  without a prompt (`refused: pin locked`, owner told `PIN approvals locked
+  for <n> s`) and the PIN file is not read; a correct PIN resets the
+  count. A restart clears the lockout, so it limits online guessing
   through one running engine, not offline guessing of the PIN file (see
   "CLI PIN").
+- **Consent only for runnable actions.** Before any prompt, an action
+  with a path capability outside `cfg.root` (lexical check with
+  `normalize` + `starts_with`; the executor still checks canonically) is
+  refused (`refused: outside root`, tool result `outside the allowed
+  folder`) without asking: the owner is never asked to approve something
+  that cannot run. A summary longer than 3000 characters after display
+  sanitizing is refused unprompted (`refused: prompt too long`, tool result
+  `request too long`), and the model note is cut by the engine to 500
+  characters with `…`, so the channel never has to refuse a truncated
+  prompt. A write approval shows only the quoted path and the byte count,
+  never the content to be written.
+- **Late replies and the PIN.** Each owner prompt has its own timeout
+  (`approval_timeout`, default 120 s), independent of the message deadline.
+  The hazard: a prompt times out, then the owner types `yes <PIN>`; that
+  line would arrive as the next chat message and, forwarded as chat, send
+  the PIN to the remote planner. Mitigations: (1) an owner message that is
+  approval-shaped (after trimming, case-insensitive: exactly `yes`, `no`,
+  or `yes` followed by whitespace and anything) is NEVER sent to the
+  planner, at any time; the engine drops it unlogged and replies `no
+  approval pending`; (2) `StdioChannel` line reads are cancel-safe (the
+  partial line lives in the channel, not the future), so a prompt cancelled
+  by its timeout mid-line does not split `yes 1234` into a lost `yes 12`
+  and a chat message `34`. Cost: a chat message such as `yes please do it`
+  is dropped too.
+- **Executor and audit state must be protected.** `Engine::try_new`
+  refuses (`EngineConfigError::UnprotectedHome`) when the PIN home, the
+  approver store's home or any state directory the caller passes (audit
+  log, snapshot store) lies inside `cfg.root` and is not protected by the
+  executor (`Executor::protects`, lexical and canonical).
 - **Non-owners get nothing.** A message whose sender is not
   `cfg.owner` causes no planner call and no reply. It is audited
   `ignored: non-owner` at most once per 60 s, with the sender id
-  display-sanitized and cut to 64 characters. The engine trusts the
-  channel's `SenderId`.
+  display-sanitized and cut to 64 characters. A wall clock that goes
+  backwards resets the window (it cannot suppress entries until it catches
+  up). The engine trusts the channel's `SenderId`.
 
 **What is audited, and when.** Every audit append runs on a blocking
 thread.
@@ -478,15 +510,22 @@ thread.
 - `approved auto` (Auto) or `approved` (Yes/YesPin, after consent) is
   appended BEFORE the token is issued and the tool runs; if that append
   fails nothing runs and the model gets `audit unavailable`.
+- `approved` is appended BEFORE `ApproverStore::authorize`, so a failed
+  `approved` append spends no approval nonce.
 - Then `executed snapshot=<id>` / `executed`, or `failed: <ExecError
   variant>`, or `failed: authorize` (token could not be issued; nothing
-  ran). If the append AFTER a run fails, the change has happened: the owner
+  ran), or `failed: executor` if the blocking executor task panicked. On a
+  panic the snapshot id (if one was taken before the panic) is NOT known to
+  the engine and is not shown to the owner; `warden` has no cheap
+  "newest snapshot" lookup yet, so the owner must find it in the snapshot
+  store. If the append AFTER a run fails, the change has happened: the owner
   is told `warning: audit append failed after the action` with the snapshot
   id, so it can still be undone, and the model still gets its result.
 - Refusals: `refused: invalid call` (fixed summary, nothing from the
   arguments), `refused: blocked`, `refused: owner declined`, `refused: bad
   reply`, `refused: approval timed out`, `refused: pin locked`, `refused:
-  bad pin`, `refused: pin unavailable`, and one aggregated `refused: too
+  bad pin`, `refused: pin unavailable`, `refused: outside root`,
+  `refused: prompt too long`, and one aggregated `refused: too
   many calls` entry per planner response for calls beyond
   `max_calls_per_message`.
 - Per message: `failed: planner`, `failed: timeout`, `failed: step limit`.
@@ -514,9 +553,11 @@ conversation; nothing from an earlier message, file or tool result is
 carried into the next one.
 
 **Timeouts never cancel a running tool.** `message_timeout` bounds the
-whole message: each planner call and each owner prompt runs under the time
-left, and the deadline is checked between steps and before each call. An
-owner prompt that times out is a refusal. `Executor::run` and the audit
+whole message: each planner call runs under the time left, and the
+deadline is checked between steps and before each call (a call reached
+after the deadline gets `timed out` and no prompt). Each owner prompt runs
+under `approval_timeout` instead; a prompt that times out is a refusal
+(`refused: approval timed out`). `Executor::run` and the audit
 appends run on blocking threads and are never wrapped in a timeout: a tool
 that started finishes and its outcome is audited, after which the message
 stops with `timed out`. Limits: `max_steps` planner calls (`step limit
@@ -534,6 +575,11 @@ reached`) and `max_calls_per_message` tool calls per message.
 - The model note in a prompt is model prose (labelled unverified); a
   persuasive note can still socially engineer the owner.
 - Freshness of approvals is only as good as the channel (see "Channel");
-  stdin input queued before a prompt can answer it.
+  stdin input queued before a prompt can answer it. A late reply typed
+  after a prompt timed out is dropped (above), but a reply typed early,
+  before the next prompt appears, can still answer that prompt.
+- The approval-shaped filter is lexical: a PIN typed in some other shape
+  (`ok 1234`, the PIN alone) is ordinary chat and goes to the planner after
+  redaction, which does not recognize PINs.
 - `AuditLog` appends and `ApproverStore` share the engine's lifetime; the
   engine holds both behind mutexes and processes one message at a time.

@@ -357,6 +357,23 @@ impl Executor {
         }
     }
 
+    /// Whether `path` (absolute) is equal to or inside a protected path,
+    /// compared in its lexical and its canonical form (deepest existing
+    /// ancestor resolved), with protected paths re-resolved now. Any error
+    /// answers `false`, so callers that require protection fail closed.
+    pub fn protects(&self, path: &Path) -> bool {
+        let Some(lex) = normalize(path) else {
+            return false;
+        };
+        let Ok(protected) = self.protected_now() else {
+            return false;
+        };
+        let canon = resolve_deepest(&lex).ok();
+        protected
+            .iter()
+            .any(|base| within(&lex, base) || canon.as_deref().is_some_and(|c| within(c, base)))
+    }
+
     /// Run `hook` with the target path right before the rename of every
     /// later write. It cannot create tokens or skip any check: it runs after
     /// all checks and the snapshot.

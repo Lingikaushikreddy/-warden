@@ -384,6 +384,11 @@ impl ApproverStore {
         })
     }
 
+    /// The directory holding the key, the spent-nonce log and the lock.
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
     /// Grant and redeem an approval for `action` at the tier `classify`
     /// gives it under `cfg`, record its nonce durably, then return the token.
     ///

@@ -41,7 +41,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -50,7 +50,7 @@ use rand::RngCore;
 use serde_json::{json, Value};
 use tokio::time::{timeout, Instant};
 use warden_core::pin::{check_pin, PinCheck};
-use warden_core::{classify, Action, AuditLog, PolicyConfig, Tier};
+use warden_core::{classify, normalize, Action, AuditLog, Capability, PolicyConfig, Tier};
 use zeroize::Zeroizing;
 
 use crate::authorize::{ApproverStore, Authorized};
@@ -77,6 +77,10 @@ const MAX_ECHO_ARGS_BYTES: usize = 65_536;
 const UNTRUSTED_HEADER: &str = "[untrusted file content]";
 /// File name of the PIN inside `home`, as the CLI uses it.
 const PIN_FILE: &str = "pin";
+/// A model note longer than this (in characters) is cut, with `…`.
+const MAX_NOTE_CHARS: usize = 500;
+/// A summary whose display form is longer than this is refused unprompted.
+const MAX_SUMMARY_CHARS: usize = 3000;
 
 /// Default system prompt. Safety does not depend on it.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are Warden, an assistant that helps the owner \
@@ -128,14 +132,18 @@ pub struct EngineConfig {
     pub approval_ttl_ms: u64,
     /// Cap on each tool result sent to the planner (after redaction).
     pub result_max_bytes: usize,
-    /// Deadline for the whole message (planner calls and owner prompts).
+    /// Deadline for the whole message: checked between steps and before
+    /// each call, and applied to each planner call.
     pub message_timeout: Duration,
+    /// How long each owner prompt waits for a reply, independent of the
+    /// message deadline. No reply in time is a refusal.
+    pub approval_timeout: Duration,
     pub system_prompt: String,
 }
 
 impl EngineConfig {
-    /// Defaults: 8 steps, 16 calls, 120 s approvals, 32 KiB results,
-    /// 300 s per message, [`DEFAULT_SYSTEM_PROMPT`].
+    /// Defaults: 8 steps, 16 calls, 120 s approval tokens, 32 KiB results,
+    /// 300 s per message, 120 s per owner prompt, [`DEFAULT_SYSTEM_PROMPT`].
     pub fn new(owner: SenderId, root: PathBuf, cwd: PathBuf) -> EngineConfig {
         EngineConfig {
             owner,
@@ -146,9 +154,91 @@ impl EngineConfig {
             approval_ttl_ms: 120_000,
             result_max_bytes: 32_768,
             message_timeout: Duration::from_secs(300),
+            approval_timeout: Duration::from_secs(120),
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
         }
     }
+}
+
+/// Why an [`Engine`] could not be built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineConfigError {
+    /// A state directory (PIN home, approver home, or one the caller passed:
+    /// audit log, snapshot store) lies inside the root and is not protected
+    /// by the executor, so an approved write could edit it.
+    UnprotectedHome(PathBuf),
+}
+
+impl fmt::Display for EngineConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EngineConfigError::UnprotectedHome(p) => write!(
+                f,
+                "state directory {} is inside the root and not protected by the executor",
+                p.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EngineConfigError {}
+
+/// Is `p` inside `root`, lexically or in canonical form (deepest existing
+/// ancestor resolved)?
+fn inside(p: &Path, root: &Path) -> bool {
+    let lexical =
+        matches!((normalize(p), normalize(root)), (Some(a), Some(r)) if a.starts_with(&r));
+    let canon = |x: &Path| -> Option<PathBuf> {
+        let mut cur = normalize(x)?;
+        let mut rest = Vec::new();
+        loop {
+            if let Ok(c) = std::fs::canonicalize(&cur) {
+                let mut out = c;
+                out.extend(rest.iter().rev());
+                return Some(out);
+            }
+            rest.push(cur.file_name()?.to_os_string());
+            cur = cur.parent()?.to_path_buf();
+        }
+    };
+    let canonical = matches!((canon(p), canon(root)), (Some(a), Some(r)) if a.starts_with(&r));
+    lexical || canonical
+}
+
+/// An owner message that looks like an approval reply: after trimming,
+/// `yes` or `no` (any case), or `yes` followed by whitespace and anything.
+/// Such text is never chat: it may be a late reply carrying the PIN.
+pub fn is_approval_shaped(text: &str) -> bool {
+    let t = text.trim();
+    if t.eq_ignore_ascii_case("yes") || t.eq_ignore_ascii_case("no") {
+        return true;
+    }
+    let mut parts = t.splitn(2, char::is_whitespace);
+    let first = parts.next().unwrap_or("");
+    first.eq_ignore_ascii_case("yes") && parts.next().is_some()
+}
+
+/// Cut a model note to [`MAX_NOTE_CHARS`] characters, ending with `…`.
+fn cap_note(note: &str) -> String {
+    if note.chars().count() <= MAX_NOTE_CHARS {
+        return note.to_string();
+    }
+    let mut out: String = note.chars().take(MAX_NOTE_CHARS - 1).collect();
+    out.push('…');
+    out
+}
+
+/// Every path capability of `action` lies inside `root` (lexically).
+fn paths_inside(action: &Action, root: &Path) -> bool {
+    let Some(r) = normalize(root) else {
+        return false;
+    };
+    action.capabilities.iter().all(|c| match c {
+        Capability::ReadPath(p) | Capability::WritePath(p) | Capability::DeletePath(p) => {
+            normalize(p).is_some_and(|p| p.starts_with(&r))
+        }
+        _ => true,
+    })
 }
 
 /// Whether PIN-tier approvals are currently accepted.
@@ -353,9 +443,14 @@ where
     A: AuditSink + Send + 'static,
 {
     /// `home` holds the PIN file (`<home>/pin`, as the CLI writes it). The
-    /// executor must have been built for `cfg.root`, with the approver home
-    /// and snapshot store protected or outside the root.
-    pub fn new(
+    /// executor must have been built for `cfg.root`. `state_dirs` are the
+    /// other directories holding Warden state (audit log, snapshot store).
+    ///
+    /// Fails with [`EngineConfigError::UnprotectedHome`] when `home`, the
+    /// approver store's home or any of `state_dirs` lies inside `cfg.root`
+    /// and is not protected by the executor ([`Executor::protects`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
         cfg: EngineConfig,
         planner: P,
         channel: C,
@@ -363,11 +458,19 @@ where
         approvals: ApproverStore,
         executor: Executor,
         home: PathBuf,
-    ) -> Engine<P, C, A> {
+        state_dirs: &[PathBuf],
+    ) -> Result<Engine<P, C, A>, EngineConfigError> {
+        let mut dirs = vec![home.clone(), approvals.home().to_path_buf()];
+        dirs.extend(state_dirs.iter().cloned());
+        for d in dirs {
+            if inside(&d, &cfg.root) && !executor.protects(&d) {
+                return Err(EngineConfigError::UnprotectedHome(d));
+            }
+        }
         let policy = PolicyConfig {
             allowed_roots: vec![cfg.root.clone()],
         };
-        Engine {
+        Ok(Engine {
             cfg,
             policy,
             planner,
@@ -379,7 +482,7 @@ where
             pin_guard: PinGuard::new(),
             clock: Box::new(system_clock_ms),
             last_non_owner_audit_ms: None,
-        }
+        })
     }
 
     /// Replace the wall clock (milliseconds since the Unix epoch). Used for
@@ -449,9 +552,11 @@ where
     pub async fn handle(&mut self, inbound: Inbound) {
         if inbound.sender != self.cfg.owner {
             let now = self.now();
+            // A clock that went backwards resets the window instead of
+            // suppressing entries until it catches up.
             let due = self
                 .last_non_owner_audit_ms
-                .is_none_or(|t| now >= t.saturating_add(NON_OWNER_AUDIT_EVERY_MS));
+                .is_none_or(|t| now < t || now >= t.saturating_add(NON_OWNER_AUDIT_EVERY_MS));
             if due {
                 self.last_non_owner_audit_ms = Some(now);
                 let who: String = sanitize_for_display(&inbound.sender.0)
@@ -463,6 +568,14 @@ where
                     .audit(&new_id(), &who, Tier::Auto, "ignored: non-owner")
                     .await;
             }
+            return;
+        }
+
+        if is_approval_shaped(&inbound.text) {
+            // Possibly a late approval reply (it may carry the PIN): never
+            // chat, never sent to the planner, never logged.
+            drop(inbound);
+            self.channel.send("no approval pending").await;
             return;
         }
 
@@ -533,7 +646,7 @@ where
                     Outcome::error("timed out")
                 } else {
                     calls_used += 1;
-                    self.process_call(c, resp.text.as_deref(), deadline).await
+                    self.process_call(c, resp.text.as_deref()).await
                 };
                 results.push(self.result_block(id, outcome));
             }
@@ -600,12 +713,7 @@ where
         Outcome::error(result)
     }
 
-    async fn process_call(
-        &mut self,
-        call: &ToolCall,
-        note: Option<&str>,
-        deadline: Instant,
-    ) -> Outcome {
+    async fn process_call(&mut self, call: &ToolCall, note: Option<&str>) -> Outcome {
         let tool = match parse_call(call, &self.cfg.cwd) {
             Ok(t) => t,
             Err(e) => {
@@ -635,6 +743,19 @@ where
                     )
                     .await;
             }
+            _ if !paths_inside(&action, &self.cfg.root) => {
+                // Lexical; the executor still checks canonically. Nothing
+                // outside the root can run, so never ask for consent.
+                let tier = classify(&action, &self.policy);
+                return self
+                    .refuse(
+                        &action,
+                        tier,
+                        "refused: outside root",
+                        "outside the allowed folder",
+                    )
+                    .await;
+            }
             Decision::Auto => {
                 if !self
                     .audit(&action.id, &action.summary, Tier::Auto, "approved auto")
@@ -657,15 +778,39 @@ where
             Decision::NeedsPin => Tier::YesPin,
         };
 
+        if sanitize_for_display(&action.summary).chars().count() > MAX_SUMMARY_CHARS {
+            return self
+                .refuse(
+                    &action,
+                    tier,
+                    "refused: prompt too long",
+                    "request too long",
+                )
+                .await;
+        }
+        if tier == Tier::YesPin {
+            let now = self.now();
+            if let PinState::Locked { until_ms } = self.pin_guard.state(now) {
+                let secs = until_ms.saturating_sub(now).div_ceil(1000);
+                self.audit_or_warn(&action.id, &action.summary, tier, "refused: pin locked")
+                    .await;
+                self.channel
+                    .send(&format!("PIN approvals locked for {secs} s"))
+                    .await;
+                return Outcome::error("pin locked");
+            }
+        }
         let prompt = ApprovalPrompt {
             summary: action.summary.clone(),
             tier,
-            model_note: note.map(str::to_owned),
+            model_note: note.map(cap_note),
         };
-        let reply = match remaining(deadline) {
-            None => None,
-            Some(left) => timeout(left, self.channel.ask_approval(&prompt)).await.ok(),
-        };
+        let reply = timeout(
+            self.cfg.approval_timeout,
+            self.channel.ask_approval(&prompt),
+        )
+        .await
+        .ok();
         let Some(reply) = reply else {
             return self
                 .refuse(
@@ -868,7 +1013,7 @@ mod tests {
         let snaps = SnapshotStore::open(&tmp.path().join("snaps")).unwrap();
         let exec = Executor::new(&root, vec![home.clone()], snaps).unwrap();
         let cfg = EngineConfig::new(SenderId("o".into()), root.clone(), root.clone());
-        let mut e = Engine::new(
+        let mut e = Engine::try_new(
             cfg,
             MockPlanner::scripted(vec![]),
             NullChannel,
@@ -876,7 +1021,9 @@ mod tests {
             store,
             exec,
             home,
-        );
+            &[],
+        )
+        .unwrap();
         let act = |cap: Capability| Action {
             id: "a".into(),
             summary: "s".into(),
@@ -924,6 +1071,39 @@ mod tests {
         // After expiry the count starts again from zero.
         g.record(60_006, false);
         assert_eq!(g.state(60_006), PinState::Open);
+    }
+
+    #[test]
+    fn approval_shaped_texts() {
+        for t in [
+            "yes",
+            " YES ",
+            "no",
+            "No",
+            "yes 123456",
+            "Yes\tpin",
+            "yes please do it",
+        ] {
+            assert!(is_approval_shaped(t), "{t:?}");
+        }
+        for t in [
+            "yesterday",
+            "nope",
+            "no thanks",
+            "please say yes",
+            "yes1234",
+            "",
+        ] {
+            assert!(!is_approval_shaped(t), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn note_is_capped() {
+        let n = cap_note(&"a".repeat(2000));
+        assert_eq!(n.chars().count(), MAX_NOTE_CHARS);
+        assert!(n.ends_with('…'));
+        assert_eq!(cap_note("short"), "short");
     }
 
     #[test]

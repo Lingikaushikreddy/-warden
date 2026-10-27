@@ -468,3 +468,25 @@ async fn send_flushes_and_sanitizes() {
     }
     assert_eq!(String::from_utf8(out).unwrap(), "hi \\u{1b}[31m there\n");
 }
+
+/// A reader that yields half a line, then nothing until more is written.
+/// A cancelled `ask_approval` must not lose the half already read, and the
+/// rest must not come back as a separate message.
+#[tokio::test(start_paused = true)]
+async fn cancelled_ask_approval_keeps_the_partial_line() {
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    let (mut client, server) = tokio::io::duplex(1024);
+    let mut c = StdioChannel::new(BufReader::new(server), tokio::io::sink());
+    client.write_all(b"yes 12").await.unwrap();
+    let r = tokio::time::timeout(
+        Duration::from_secs(5),
+        c.ask_approval(&prompt("delete \"/r/a\"", Tier::YesPin, None)),
+    )
+    .await;
+    assert!(r.is_err(), "the prompt was cancelled while waiting");
+    client.write_all(b"34\nnext\n").await.unwrap();
+    let m = c.recv().await.unwrap();
+    assert_eq!(m.text, "yes 1234", "the whole line, not just its tail");
+    assert_eq!(c.recv().await.unwrap().text, "next");
+}

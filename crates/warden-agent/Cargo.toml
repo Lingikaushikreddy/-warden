@@ -37,5 +37,7 @@ zeroize = "1"
 # `authorize` target runs without extra flags.
 warden-agent = { path = ".", features = ["test-hooks"] }
 hex = "0.4"
+# Paused time (`start_paused`) for deadline tests.
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 wiremock = "0.6"

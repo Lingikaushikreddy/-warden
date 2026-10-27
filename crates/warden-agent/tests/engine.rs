@@ -78,6 +78,8 @@ impl AuditSink for RecSink {
 enum Reply {
     Is(ApprovalReply),
     Hang,
+    /// Answer after a (tokio) delay.
+    After(Duration, ApprovalReply),
 }
 
 #[derive(Default, Clone)]
@@ -115,6 +117,10 @@ impl Channel for TestChannel {
         match self.replies.pop_front() {
             Some(Reply::Is(r)) => r,
             Some(Reply::Hang) => std::future::pending().await,
+            Some(Reply::After(d, r)) => {
+                tokio::time::sleep(d).await;
+                r
+            }
             None => ApprovalReply::No,
         }
     }
@@ -261,8 +267,18 @@ impl Env {
             probe: o.probe,
         };
         let clock = self.clock.clone();
-        Engine::new(cfg, planner, channel, sink, store, exec, self.home.clone())
-            .with_clock(Box::new(move || clock.load(Ordering::SeqCst)))
+        Engine::try_new(
+            cfg,
+            planner,
+            channel,
+            sink,
+            store,
+            exec,
+            self.home.clone(),
+            std::slice::from_ref(&self.snaps),
+        )
+        .unwrap()
+        .with_clock(Box::new(move || clock.load(Ordering::SeqCst)))
     }
 
     fn engine(
@@ -515,20 +531,19 @@ async fn unknown_tool_extra_args_and_dotdot_are_refused_without_panic() {
     for r in &results {
         assert!(!r.1.contains("SHOULD_NOT_ECHO") && !r.1.contains("rm_rf"));
     }
-    // The `..` path is normalized outside the root: Yes tier, put to the
-    // owner (who did not answer yes), never read.
-    let prompts = env.seen.prompts();
-    assert_eq!(prompts.len(), 1);
-    assert!(!prompts[0].summary.contains(".."));
-    assert_eq!(prompts[0].tier, Tier::Yes);
+    // The `..` path is normalized outside the root: refused without a
+    // prompt (nothing outside the root can run), never read.
+    assert!(env.seen.prompts().is_empty());
+    assert_eq!(results[2].1, "outside the allowed folder");
     let d = env.decisions();
     assert_eq!(
         d.iter().filter(|d| *d == "refused: invalid call").count(),
         4
     );
-    assert!(d.contains(&"refused: owner declined".to_string()));
+    assert!(d.contains(&"refused: outside root".to_string()));
     assert!(!d.iter().any(|d| d.starts_with("approved")));
     for e in env.entries() {
+        assert!(!e.summary.contains(".."));
         assert!(!e.summary.contains("SHOULD_NOT_ECHO") && !e.summary.contains("rm_rf"));
     }
     assert!(!env.root.join("b.txt").exists());
@@ -745,6 +760,12 @@ async fn wrong_pin_three_times_locks_for_a_minute_even_for_the_right_pin() {
     let (_, results) = blocks(&e.planner().requests()[1]);
     let texts: Vec<&str> = results.iter().map(|r| r.1.as_str()).collect();
     assert_eq!(texts, vec!["bad pin", "bad pin", "bad pin", "pin locked"]);
+    // The lock is checked before prompting: the right PIN is never asked for.
+    assert_eq!(env.seen.prompts().len(), 3);
+    assert!(env
+        .seen
+        .sent()
+        .contains(&"PIN approvals locked for 60 s".to_string()));
     let all = everything(&env, &e.planner().requests());
     for p in ["000000", "111111", "222222", PIN] {
         assert!(!all.contains(p));
@@ -787,9 +808,15 @@ async fn pin_lock_expires_with_the_injected_clock() {
     e.handle(msg("delete")).await;
     assert!(f.exists());
     assert_eq!(env.decisions().last().unwrap(), "refused: pin locked");
+    assert_eq!(env.seen.prompts().len(), 3, "no prompt while locked");
+    assert!(env
+        .seen
+        .sent()
+        .contains(&"PIN approvals locked for 1 s".to_string()));
     env.advance(1_001);
     e.handle(msg("delete")).await;
     assert!(!f.exists());
+    assert_eq!(env.seen.prompts().len(), 4);
 }
 
 #[tokio::test]
@@ -1034,24 +1061,28 @@ impl Planner for SlowPlanner {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn message_timeout_stops_a_slow_planner() {
     let env = env();
     let mut e = env.engine_with(
         SlowPlanner,
         Opts {
-            tweak: Box::new(|c| c.message_timeout = Duration::from_millis(100)),
+            tweak: Box::new(|c| c.message_timeout = Duration::from_secs(10)),
             ..Opts::default()
         },
     );
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     e.handle(msg("go")).await;
-    assert!(started.elapsed() < Duration::from_secs(5));
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_secs(10) && took < Duration::from_secs(30),
+        "{took:?}"
+    );
     assert_eq!(env.seen.sent(), vec!["timed out".to_string()]);
     assert_eq!(env.decisions(), vec!["failed: timeout"]);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn prompt_timeout_counts_as_decline() {
     let env = env();
     let f = env.file("a.txt", "old");
@@ -1069,16 +1100,24 @@ async fn prompt_timeout_counts_as_decline() {
         ],
         Opts {
             replies: vec![Reply::Hang],
-            tweak: Box::new(|c| c.message_timeout = Duration::from_millis(150)),
+            tweak: Box::new(|c| c.approval_timeout = Duration::from_secs(30)),
             ..Opts::default()
         },
     );
+    let started = tokio::time::Instant::now();
     e.handle(msg("go")).await;
+    // The prompt has its own timeout; the 300 s message deadline is not hit.
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_secs(30) && took < Duration::from_secs(60),
+        "{took:?}"
+    );
     assert_eq!(fs::read_to_string(&f).unwrap(), "old");
     let d = env.decisions();
-    assert_eq!(d, vec!["refused: approval timed out", "failed: timeout"]);
-    assert!(!d.iter().any(|d| d.starts_with("approved")));
-    assert!(env.seen.sent().contains(&"timed out".to_string()));
+    assert_eq!(d, vec!["refused: approval timed out"]);
+    let (_, results) = blocks(&e.planner().requests()[1]);
+    assert_eq!(results[0].1, "owner declined");
+    assert_eq!(env.seen.sent().last().unwrap(), "ok");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1102,7 +1141,7 @@ async fn a_running_tool_is_not_cancelled_by_the_message_deadline() {
             tweak: Box::new(|c| c.message_timeout = Duration::from_millis(200)),
             exec_hook: Box::new(|x| {
                 x.before_rename_hook_for_test(Box::new(|_| {
-                    std::thread::sleep(Duration::from_millis(500))
+                    std::thread::sleep(Duration::from_millis(1000))
                 }))
             }),
             ..Opts::default()
@@ -1139,7 +1178,13 @@ async fn planner_error_is_reported_and_audited_without_error_text() {
         );
         assert_eq!(env.decisions(), vec!["failed: planner"]);
         let all = everything(&env, &[]);
-        assert!(!all.contains("SECRET_DETAIL") && !all.contains("503"));
+        // Fixed markers only: random hex action ids may contain "503".
+        assert!(
+            !all.contains("SECRET_DETAIL")
+                && !all.contains("Status(")
+                && !all.contains("HTTP status")
+                && !all.contains("status 503")
+        );
     }
 }
 
@@ -1240,7 +1285,7 @@ async fn terminal_escapes_in_model_text_are_sanitized_in_reply() {
         Some("\u{1b}]0;pwned\u{7}hi\u{1b}[2J\u{202e}gnp.exe"),
         vec![],
     )]);
-    let mut e = Engine::new(
+    let mut e = Engine::try_new(
         EngineConfig::new(SenderId("local".into()), env.root.clone(), env.root.clone()),
         planner,
         channel,
@@ -1248,7 +1293,9 @@ async fn terminal_escapes_in_model_text_are_sanitized_in_reply() {
         store,
         exec,
         env.home.clone(),
-    );
+        &[],
+    )
+    .unwrap();
     e.run().await;
     let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
     assert!(!text.contains('\u{1b}') && !text.contains('\u{7}') && !text.contains('\u{202e}'));
@@ -1332,4 +1379,383 @@ async fn audit_entries_never_contain_file_content() {
     for s in env.seen.sent() {
         assert!(!s.contains("TOPSECRET"), "{s}");
     }
+}
+
+// ------------------------------------------------- review round 1 fixes
+
+#[tokio::test(start_paused = true)]
+async fn late_pin_after_timeout_never_reaches_planner() {
+    let env = env();
+    env.set_pin();
+    let f = env.file("a.txt", "A");
+    let mut e = env.engine(
+        vec![
+            reply(None, vec![call("t1", "delete_file", path_arg(&f))]),
+            reply(Some("not deleted"), vec![]),
+            reply(Some("must not be reached"), vec![]),
+        ],
+        Opts {
+            inbound: vec![msg("delete a.txt"), msg(&format!("  Yes {PIN} "))],
+            replies: vec![Reply::Hang],
+            tweak: Box::new(|c| c.approval_timeout = Duration::from_secs(5)),
+            ..Opts::default()
+        },
+    );
+    e.run().await;
+    assert!(f.exists());
+    let reqs = e.planner().requests();
+    assert_eq!(reqs.len(), 2, "the late reply was not sent as chat");
+    let all = everything(&env, &reqs);
+    assert!(!all.contains(PIN), "the late PIN leaked");
+    assert_eq!(env.seen.sent().last().unwrap(), "no approval pending");
+}
+
+#[tokio::test]
+async fn approval_shaped_chat_is_dropped_with_notice() {
+    let env = env();
+    let mut e = env.engine(vec![reply(Some("chat"), vec![])], Opts::default());
+    for t in ["yes", " NO ", "yes 123456", "Yes\tdo it"] {
+        e.handle(msg(t)).await;
+    }
+    assert!(e.planner().requests().is_empty());
+    assert_eq!(env.seen.sent(), vec!["no approval pending"; 4]);
+    assert!(env.entries().is_empty(), "nothing (no PIN) is audited");
+    e.handle(msg("yesterday's notes please")).await;
+    assert_eq!(e.planner().requests().len(), 1);
+}
+
+#[tokio::test]
+async fn identical_needs_yes_calls_each_get_a_prompt() {
+    let env = env();
+    env.file("a.txt", "old");
+    let w = |id: &str| call(id, "write_file", json!({"path": "a.txt", "content": "new"}));
+    let mut e = env.engine(
+        vec![
+            reply(None, vec![w("t1"), w("t2"), w("t3")]),
+            reply(Some("ok"), vec![]),
+        ],
+        Opts {
+            replies: vec![yes()],
+            ..Opts::default()
+        },
+    );
+    e.handle(msg("go")).await;
+    assert_eq!(env.seen.prompts().len(), 3, "no approval cache");
+    let d = env.decisions();
+    assert_eq!(d.iter().filter(|d| *d == "approved").count(), 1);
+    assert_eq!(d.iter().filter(|d| d.starts_with("executed")).count(), 1);
+    assert_eq!(env.snapshot_count(), 1);
+}
+
+#[tokio::test]
+async fn approved_append_failure_spends_no_nonce() {
+    for (fail_on, spent) in [(Some(1), 0), (None, 1)] {
+        let env = env();
+        env.file("a.txt", "old");
+        let e = {
+            let mut e = env.engine(
+                vec![
+                    reply(
+                        None,
+                        vec![call(
+                            "t1",
+                            "write_file",
+                            json!({"path": "a.txt", "content": "new"}),
+                        )],
+                    ),
+                    reply(Some("ok"), vec![]),
+                ],
+                Opts {
+                    replies: vec![yes()],
+                    fail_on,
+                    ..Opts::default()
+                },
+            );
+            e.handle(msg("go")).await;
+            e
+        };
+        drop(e); // releases the store lock
+        let store = ApproverStore::open(&env.home, NOW).unwrap();
+        assert_eq!(store.spent_for_test().len(), spent, "fail_on={fail_on:?}");
+    }
+}
+
+#[tokio::test]
+async fn duplicate_tool_ids_in_one_response_are_malformed() {
+    let env = env();
+    let f = env.file("a.txt", "A");
+    let mut e = env.engine(
+        vec![reply(
+            None,
+            vec![
+                call("t1", "read_file", path_arg(&f)),
+                call("t1", "read_file", path_arg(&f)),
+            ],
+        )],
+        Opts::default(),
+    );
+    e.handle(msg("go")).await;
+    assert_eq!(env.seen.sent(), vec!["planner unavailable (malformed)"]);
+    assert_eq!(env.decisions(), vec!["failed: planner"]);
+}
+
+#[tokio::test]
+async fn duplicate_tool_ids_across_steps_are_malformed() {
+    let env = env();
+    let f = env.file("a.txt", "A");
+    let mut e = env.engine(
+        vec![
+            reply(None, vec![call("t1", "read_file", path_arg(&f))]),
+            reply(None, vec![call("t1", "read_file", path_arg(&f))]),
+        ],
+        Opts::default(),
+    );
+    e.handle(msg("go")).await;
+    assert_eq!(
+        env.seen.sent().last().unwrap(),
+        "planner unavailable (malformed)"
+    );
+    assert_eq!(
+        env.decisions(),
+        vec!["approved auto", "executed", "failed: planner"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn prompt_overrunning_the_deadline_times_out_the_next_call_unprompted() {
+    let env = env();
+    env.file("a.txt", "old");
+    let w = |id: &str| call(id, "write_file", json!({"path": "a.txt", "content": "new"}));
+    let mut e = env.engine(
+        vec![
+            reply(None, vec![w("t1"), w("t2")]),
+            reply(Some("never"), vec![]),
+        ],
+        Opts {
+            replies: vec![
+                Reply::After(Duration::from_secs(20), ApprovalReply::No),
+                yes(),
+            ],
+            tweak: Box::new(|c| {
+                c.message_timeout = Duration::from_secs(10);
+                c.approval_timeout = Duration::from_secs(60);
+            }),
+            ..Opts::default()
+        },
+    );
+    e.handle(msg("go")).await;
+    assert_eq!(
+        env.seen.prompts().len(),
+        1,
+        "call 2 was not put to the owner"
+    );
+    assert_eq!(
+        env.decisions(),
+        vec!["refused: owner declined", "failed: timeout"]
+    );
+    assert_eq!(e.planner().requests().len(), 1);
+}
+
+#[tokio::test]
+async fn secret_straddling_the_result_cut_never_survives() {
+    let header = "[untrusted file content]\n".len();
+    for prefix in [4usize, 10, 16, 24, 40] {
+        let env = env();
+        let pad = "x".repeat(100);
+        let tail = "more text ".repeat(50);
+        let f = env.file("a.txt", &format!("{pad}{ANTHROPIC_KEY}\n{tail}"));
+        let max = header + pad.len() + prefix;
+        let mut e = env.engine(
+            vec![
+                reply(None, vec![call("t1", "read_file", path_arg(&f))]),
+                reply(Some("ok"), vec![]),
+            ],
+            Opts {
+                tweak: Box::new(move |c| c.result_max_bytes = max),
+                ..Opts::default()
+            },
+        );
+        e.handle(msg("go")).await;
+        let reqs = e.planner().requests();
+        let (_, results) = blocks(&reqs[1]);
+        let r = &results[0].1;
+        assert!(r.ends_with("\n[truncated]"), "{r}");
+        assert!(!r.contains("sk-ant"), "prefix {prefix}: {r}");
+        assert!(!reqs.join("").contains("sk-ant-api03"), "prefix {prefix}");
+    }
+}
+
+#[tokio::test]
+async fn long_model_note_is_capped_before_the_prompt() {
+    let env = env();
+    let note = "n".repeat(2000);
+    let mut e = env.engine(
+        vec![
+            reply(
+                Some(&note),
+                vec![call(
+                    "t1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "x"}),
+                )],
+            ),
+            reply(Some("ok"), vec![]),
+        ],
+        Opts::default(),
+    );
+    e.handle(msg("go")).await;
+    let p = env.seen.prompts();
+    let n = p[0].model_note.as_deref().unwrap();
+    assert_eq!(n.chars().count(), 500);
+    assert!(n.ends_with('…'));
+}
+
+#[tokio::test]
+async fn over_long_summary_is_refused_before_prompting() {
+    let env = env();
+    let long = vec!["d".repeat(200); 17].join("/");
+    let mut e = env.engine(
+        vec![
+            reply(
+                None,
+                vec![call(
+                    "t1",
+                    "write_file",
+                    json!({"path": long, "content": "x"}),
+                )],
+            ),
+            reply(Some("ok"), vec![]),
+        ],
+        Opts {
+            replies: vec![yes()],
+            ..Opts::default()
+        },
+    );
+    e.handle(msg("go")).await;
+    assert!(env.seen.prompts().is_empty());
+    assert_eq!(env.decisions(), vec!["refused: prompt too long"]);
+    let (_, results) = blocks(&e.planner().requests()[1]);
+    assert_eq!(results[0].1, "request too long");
+}
+
+#[tokio::test]
+async fn outside_root_write_is_refused_without_a_prompt() {
+    let env = env();
+    let outside = env.root.parent().unwrap().join("outside.txt");
+    let mut e = env.engine(
+        vec![
+            reply(
+                None,
+                vec![
+                    call(
+                        "t1",
+                        "write_file",
+                        json!({"path": outside.to_string_lossy(), "content": "x"}),
+                    ),
+                    call("t2", "read_file", json!({"path": "/etc/hosts"})),
+                ],
+            ),
+            reply(Some("ok"), vec![]),
+        ],
+        Opts {
+            replies: vec![yes(), yes()],
+            ..Opts::default()
+        },
+    );
+    e.handle(msg("go")).await;
+    assert!(env.seen.prompts().is_empty());
+    assert!(!outside.exists());
+    assert_eq!(env.decisions(), vec!["refused: outside root"; 2]);
+    let (_, results) = blocks(&e.planner().requests()[1]);
+    assert_eq!(results[0].1, "outside the allowed folder");
+    assert_eq!(results[1].1, "outside the allowed folder");
+}
+
+#[tokio::test]
+async fn non_owner_rate_limit_survives_a_clock_going_backwards() {
+    let env = env();
+    let mut e = env.engine(vec![], Opts::default());
+    let from = Inbound {
+        sender: SenderId("mallory".into()),
+        text: "x".into(),
+    };
+    e.handle(from.clone()).await;
+    env.clock.store(NOW - 10_000_000, Ordering::SeqCst);
+    e.handle(from.clone()).await;
+    assert_eq!(
+        env.entries().len(),
+        2,
+        "a backwards clock resets the window"
+    );
+    e.handle(from.clone()).await;
+    assert_eq!(env.entries().len(), 2);
+}
+
+fn try_engine(
+    env: &Env,
+    home: &Path,
+    protected: Vec<PathBuf>,
+    state_dirs: &[PathBuf],
+) -> Result<(), warden_agent::engine::EngineConfigError> {
+    fs::create_dir_all(home).unwrap();
+    let store = ApproverStore::open(home, NOW).unwrap();
+    let exec = Executor::new(
+        &env.root,
+        protected,
+        SnapshotStore::open(&env.snaps).unwrap(),
+    )
+    .unwrap();
+    let sink = RecSink {
+        entries: env.entries.clone(),
+        count: 0,
+        fail_on: None,
+        probe: None,
+    };
+    let channel = TestChannel {
+        inbound: VecDeque::new(),
+        replies: VecDeque::new(),
+        seen: env.seen.clone(),
+    };
+    Engine::try_new(
+        EngineConfig::new(owner(), env.root.clone(), env.root.clone()),
+        MockPlanner::scripted(vec![]),
+        channel,
+        sink,
+        store,
+        exec,
+        home.to_path_buf(),
+        state_dirs,
+    )
+    .map(drop)
+}
+
+#[test]
+fn try_new_refuses_an_unprotected_home_inside_the_root() {
+    use warden_agent::engine::EngineConfigError;
+    let env = env();
+    let inner = env.root.join(".warden");
+    assert_eq!(
+        try_engine(&env, &inner, vec![], &[]),
+        Err(EngineConfigError::UnprotectedHome(inner.clone()))
+    );
+    assert_eq!(try_engine(&env, &inner, vec![inner.clone()], &[]), Ok(()));
+    // A home outside the root needs no protection.
+    let outer = env.home.clone();
+    assert_eq!(try_engine(&env, &outer, vec![], &[]), Ok(()));
+    // State dirs the caller passes (audit, snapshots) are checked too.
+    let audit_dir = env.root.join("audit");
+    fs::create_dir(&audit_dir).unwrap();
+    assert_eq!(
+        try_engine(&env, &outer, vec![], std::slice::from_ref(&audit_dir)),
+        Err(EngineConfigError::UnprotectedHome(audit_dir.clone()))
+    );
+    assert_eq!(
+        try_engine(
+            &env,
+            &outer,
+            vec![audit_dir.clone()],
+            std::slice::from_ref(&audit_dir)
+        ),
+        Ok(())
+    );
 }
