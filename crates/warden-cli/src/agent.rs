@@ -15,7 +15,10 @@
 //!    unresolvable `HOME` also needs the flag);
 //! 4. build the planner (Anthropic: the key from the environment variable
 //!    named by `api_key_env`, never from the file);
-//! 5. open the audit log (a broken or locked log is refused);
+//! 5. open the audit log (a broken or locked log is refused). From here on
+//!    it is leased ([`LeasedAuditLog`]): held while a message is handled or
+//!    a session entry is written, released in between, so `warden undo` and
+//!    the other writing commands work while the agent is idle;
 //! 6. open the approver store and the snapshot store, build the executor
 //!    with the data dir, the snapshot dir and the config file protected (the
 //!    snapshot dir is inside the data dir; protecting it too is defense in
@@ -47,10 +50,11 @@ use warden_agent::channel::{sanitize_for_display, SenderId, StdioChannel};
 use warden_agent::config::{Config, Provider, DEFAULT_API_KEY_ENV};
 use warden_agent::engine::{AuditSink, Engine, EngineConfig};
 use warden_agent::exec::Executor;
+use warden_agent::lease::LeasedAuditLog;
 use warden_agent::planner::Planner;
-use warden_core::{AuditLog, SnapshotStore, Tier};
+use warden_core::{SnapshotStore, Tier};
 
-use crate::commands::{ensure_home, open_audit};
+use crate::commands::{audit_open_failed, ensure_home};
 use crate::{EXIT_ERROR, EXIT_OK};
 
 /// Default Anthropic API base URL.
@@ -78,8 +82,8 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The audit log shared by the engine and the session entries.
-struct SharedAudit(Arc<Mutex<AuditLog>>);
+/// The leased audit log shared by the engine and the session entries.
+struct SharedAudit(Arc<Mutex<LeasedAuditLog>>);
 
 impl AuditSink for SharedAudit {
     fn append(
@@ -93,14 +97,31 @@ impl AuditSink for SharedAudit {
             .0
             .lock()
             .map_err(|_| io::Error::other("audit lock poisoned"))?;
-        log.append(action_id, summary, tier, decision).map(drop)
+        log.append(action_id, summary, tier, decision)
     }
+
+    fn release(&mut self) {
+        if let Ok(mut log) = self.0.lock() {
+            log.release();
+        }
+    }
+}
+
+/// Append a session entry (action id `session`, tier `Auto`) to the leased
+/// log, then release it whether or not the append worked: outside a
+/// message the agent never holds the log.
+fn session_entry(audit: &Arc<Mutex<LeasedAuditLog>>, decision: &str) -> io::Result<()> {
+    let mut shared = SharedAudit(Arc::clone(audit));
+    let res = shared.append(SESSION_ID, "agent session", Tier::Auto, decision);
+    shared.release();
+    res
 }
 
 /// Everything the engine needs except the planner.
 struct Parts {
     cfg: EngineConfig,
-    audit: Arc<Mutex<AuditLog>>,
+    /// Open (startup check done) until the first session entry releases it.
+    audit: Arc<Mutex<LeasedAuditLog>>,
     approvals: ApproverStore,
     executor: Executor,
     home: PathBuf,
@@ -269,7 +290,15 @@ fn start(home: &Path, config: Option<PathBuf>, allow_home_root: bool) -> Result<
 /// Steps 5-6: the audit log first (a broken log stops everything), then the
 /// approver store, the snapshot store and the executor.
 fn open_parts(home: &Path, config: &Path, cfg: &Config, root: PathBuf) -> Result<Parts, u8> {
-    let audit = Arc::new(Mutex::new(open_audit(home)?));
+    // The data dir exists (step 1). warden-core creates a new log with mode
+    // 0o600. Opened now, without waiting, so a broken or locked log stops
+    // startup; it stays open until the first session entry.
+    let path = home.join("audit.jsonl");
+    let mut leased = LeasedAuditLog::new(path.clone());
+    leased
+        .open_now()
+        .map_err(|e| audit_open_failed(&path, &e))?;
+    let audit = Arc::new(Mutex::new(leased));
     let approvals = ApproverStore::open(home, now_ms()).map_err(|e| {
         err!(
             "error: cannot open the approver store in {}: {e}",
@@ -362,9 +391,7 @@ fn run<P: Planner>(planner: P, parts: Parts) -> Result<u8, u8> {
         sanitize_for_display(cfg.owners.first().map_or("", |o| o.0.as_str())),
         shown(&cfg.root)
     );
-    let session = |decision: &str| -> io::Result<()> {
-        SharedAudit(Arc::clone(&audit)).append(SESSION_ID, "agent session", Tier::Auto, decision)
-    };
+    let session = |decision: &str| session_entry(&audit, decision);
     let code = rt.block_on(async {
         let channel = StdioChannel::new(
             tokio::io::BufReader::new(tokio::io::stdin()),

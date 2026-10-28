@@ -146,8 +146,9 @@ against {rel}; anything outside the folder is refused.",
     )
 }
 
-/// Where audit entries go. Implemented for [`AuditLog`]; tests inject
-/// sinks that fail on a chosen append.
+/// Where audit entries go. Implemented for [`AuditLog`] and
+/// [`LeasedAuditLog`](crate::lease::LeasedAuditLog); tests inject sinks that
+/// fail on a chosen append.
 pub trait AuditSink {
     fn append(
         &mut self,
@@ -156,6 +157,10 @@ pub trait AuditSink {
         tier: Tier,
         decision: &str,
     ) -> io::Result<()>;
+
+    /// Let go of the underlying log until the next append. The engine calls
+    /// it when it finishes a message, on every path. Default: nothing.
+    fn release(&mut self) {}
 }
 
 impl AuditSink for AuditLog {
@@ -841,8 +846,27 @@ where
         }
     }
 
-    /// Process one inbound message.
+    /// Process one inbound message, then release the audit sink
+    /// ([`AuditSink::release`]) whatever happened, so other writers can use
+    /// the log while the engine is idle.
     pub async fn handle(&mut self, inbound: Inbound) {
+        self.handle_message(inbound).await;
+        self.release_audit().await;
+    }
+
+    /// [`AuditSink::release`] on a blocking thread, through the same mutex
+    /// as appends.
+    async fn release_audit(&self) {
+        let sink = Arc::clone(&self.audit);
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(mut g) = sink.lock() {
+                g.release();
+            }
+        })
+        .await;
+    }
+
+    async fn handle_message(&mut self, inbound: Inbound) {
         if !self.cfg.owners.contains(&inbound.sender) {
             let now = self.now();
             // A clock that went backwards resets the window instead of

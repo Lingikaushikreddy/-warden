@@ -130,9 +130,13 @@ Config, root and key problems are caught before the audit log, approver
 key or snapshot store are created, so they leave nothing behind but the
 data dir.
 
-**One process at a time.** While `warden agent` runs it holds the audit
-log's lock, so `warden run`, `warden undo` and the other writing commands
-in another terminal fail with a lock error. Stop the agent (Ctrl-D) first.
+**One process at a time.** `warden agent` holds the audit log's lock only
+while it handles a message. While it is idle (waiting for your next line),
+`warden run`, `warden undo` and the other writing commands work from
+another terminal; while it is handling a message they fail fast with a
+lock error, so try again once it has answered. The agent waits up to 2
+seconds for a command that holds the log; if the log is still busy, the
+action it was about to take is refused (`audit unavailable`).
 
 ## Honest limits
 

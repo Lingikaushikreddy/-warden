@@ -511,8 +511,23 @@ agent engine on stdin/stdout. The pieces, each with its own section here:
   contains the data dir starts, and every tool call into it is refused
   `Protected`. Sessions are audited (`agent session started` / `agent
   session ended`, action id `session`, tier `Auto`; the end entry is best
-  effort). While the agent runs it holds the audit log lock, so other
-  writing `warden` commands fail until it exits. The API key stays in the
+  effort). The audit log is leased (`warden_agent::lease::LeasedAuditLog`):
+  opened (exclusive lock, full chain verification) on the first append
+  of a message and released when `Engine::handle` returns, on every path
+  (non-owner and dropped messages included), on a blocking thread through
+  the same mutex as appends; each session entry also releases it. So
+  `warden undo` and the other writing commands work while the agent is
+  idle and fail fast with a lock error while it handles a message. An
+  agent append that finds the log locked retries every 100 ms for up to
+  2 s, then fails, and the action is refused `audit unavailable` (fail
+  closed). Each reopen re-verifies the chain from the start, so every
+  message pays a read of the whole log (linear in its size), and the chain
+  continues from the log's real head, so entries other writers appended
+  in between keep it valid. The startup open does not wait: a broken or
+  locked log is refused. A failed append drops the open log, so the next
+  one re-verifies the file before writing. If a `handle` future is
+  dropped mid-message (cancellation), the release does not run and the
+  log stays held until the next message finishes. The API key stays in the
   process environment (the planner zeroizes its own copy).
 - **The HOME-ancestor guard trusts the `HOME` environment variable**; the
   passwd home is not consulted, so a process started with a different

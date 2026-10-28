@@ -163,13 +163,17 @@ pub(crate) fn open_audit(home: &Path) -> Result<AuditLog, u8> {
     }
     let path = home.join("audit.jsonl");
     // warden-core creates a new log with mode 0o600.
-    AuditLog::open(&path).map_err(|e| {
-        err!(
-            "error: cannot open audit log {}: {e}\nrefusing to act without a working audit log; run `warden audit verify`",
-            path.display()
-        );
-        EXIT_ERROR
-    })
+    AuditLog::open(&path).map_err(|e| audit_open_failed(&path, &e))
+}
+
+/// Report a log that cannot be opened (broken or locked) and return the
+/// error code.
+pub(crate) fn audit_open_failed(path: &Path, e: &io::Error) -> u8 {
+    err!(
+        "error: cannot open audit log {}: {e}\nrefusing to act without a working audit log; run `warden audit verify`",
+        path.display()
+    );
+    EXIT_ERROR
 }
 
 /// Append an audit entry; on failure report it and return the error code.

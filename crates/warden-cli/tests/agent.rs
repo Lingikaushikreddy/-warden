@@ -866,3 +866,156 @@ fn agent_config_inside_the_root_cannot_be_rewritten() {
     assert!(!d.iter().any(|x| x.starts_with("executed")), "{d:?}");
     assert!(text.contains("all done"), "{text}");
 }
+
+/// Poll until nobody holds the audit log's lock (the agent has finished the
+/// message and released it), then let go of it again.
+fn wait_for_audit_unlocked(e: &Env, deadline: Instant) {
+    let f = fs::File::open(e.home.join("audit.jsonl")).unwrap();
+    loop {
+        match f.try_lock() {
+            Ok(()) => {
+                f.unlock().unwrap();
+                return;
+            }
+            Err(fs::TryLockError::WouldBlock) => {}
+            Err(fs::TryLockError::Error(err)) => panic!("cannot lock the audit log: {err}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the agent never released the audit log"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn undo_works_while_the_agent_is_idle() {
+    const PIN: &str = "4815162342";
+    let e = Env::new();
+    let a = e.root.join("a.txt");
+    fs::write(&a, "old").unwrap();
+    e.mock(&e.root, write_script("a.txt", "new"));
+    let warden = || {
+        let mut c = Command::cargo_bin("warden").unwrap();
+        c.env_remove(KEY_VAR)
+            .env_remove("WARDEN_PIN")
+            .env("HOME", &e.user_home)
+            .current_dir(&e.root)
+            .timeout(RUN_TIMEOUT)
+            .arg("--home")
+            .arg(&e.home);
+        c
+    };
+    warden().args(["init-pin", PIN]).assert().success();
+
+    let re = regex::Regex::new(r#"Reply "yes (\d{4})"#).unwrap();
+    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("warden"))
+        .env_remove(KEY_VAR)
+        .env_remove("WARDEN_PIN")
+        .env("HOME", &e.user_home)
+        .current_dir(&e.root)
+        .arg("--home")
+        .arg(&e.home)
+        .arg("agent")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"update a.txt\n").unwrap();
+    stdin.flush().unwrap();
+    let (tx, rx) = mpsc::channel::<String>();
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(n) if n > 0 => {
+                    if tx.send(line).is_err() {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+    });
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    let mut seen = String::new();
+    let fail = |child: &mut std::process::Child, seen: &str, why: &str| -> ! {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("{why}: {seen}");
+    };
+    // Wait for `pred` on the output so far.
+    let wait_for = |child: &mut std::process::Child,
+                    seen: &mut String,
+                    pred: &dyn Fn(&str) -> bool,
+                    why: &str| {
+        while !pred(seen) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(line) => seen.push_str(&line),
+                Err(_) => fail(child, seen, why),
+            }
+        }
+    };
+    wait_for(
+        &mut child,
+        &mut seen,
+        &|s| re.is_match(s),
+        "agent never prompted",
+    );
+    let code = re.captures(&seen).unwrap()[1].to_string();
+    stdin.write_all(format!("yes {code}\n").as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    wait_for(
+        &mut child,
+        &mut seen,
+        &|s| s.contains("all done"),
+        "the message never finished",
+    );
+    assert_eq!(fs::read_to_string(&a).unwrap(), "new", "{seen}");
+    let id = e
+        .decisions()
+        .iter()
+        .find_map(|d| d.strip_prefix("executed snapshot=").map(str::to_owned))
+        .expect("snapshot id in the audit log");
+
+    // The agent is still running (stdin open) but idle.
+    wait_for_audit_unlocked(&e, deadline);
+    assert!(child.try_wait().unwrap().is_none(), "the agent is running");
+    let o = warden()
+        .env("WARDEN_PIN", PIN)
+        .args(["undo", &id, "--root"])
+        .arg(&e.root)
+        .arg("--yes")
+        .output()
+        .unwrap();
+    let (so, se) = out(&o);
+    if o.status.code() != Some(0) {
+        fail(&mut child, &seen, &format!("undo failed: {so}\n{se}"));
+    }
+    assert_eq!(fs::read_to_string(&a).unwrap(), "old");
+
+    drop(stdin);
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if Instant::now() >= deadline {
+            fail(&mut child, &seen, "agent did not exit");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(0), "{seen}");
+    let d = e.decisions();
+    assert!(d.iter().any(|x| x.starts_with("restored files=")), "{d:?}");
+    assert_eq!(
+        d.last().map(String::as_str),
+        Some("agent session ended"),
+        "{d:?}"
+    );
+    warden().args(["audit", "verify"]).assert().success();
+}
