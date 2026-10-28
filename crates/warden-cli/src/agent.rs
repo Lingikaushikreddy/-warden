@@ -382,7 +382,7 @@ fn run<P: Planner>(planner: P, parts: Parts) -> Result<u8, u8> {
         })?;
     let banner = format!(
         "warden agent: owner={} root={}",
-        sanitize_for_display(&cfg.owner.0),
+        sanitize_for_display(cfg.owners.first().map_or("", |o| o.0.as_str())),
         shown(&cfg.root)
     );
     let session = |decision: &str| -> io::Result<()> {

@@ -430,8 +430,28 @@ exists at the time of the check.
 - Multi-line summaries and model notes in an approval prompt have every line
   after the first prefixed with `  | `, so model or file-name text cannot
   forge a `Reply "yes"...` line.
-- `Channel::ask_approval` must only return a reply that came from the owner;
-  the engine does not re-check. Any doubt must yield `No`.
+- **Recipients.** Every outbound `Channel` call names its recipient:
+  `send(to, text)`, `ask_approval(to, prompt)`,
+  `discard_pending_input(to)`, `retract_last(to)`, and `accepts_pin(to)`.
+  The engine passes the sender of the message being handled to all of
+  them. A remote channel must deliver to `to` and nobody else; a local
+  channel with one sender (`StdioChannel`, whose only sender is `local`)
+  ignores it. `recv` must be cancel-safe (a dropped `recv` future loses
+  and splits no message).
+- `Channel::ask_approval(to, ...)` must only return a reply that came from
+  `to`; the engine does not re-check. With several owners, a reply from a
+  different owner does not count either. Any doubt must yield `No`.
+- **Per-channel PIN gate.** `Channel::accepts_pin(to)` (default `true`)
+  says whether a PIN may be typed over this channel. When it is `false`
+  the engine never prompts for a `YesPin` action (see "Engine").
+- **Retraction.** `Channel::retract_last(to)` (default no-op) is a
+  best-effort removal of the most recent message received from `to`. The
+  engine calls it after dropping a message that may hold the PIN. On a
+  remote service the text has still reached that service's servers.
+- `render_prompt` (crate-private) is the approval prompt text exactly as
+  `StdioChannel` prints it, or `None` when the prompt must be refused
+  (truncated summary or note, invalid challenge), so other channels show
+  the same sanitized, `  | `-indented text with the same refusal rule.
 - Input lines are capped at 65,536 bytes read with a bounded buffer; an
   over-long line is discarded up to its newline with a notice. Over-long or
   missing approval replies are `No`.
@@ -463,10 +483,17 @@ exists at the time of the check.
   prompt (it returns the bytes dropped, and the owner is told `earlier
   unsent input was discarded`), ends the message on a prompt timeout, and
   never treats approval-shaped text as chat.
-- The PIN comes back as a plain `String` (not zeroized); the engine must
-  compare it in constant time.
-- Display also escapes blank-looking spaces (NBSP, U+2000-200A, U+202F,
-  U+205F, U+3000), which stay legal in paths. A literal backslash is not
+- The PIN comes back as `ApprovalReply::YesPin(Zeroizing<String>)`, wiped
+  when dropped, and its `Debug` is `YesPin(<redacted>)`; the engine
+  compares it in constant time.
+- Display escapes, and paths reject, these default-ignorable or reserved
+  format code points as well: U+180F, U+1BCA0-U+1BCA3 (shorthand format
+  controls), U+13430-U+1343F (Egyptian hieroglyph format controls),
+  U+E0080-U+E00FF and U+E01F0-U+E0FFF (unassigned tag-plane slots) and
+  U+FFF0-U+FFF8 (unassigned specials). Why: a renderer may draw them as
+  nothing, so two different paths could look identical in a prompt.
+- Display also escapes blank-looking spaces (NBSP, U+1680 Ogham space
+  mark, U+2000-200A, U+202F, U+205F, U+3000), which stay legal in paths. A literal backslash is not
   escaped, so literal `\u{1b}` text looks like an escaped ESC (noise only).
   Confusables and tab alignment are not solvable by filtering.
 
@@ -518,7 +545,7 @@ agent engine on stdin/stdout. The pieces, each with its own section here:
   `redact.rs` "Known limits"); it will miss unknown secret formats, and the
   remote planner sees whatever it misses.
 - **Consent and the PIN**: see "Channel" (per-prompt challenge code) and
-  "Engine" (PIN lockout in memory, late replies, PIN-like chat).
+  "Engine" (persisted PIN lockout, late replies, PIN-like chat).
 - **Approvals and execution**: see "Agent approver store" and "Agent
   executor".
 
@@ -547,14 +574,26 @@ planner and the executor are wired together.
   unavailable`). The PIN is held in `Zeroizing<String>` and dropped right
   after the check; it never appears in the audit log, tool results,
   channel messages or error text.
-- **PIN lockout is in memory only.** Three consecutive bad PINs lock
-  PIN-tier approvals for 60 s of the injected wall clock. The lock is
-  checked BEFORE prompting: while locked, a `YesPin` action is refused
-  without a prompt (`refused: pin locked`, owner told `PIN approvals locked
-  for <n> s`) and the PIN file is not read; a correct PIN resets the
-  count. A restart clears the lockout, so it limits online guessing
-  through one running engine, not offline guessing of the PIN file (see
-  "CLI PIN").
+- **PIN lockout is persisted and escalates.** Three consecutive bad PINs
+  lock PIN-tier approvals for `60_000 << level` ms of the injected wall
+  clock, capped at a day (`PIN_LOCK_MAX_MS = 86_400_000`); `level` rises by 1
+  on each lock, so repeated lockouts last 60 s, 120 s, 240 s and so on. A
+  correct PIN resets the count and the level. The lock is checked BEFORE
+  prompting: while locked, a `YesPin` action is refused without a prompt
+  (`refused: pin locked`, owner told `PIN approvals locked for <n> s`) and
+  the PIN file is not read. The state (`failures`, `level`,
+  `locked_until_ms`, 16 bytes) lives in `<home>/pin-guard`; `Engine::try_new`
+  loads it (missing means no lockout) and refuses to start
+  (`EngineConfigError::PinGuardState`) if it is malformed, a symlink, not a
+  regular file or has group/other permission bits. It is rewritten
+  atomically (0600 temp file, `sync_all`, rename, directory fsync) after
+  every PIN check, so a restart does not clear a lockout. If the write
+  fails, PIN-tier approvals are refused (`refused: pin unavailable`, no
+  prompt) until restart and the owner is told `warning: cannot save the PIN
+  lockout; PIN approvals are disabled until restart`. Limits: it limits
+  online guessing through the engine, not offline guessing of the PIN file
+  (see "CLI PIN"); anyone who can write the PIN home can reset it, and the
+  lock follows the wall clock, so a clock moved forward ends it early.
 - **Consent only for runnable actions.** Before any prompt, an action
   with a path capability the executor would refuse as outside the root is
   refused. The engine asks the executor itself
@@ -648,8 +687,37 @@ planner and the executor are wired together.
   the folder (quoted) and what relative paths resolve against; the whole
   prompt is redacted before it is sent. `..` is still resolved lexically
   and anything that leaves the root is refused before any prompt.
-- **Non-owners get nothing.** A message whose sender is not
-  `cfg.owner` causes no planner call and no reply. It is audited
+- **Several owners, each served alone.** `EngineConfig.owners` lists the
+  senders whose messages are acted on (`EngineConfig::new` sets one).
+  Everything said while handling a message, approval prompts and the
+  discard notice included, goes to that message's sender only, and an
+  approval is asked of (and may only be answered by) the requester, never
+  another owner. Owners share one PIN, one PIN lockout and one approver
+  store.
+- **Per-channel PIN gate.** Before a `YesPin` prompt, and before the PIN
+  lockout check, an action whose requester's channel answers
+  `accepts_pin(sender) == false` is refused with no prompt, no challenge
+  drawn and no PIN file read: audited `refused: pin not accepted on this
+  channel`, tool result `pin not accepted on this channel`, and the owner
+  is told `this needs your PIN, which this channel does not accept; do it
+  at the computer`. Why: a PIN typed into a remote chat service is stored
+  on its servers.
+- **Retraction of messages that may hold the PIN.** After a message is
+  dropped as PIN-like, or as approval-shaped with 3 or more whitespace
+  tokens (`yes <code> <PIN>`), the engine calls `retract_last(sender)`.
+  A two-token approval-shaped message (`yes <x>`, any whitespace) is also
+  checked with the PIN-like check (same bounds, constant time); if it holds
+  the PIN (an owner who forgot the code), it is handled as a PIN-like
+  message: retracted, `ignored: pin-like message` audited, never sent to
+  the planner. Best effort only; a bare `yes`/`no` or `yes <code>` that is
+  not the PIN is not retracted.
+- **The truncation marker always survives.** A model reply the provider
+  cut off is first cut so that, together with `\n[reply truncated]`, it
+  fits in the 4096 characters a channel displays (counting display
+  escapes), and the marker is appended after that, so the channel's own
+  cap never removes it.
+- **Non-owners get nothing.** A message whose sender is not in
+  `cfg.owners` causes no planner call and no reply. It is audited
   `ignored: non-owner` at most once per 60 s, with the sender id
   display-sanitized and cut to 64 characters. A wall clock that goes
   backwards resets the window (it cannot suppress entries until it catches

@@ -17,5 +17,6 @@ pub mod exec;
 mod http;
 pub mod planner;
 pub mod redact;
+mod state;
 pub mod telegram;
 pub mod tools;

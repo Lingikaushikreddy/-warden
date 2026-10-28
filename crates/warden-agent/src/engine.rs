@@ -63,17 +63,25 @@ use zeroize::Zeroizing;
 
 use crate::authorize::{ApproverStore, Authorized};
 use crate::channel::{
-    sanitize_for_display, ApprovalPrompt, ApprovalReply, Channel, Inbound, SenderId,
+    display_prefix, sanitize_for_display, ApprovalPrompt, ApprovalReply, Channel, Inbound, SenderId,
 };
 use crate::exec::{ExecError, Executor, READ_OVERLAP_BYTES};
 use crate::planner::{Block, PlanRequest, Planner, PlannerError, Role, ToolId, Turn};
 use crate::redact::{redact, Redacted};
+use crate::state;
 use crate::tools::{parse_call, to_action, tool_specs, Tool, ToolCall, ToolError};
 
 /// Consecutive bad PINs that lock PIN-tier approvals.
 const PIN_MAX_FAILURES: u32 = 3;
-/// How long a PIN lockout lasts.
+/// How long the first PIN lockout lasts (each further one doubles).
 const PIN_LOCK_MS: u64 = 60_000;
+/// Longest PIN lockout.
+pub const PIN_LOCK_MAX_MS: u64 = 86_400_000;
+/// File name of the persisted [`PinGuard`] inside the PIN home.
+pub const PIN_GUARD_FILE: &str = "pin-guard";
+/// Told to the owner when the PIN lockout could not be saved.
+const PIN_GUARD_UNSAVED: &str =
+    "warning: cannot save the PIN lockout; PIN approvals are disabled until restart";
 /// At most one `ignored: non-owner` audit entry per this many milliseconds.
 const NON_OWNER_AUDIT_EVERY_MS: u64 = 60_000;
 /// How many recent challenge codes a new one must differ from.
@@ -98,6 +106,18 @@ const PIN_FILE: &str = "pin";
 const MAX_NOTE_CHARS: usize = 500;
 /// A summary whose display form is longer than this is refused unprompted.
 const MAX_SUMMARY_CHARS: usize = 3000;
+/// Most characters a channel displays per message (as `sanitize_for_display`
+/// caps it).
+const MAX_DISPLAY_CHARS: usize = 4096;
+/// Appended to a model reply the provider cut off.
+const REPLY_TRUNCATED: &str = "\n[reply truncated]";
+/// Told to the owner when a `YesPin` action is asked for over a channel
+/// that does not accept PINs.
+const PIN_NOT_ACCEPTED: &str =
+    "this needs your PIN, which this channel does not accept; do it at the computer";
+/// Approval-shaped messages with at least this many whitespace tokens may
+/// carry a PIN (`yes <code> <PIN>`) and are retracted.
+const RETRACT_MIN_TOKENS: usize = 3;
 
 /// Default system prompt, without the folder sentence that
 /// [`default_system_prompt`] appends. Safety does not depend on it.
@@ -153,8 +173,10 @@ impl AuditSink for AuditLog {
 /// Engine settings.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// The only sender whose messages are acted on.
-    pub owner: SenderId,
+    /// The senders whose messages are acted on. Each is served on its own:
+    /// everything said while handling a message, approval prompts included,
+    /// goes to that message's sender only.
+    pub owners: Vec<SenderId>,
     /// The single allowed root (policy and executor).
     pub root: PathBuf,
     /// Relative tool paths resolve against this.
@@ -177,15 +199,15 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
-    /// Defaults: 8 steps, 16 calls, 120 s approval tokens, 32 KiB results,
-    /// 300 s per message, 120 s per owner prompt, and
-    /// [`default_system_prompt`] for `root` and `cwd` (canonicalized when
-    /// they exist, as `Engine::try_new` stores them).
+    /// One owner (`owners: vec![owner]`). Defaults: 8 steps, 16 calls,
+    /// 120 s approval tokens, 32 KiB results, 300 s per message, 120 s per
+    /// owner prompt, and [`default_system_prompt`] for `root` and `cwd`
+    /// (canonicalized when they exist, as `Engine::try_new` stores them).
     pub fn new(owner: SenderId, root: PathBuf, cwd: PathBuf) -> EngineConfig {
         let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         let system_prompt = default_system_prompt(&canon(&root), &canon(&cwd));
         EngineConfig {
-            owner,
+            owners: vec![owner],
             root,
             cwd,
             max_steps: 8,
@@ -206,6 +228,10 @@ pub enum EngineConfigError {
     /// audit log, snapshot store) lies inside the root and is not protected
     /// by the executor, so an approved write could edit it.
     UnprotectedHome(PathBuf),
+    /// `<home>/pin-guard` (the persisted PIN lockout) is malformed,
+    /// insecure (a symlink, not a regular file, group/other permission
+    /// bits) or unreadable.
+    PinGuardState(io::ErrorKind),
 }
 
 impl fmt::Display for EngineConfigError {
@@ -216,6 +242,12 @@ impl fmt::Display for EngineConfigError {
                 "state directory {} is inside the root and not protected by the executor",
                 p.display()
             ),
+            EngineConfigError::PinGuardState(k) => {
+                write!(
+                    f,
+                    "cannot load the PIN lockout state ({PIN_GUARD_FILE}): {k}"
+                )
+            }
         }
     }
 }
@@ -315,18 +347,53 @@ pub enum PinState {
     Locked { until_ms: u64 },
 }
 
-/// In-memory PIN rate limit: 3 consecutive bad PINs lock PIN-tier
-/// approvals for 60 s; a correct PIN resets the count. Not persisted, so a
-/// restart clears it.
-#[derive(Debug, Default)]
+/// PIN rate limit: 3 consecutive bad PINs lock PIN-tier approvals. A lock
+/// lasts `60_000 << level` ms, capped at [`PIN_LOCK_MAX_MS`]; `level` rises
+/// by 1 on each lock, so repeated lockouts escalate (60 s, 120 s, 240 s …,
+/// at most a day). A correct PIN resets the count and the level. The engine
+/// persists it in `<home>/pin-guard` ([`PIN_GUARD_FILE`]) so a restart does
+/// not clear it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PinGuard {
     failures: u32,
+    level: u32,
     locked_until: Option<u64>,
 }
 
 impl PinGuard {
     pub fn new() -> PinGuard {
         PinGuard::default()
+    }
+
+    /// `failures` (u32 BE) || `level` (u32 BE) || `locked_until_ms` (u64 BE,
+    /// 0 = not locked).
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[..4].copy_from_slice(&self.failures.to_be_bytes());
+        b[4..8].copy_from_slice(&self.level.to_be_bytes());
+        b[8..].copy_from_slice(&self.locked_until.unwrap_or(0).to_be_bytes());
+        b
+    }
+
+    /// The inverse of [`PinGuard::to_bytes`]; `None` unless `b` is exactly
+    /// 16 bytes.
+    pub fn from_bytes(b: &[u8]) -> Option<PinGuard> {
+        let b: &[u8; 16] = b.try_into().ok()?;
+        let (f, rest) = b.split_at(4);
+        let (l, u) = rest.split_at(4);
+        let until = u64::from_be_bytes(u.try_into().ok()?);
+        Some(PinGuard {
+            failures: u32::from_be_bytes(f.try_into().ok()?),
+            level: u32::from_be_bytes(l.try_into().ok()?),
+            locked_until: (until != 0).then_some(until),
+        })
+    }
+
+    /// How long the next lock lasts.
+    fn lock_ms(&self) -> u64 {
+        // 60_000 << 11 is already past the cap; bounding the shift keeps it
+        // from overflowing.
+        (PIN_LOCK_MS << self.level.min(20)).min(PIN_LOCK_MAX_MS)
     }
 
     pub fn state(&self, now_ms: u64) -> PinState {
@@ -340,6 +407,7 @@ impl PinGuard {
     pub fn record(&mut self, now_ms: u64, ok: bool) {
         if ok {
             self.failures = 0;
+            self.level = 0;
             self.locked_until = None;
             return;
         }
@@ -349,7 +417,8 @@ impl PinGuard {
         }
         self.failures = self.failures.saturating_add(1);
         if self.failures >= PIN_MAX_FAILURES {
-            self.locked_until = Some(now_ms.saturating_add(PIN_LOCK_MS));
+            self.locked_until = Some(now_ms.saturating_add(self.lock_ms()));
+            self.level = self.level.saturating_add(1);
             self.failures = 0;
         }
     }
@@ -550,7 +619,7 @@ impl From<ApprovalReply> for Consent {
             ApprovalReply::Yes => Consent::Yes,
             ApprovalReply::No => Consent::No,
             ApprovalReply::Closed => Consent::Closed,
-            ApprovalReply::YesPin(p) => Consent::Pin(Zeroizing::new(p)),
+            ApprovalReply::YesPin(p) => Consent::Pin(p),
         }
     }
 }
@@ -566,6 +635,12 @@ pub struct Engine<P: Planner, C: Channel, A: AuditSink> {
     executor: Arc<Executor>,
     pin_path: PathBuf,
     pin_guard: PinGuard,
+    /// `<home>/pin-guard`, rewritten after every PIN check.
+    pin_guard_path: PathBuf,
+    /// Set when writing `pin_guard_path` failed: PIN-tier approvals are
+    /// refused until restart, so a lockout that is not on disk cannot be
+    /// escaped by a restart.
+    pin_guard_unsaved: bool,
     clock: Clock,
     last_non_owner_audit_ms: Option<u64>,
     /// Set when an owner prompt timed out or the input closed: the current
@@ -573,6 +648,8 @@ pub struct Engine<P: Planner, C: Channel, A: AuditSink> {
     end_message: Option<EndReason>,
     /// Challenge codes of recent prompts; a new code never repeats one.
     recent_challenges: VecDeque<String>,
+    /// Sender of the message being handled: every outbound call goes here.
+    sender: SenderId,
     /// How many `check_pin` calls the PIN-like check has made (test-hooks).
     #[cfg(feature = "test-hooks")]
     pin_like_checks: Arc<std::sync::atomic::AtomicUsize>,
@@ -608,9 +685,14 @@ where
     /// config file); a file is matched as itself, a directory with
     /// everything inside it.
     ///
+    /// The PIN lockout is loaded from `<home>/pin-guard` ([`PIN_GUARD_FILE`];
+    /// missing means none).
+    ///
     /// Fails with [`EngineConfigError::UnprotectedHome`] when `home`, the
     /// approver store's home or any of `state_dirs` lies inside `cfg.root`
-    /// and is not protected by the executor ([`Executor::protects`]).
+    /// and is not protected by the executor ([`Executor::protects`]), and
+    /// with [`EngineConfigError::PinGuardState`] when the lockout file is
+    /// malformed, insecure or unreadable.
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         cfg: EngineConfig,
@@ -645,6 +727,13 @@ where
             allowed_roots.push(root_as_given);
         }
         let policy = PolicyConfig { allowed_roots };
+        let pin_guard_path = home.join(PIN_GUARD_FILE);
+        let pin_guard = match state::read_private(&pin_guard_path, 16) {
+            Ok(None) => PinGuard::new(),
+            Ok(Some(b)) => PinGuard::from_bytes(&b)
+                .ok_or(EngineConfigError::PinGuardState(io::ErrorKind::InvalidData))?,
+            Err(e) => return Err(EngineConfigError::PinGuardState(e.kind())),
+        };
         Ok(Engine {
             cfg,
             policy,
@@ -654,11 +743,14 @@ where
             approvals: Arc::new(Mutex::new(approvals)),
             executor: Arc::new(executor),
             pin_path: home.join(PIN_FILE),
-            pin_guard: PinGuard::new(),
+            pin_guard,
+            pin_guard_path,
+            pin_guard_unsaved: false,
             clock: Box::new(system_clock_ms),
             last_non_owner_audit_ms: None,
             end_message: None,
             recent_challenges: VecDeque::new(),
+            sender: SenderId(String::new()),
             #[cfg(feature = "test-hooks")]
             pin_like_checks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
@@ -736,17 +828,22 @@ where
         matches!(res, Ok(Ok(())))
     }
 
+    /// Send `text` to the sender of the message being handled.
+    async fn say(&mut self, text: &str) {
+        self.channel.send(&self.sender, text).await;
+    }
+
     /// Audit something where nothing executes either way; tell the owner if
     /// the append failed.
     async fn audit_or_warn(&mut self, action_id: &str, summary: &str, tier: Tier, decision: &str) {
         if !self.audit(action_id, summary, tier, decision).await {
-            self.channel.send("warning: audit append failed").await;
+            self.say("warning: audit append failed").await;
         }
     }
 
     /// Process one inbound message.
     pub async fn handle(&mut self, inbound: Inbound) {
-        if inbound.sender != self.cfg.owner {
+        if !self.cfg.owners.contains(&inbound.sender) {
             let now = self.now();
             // A clock that went backwards resets the window instead of
             // suppressing entries until it catches up.
@@ -767,18 +864,23 @@ where
             return;
         }
 
+        self.sender = inbound.sender;
         let text = Zeroizing::new(inbound.text);
-        if is_approval_shaped(&text) {
-            // Possibly a late approval reply (it may carry the PIN): never
-            // chat, never sent to the planner, never logged.
+        // Approval-shaped text is possibly a late approval reply: never chat,
+        // never sent to the planner, never logged. Of it, only `yes <x>` (two
+        // tokens) is checked for the PIN: an owner who forgot the code may
+        // have typed `yes <PIN>`.
+        let shaped = is_approval_shaped(&text);
+        let tokens = text.split_whitespace().count();
+        let pin_like = if shaped {
+            tokens == 2 && self.is_pin_like(&text).await
+        } else {
+            self.is_pin_like(&text).await
+        };
+        if pin_like {
             drop(text);
-            self.channel.send("no approval pending").await;
-            return;
-        }
-        if self.is_pin_like(&text).await {
-            drop(text);
-            self.channel
-                .send("that message looks like your PIN; it was not sent")
+            self.channel.retract_last(&self.sender).await;
+            self.say("that message looks like your PIN; it was not sent")
                 .await;
             self.audit_or_warn(
                 &new_id(),
@@ -787,6 +889,15 @@ where
                 "ignored: pin-like message",
             )
             .await;
+            return;
+        }
+        if shaped {
+            drop(text);
+            // With a code and something after it, it may hold the PIN.
+            if tokens >= RETRACT_MIN_TOKENS {
+                self.channel.retract_last(&self.sender).await;
+            }
+            self.say("no approval pending").await;
             return;
         }
         self.end_message = None;
@@ -843,9 +954,14 @@ where
                     model_reply(&text)
                 };
                 if resp.truncated {
-                    out.push_str("\n[reply truncated]");
+                    // Cut first so the marker fits in what the channel
+                    // displays and is never itself cut off.
+                    let keep = MAX_DISPLAY_CHARS - REPLY_TRUNCATED.chars().count();
+                    let n = display_prefix(&out, keep).len();
+                    out.truncate(n);
+                    out.push_str(REPLY_TRUNCATED);
                 }
-                self.channel.send(&out).await;
+                self.say(&out).await;
                 return;
             }
 
@@ -886,7 +1002,7 @@ where
                 );
                 self.audit_or_warn(&msg_id, &summary, Tier::Auto, "refused: too many calls")
                     .await;
-                self.channel.send(&format!("refused: {summary}")).await;
+                self.say(&format!("refused: {summary}")).await;
             }
             turns.push(Turn {
                 role: Role::Assistant,
@@ -898,7 +1014,7 @@ where
             });
         }
 
-        self.channel.send("step limit reached").await;
+        self.say("step limit reached").await;
         self.audit_or_warn(&msg_id, "message", Tier::Auto, "failed: step limit")
             .await;
     }
@@ -973,21 +1089,19 @@ where
     }
 
     async fn timed_out(&mut self, msg_id: &str) {
-        self.channel.send("timed out").await;
+        self.say("timed out").await;
         self.audit_or_warn(msg_id, "message", Tier::Auto, "failed: timeout")
             .await;
     }
 
     async fn input_closed(&mut self, msg_id: &str) {
-        self.channel.send("input closed").await;
+        self.say("input closed").await;
         self.audit_or_warn(msg_id, "message", Tier::Auto, "failed: input closed")
             .await;
     }
 
     async fn planner_failed(&mut self, msg_id: &str, kind: &str) {
-        self.channel
-            .send(&format!("planner unavailable ({kind})"))
-            .await;
+        self.say(&format!("planner unavailable ({kind})")).await;
         self.audit_or_warn(msg_id, "message", Tier::Auto, "failed: planner")
             .await;
     }
@@ -1011,9 +1125,7 @@ where
     ) -> Outcome {
         self.audit_or_warn(&action.id, &action.summary, tier, decision)
             .await;
-        self.channel
-            .send(&format!("refused: {}", action.summary))
-            .await;
+        self.say(&format!("refused: {}", action.summary)).await;
         Outcome::error(result)
     }
 
@@ -1030,7 +1142,7 @@ where
                     "refused: invalid call",
                 )
                 .await;
-                self.channel.send("refused: invalid tool call").await;
+                self.say("refused: invalid tool call").await;
                 return Outcome::error(format!("invalid call: {reason}"));
             }
         };
@@ -1097,14 +1209,34 @@ where
             Decision::NeedsPin => Tier::YesPin,
         };
 
+        if tier == Tier::YesPin && !self.channel.accepts_pin(&self.sender) {
+            // Checked before the lock and before any challenge or PIN file
+            // read: a PIN typed here would be stored by a third party.
+            self.audit_or_warn(
+                &action.id,
+                &action.summary,
+                tier,
+                "refused: pin not accepted on this channel",
+            )
+            .await;
+            self.say(PIN_NOT_ACCEPTED).await;
+            return Outcome::error("pin not accepted on this channel");
+        }
+        if tier == Tier::YesPin && self.pin_guard_unsaved {
+            // Checked before prompting: no PIN is asked for that could not
+            // be rate-limited across a restart.
+            self.say(PIN_GUARD_UNSAVED).await;
+            return self
+                .refuse(&action, tier, "refused: pin unavailable", "pin unavailable")
+                .await;
+        }
         if tier == Tier::YesPin {
             let now = self.now();
             if let PinState::Locked { until_ms } = self.pin_guard.state(now) {
                 let secs = until_ms.saturating_sub(now).div_ceil(1000);
                 self.audit_or_warn(&action.id, &action.summary, tier, "refused: pin locked")
                     .await;
-                self.channel
-                    .send(&format!("PIN approvals locked for {secs} s"))
+                self.say(&format!("PIN approvals locked for {secs} s"))
                     .await;
                 return Outcome::error("pin locked");
             }
@@ -1126,14 +1258,12 @@ where
         // Input already waiting cannot be a reply to a prompt not yet shown
         // (it cannot contain the new code either); say so, so typed-ahead
         // chat is not lost silently.
-        if self.channel.discard_pending_input().await > 0 {
-            self.channel
-                .send("earlier unsent input was discarded")
-                .await;
+        if self.channel.discard_pending_input(&self.sender).await > 0 {
+            self.say("earlier unsent input was discarded").await;
         }
         let reply = timeout(
             self.cfg.approval_timeout,
-            self.channel.ask_approval(&prompt),
+            self.channel.ask_approval(&self.sender, &prompt),
         )
         .await
         .ok();
@@ -1214,10 +1344,22 @@ where
         match checked {
             Ok(Ok(PinCheck::Match)) => {
                 self.pin_guard.record(now, true);
+                if !self.save_pin_guard().await {
+                    return Some(
+                        self.refuse(
+                            action,
+                            Tier::YesPin,
+                            "refused: pin unavailable",
+                            "pin unavailable",
+                        )
+                        .await,
+                    );
+                }
                 None
             }
             Ok(Ok(PinCheck::Mismatch)) => {
                 self.pin_guard.record(now, false);
+                self.save_pin_guard().await;
                 Some(
                     self.refuse(action, Tier::YesPin, "refused: bad pin", "bad pin")
                         .await,
@@ -1236,9 +1378,22 @@ where
         }
     }
 
+    /// Write the [`PinGuard`] to `<home>/pin-guard` on a blocking thread.
+    /// On failure, disable PIN-tier approvals until restart, tell the owner
+    /// and answer `false`.
+    async fn save_pin_guard(&mut self) -> bool {
+        let (path, bytes) = (self.pin_guard_path.clone(), self.pin_guard.to_bytes());
+        let res = tokio::task::spawn_blocking(move || state::write_atomic(&path, &bytes)).await;
+        if matches!(res, Ok(Ok(()))) {
+            return true;
+        }
+        self.pin_guard_unsaved = true;
+        self.say(PIN_GUARD_UNSAVED).await;
+        false
+    }
+
     async fn audit_unavailable(&mut self, action: &Action) -> Outcome {
-        self.channel
-            .send(&format!("refused: {} (audit unavailable)", action.summary))
+        self.say(&format!("refused: {} (audit unavailable)", action.summary))
             .await;
         Outcome::error("audit unavailable")
     }
@@ -1246,9 +1401,7 @@ where
     async fn authorize_failed(&mut self, action: &Action, tier: Tier) -> Outcome {
         self.audit_or_warn(&action.id, &action.summary, tier, "failed: authorize")
             .await;
-        self.channel
-            .send(&format!("failed: {}", action.summary))
-            .await;
+        self.say(&format!("failed: {}", action.summary)).await;
         Outcome::error("approval unavailable")
     }
 
@@ -1308,14 +1461,14 @@ where
             if let Some(id) = &snapshot {
                 w.push_str(&format!(" (snapshot {id})"));
             }
-            self.channel.send(&w).await;
+            self.say(&w).await;
         }
         let line = match (&outcome.is_error, &snapshot) {
             (false, _) => format!("done: {}", action.summary),
             (true, Some(id)) => format!("failed: {} (snapshot {id})", action.summary),
             (true, None) => format!("failed: {}", action.summary),
         };
-        self.channel.send(&line).await;
+        self.say(&line).await;
         outcome
     }
 }
@@ -1334,8 +1487,12 @@ mod tests {
         async fn recv(&mut self) -> Option<Inbound> {
             None
         }
-        async fn send(&mut self, _text: &str) {}
-        async fn ask_approval(&mut self, _prompt: &ApprovalPrompt) -> ApprovalReply {
+        async fn send(&mut self, _to: &SenderId, _text: &str) {}
+        async fn ask_approval(
+            &mut self,
+            _to: &SenderId,
+            _prompt: &ApprovalPrompt,
+        ) -> ApprovalReply {
             ApprovalReply::No
         }
     }
@@ -1416,6 +1573,81 @@ mod tests {
         // After expiry the count starts again from zero.
         g.record(60_006, false);
         assert_eq!(g.state(60_006), PinState::Open);
+    }
+
+    /// Three bad PINs at `t`; returns the lock length.
+    fn lock_at(g: &mut PinGuard, t: u64) -> u64 {
+        for i in 0..3 {
+            g.record(t + i, false);
+        }
+        match g.state(t + 2) {
+            PinState::Locked { until_ms } => until_ms - (t + 2),
+            PinState::Open => panic!("not locked at {t}"),
+        }
+    }
+
+    #[test]
+    fn pin_guard_bytes_roundtrip() {
+        let fresh = PinGuard::new();
+        assert_eq!(fresh.to_bytes(), [0u8; 16]);
+        assert_eq!(
+            PinGuard::from_bytes(&fresh.to_bytes()),
+            Some(PinGuard::new())
+        );
+
+        let mut g = PinGuard::new();
+        lock_at(&mut g, 1_000);
+        let b = g.to_bytes();
+        assert_eq!(&b[..4], &0u32.to_be_bytes());
+        assert_eq!(&b[4..8], &1u32.to_be_bytes());
+        assert_eq!(&b[8..], &61_002u64.to_be_bytes());
+        assert_eq!(PinGuard::from_bytes(&b).as_ref(), Some(&g));
+        g.record(1_000_000, false); // lock expired: one failure, level kept
+        let b = g.to_bytes();
+        assert_eq!(&b[..4], &1u32.to_be_bytes());
+        assert_eq!(&b[4..8], &1u32.to_be_bytes());
+        assert_eq!(&b[8..], &0u64.to_be_bytes());
+        let back = PinGuard::from_bytes(&b).unwrap();
+        assert_eq!(back, g);
+        assert_eq!(back.to_bytes(), b);
+
+        let mut locked = PinGuard::new();
+        lock_at(&mut locked, 5);
+        let back = PinGuard::from_bytes(&locked.to_bytes()).unwrap();
+        assert_eq!(back.state(10), PinState::Locked { until_ms: 60_007 });
+
+        assert_eq!(PinGuard::from_bytes(&[]), None);
+        assert_eq!(PinGuard::from_bytes(&[0u8; 15]), None);
+        assert_eq!(PinGuard::from_bytes(&[0u8; 17]), None);
+    }
+
+    #[test]
+    fn lock_doubles_on_each_consecutive_lockout_and_caps_at_a_day() {
+        let mut g = PinGuard::new();
+        let mut t = 0u64;
+        let mut locks = Vec::new();
+        for _ in 0..40 {
+            let len = lock_at(&mut g, t);
+            locks.push(len);
+            t += len + 2;
+            assert_eq!(g.state(t), PinState::Open);
+        }
+        assert_eq!(&locks[..4], &[60_000, 120_000, 240_000, 480_000]);
+        for w in locks.windows(2) {
+            assert!(w[1] == (w[0] * 2).min(PIN_LOCK_MAX_MS), "{w:?}");
+        }
+        assert!(locks.iter().all(|&l| l <= PIN_LOCK_MAX_MS));
+        assert_eq!(*locks.last().unwrap(), 86_400_000);
+    }
+
+    #[test]
+    fn correct_pin_resets_level() {
+        let mut g = PinGuard::new();
+        assert_eq!(lock_at(&mut g, 0), 60_000);
+        assert_eq!(lock_at(&mut g, 100_000), 120_000);
+        g.record(1_000_000, true);
+        assert_eq!(g, PinGuard::new());
+        assert_eq!(lock_at(&mut g, 2_000_000), 60_000);
     }
 
     #[test]

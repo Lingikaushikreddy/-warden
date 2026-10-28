@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,13 +16,14 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use warden_agent::authorize::ApproverStore;
 use warden_agent::channel::{
-    ApprovalPrompt, ApprovalReply, Channel, Inbound, SenderId, StdioChannel,
+    sanitize_for_display, ApprovalPrompt, ApprovalReply, Channel, Inbound, SenderId, StdioChannel,
 };
-use warden_agent::engine::{AuditSink, Engine, EngineConfig};
+use warden_agent::engine::{AuditSink, Engine, EngineConfig, PIN_GUARD_FILE};
 use warden_agent::exec::Executor;
 use warden_agent::planner::{MockPlanner, PlanRequest, PlanResponse, Planner, PlannerError};
 use warden_agent::tools::ToolCall;
 use warden_core::{SnapshotStore, Tier};
+use zeroize::Zeroizing;
 
 const NOW: u64 = 1_700_000_000_000;
 const PIN: &str = "4815162342";
@@ -84,16 +86,31 @@ enum Reply {
 
 #[derive(Default, Clone)]
 struct Seen {
-    sent: Arc<Mutex<Vec<String>>>,
-    prompts: Arc<Mutex<Vec<ApprovalPrompt>>>,
+    /// Every `send`, with its recipient.
+    sent: Arc<Mutex<Vec<(SenderId, String)>>>,
+    /// Every `ask_approval`, with its recipient.
+    prompts: Arc<Mutex<Vec<(SenderId, ApprovalPrompt)>>>,
+    /// Every `retract_last`, with its sender.
+    retracted: Arc<Mutex<Vec<SenderId>>>,
+    /// Set to make `accepts_pin` answer `false` from now on.
+    pin_off: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Seen {
     fn sent(&self) -> Vec<String> {
+        self.sent_to().into_iter().map(|(_, t)| t).collect()
+    }
+    fn sent_to(&self) -> Vec<(SenderId, String)> {
         self.sent.lock().unwrap().clone()
     }
     fn prompts(&self) -> Vec<ApprovalPrompt> {
+        self.prompts_to().into_iter().map(|(_, p)| p).collect()
+    }
+    fn prompts_to(&self) -> Vec<(SenderId, ApprovalPrompt)> {
         self.prompts.lock().unwrap().clone()
+    }
+    fn retracted(&self) -> Vec<SenderId> {
+        self.retracted.lock().unwrap().clone()
     }
 }
 
@@ -101,6 +118,8 @@ struct TestChannel {
     inbound: VecDeque<Inbound>,
     replies: VecDeque<Reply>,
     seen: Seen,
+    /// What `accepts_pin` answers.
+    accepts_pin: bool,
 }
 
 impl Channel for TestChannel {
@@ -108,12 +127,20 @@ impl Channel for TestChannel {
         self.inbound.pop_front()
     }
 
-    async fn send(&mut self, text: &str) {
-        self.seen.sent.lock().unwrap().push(text.to_string());
+    async fn send(&mut self, to: &SenderId, text: &str) {
+        self.seen
+            .sent
+            .lock()
+            .unwrap()
+            .push((to.clone(), text.to_string()));
     }
 
-    async fn ask_approval(&mut self, prompt: &ApprovalPrompt) -> ApprovalReply {
-        self.seen.prompts.lock().unwrap().push(prompt.clone());
+    async fn ask_approval(&mut self, to: &SenderId, prompt: &ApprovalPrompt) -> ApprovalReply {
+        self.seen
+            .prompts
+            .lock()
+            .unwrap()
+            .push((to.clone(), prompt.clone()));
         match self.replies.pop_front() {
             Some(Reply::Is(r)) => r,
             Some(Reply::Hang) => std::future::pending().await,
@@ -123,6 +150,14 @@ impl Channel for TestChannel {
             }
             None => ApprovalReply::No,
         }
+    }
+
+    fn accepts_pin(&self, _to: &SenderId) -> bool {
+        self.accepts_pin && !self.seen.pin_off.load(Ordering::SeqCst)
+    }
+
+    async fn retract_last(&mut self, to: &SenderId) {
+        self.seen.retracted.lock().unwrap().push(to.clone());
     }
 }
 
@@ -168,7 +203,7 @@ fn yes() -> Reply {
 }
 
 fn yes_pin(p: &str) -> Reply {
-    Reply::Is(ApprovalReply::YesPin(p.into()))
+    Reply::Is(ApprovalReply::YesPin(Zeroizing::new(p.into())))
 }
 
 fn env() -> Env {
@@ -197,6 +232,8 @@ struct Opts {
     tweak: Box<dyn FnOnce(&mut EngineConfig)>,
     store_hook: Box<dyn FnOnce(&mut ApproverStore)>,
     exec_hook: Box<dyn FnOnce(&mut Executor)>,
+    /// What the channel's `accepts_pin` answers.
+    accepts_pin: bool,
 }
 
 impl Default for Opts {
@@ -209,6 +246,7 @@ impl Default for Opts {
             tweak: Box::new(|_| {}),
             store_hook: Box::new(|_| {}),
             exec_hook: Box::new(|_| {}),
+            accepts_pin: true,
         }
     }
 }
@@ -244,6 +282,14 @@ impl Env {
     }
 
     fn engine_with<P: Planner>(&self, planner: P, o: Opts) -> Engine<P, TestChannel, RecSink> {
+        self.try_engine_with(planner, o).unwrap()
+    }
+
+    fn try_engine_with<P: Planner>(
+        &self,
+        planner: P,
+        o: Opts,
+    ) -> Result<Engine<P, TestChannel, RecSink>, warden_agent::engine::EngineConfigError> {
         let mut store = ApproverStore::open(&self.home, NOW).unwrap();
         (o.store_hook)(&mut store);
         let snapshots = SnapshotStore::open(&self.snaps).unwrap();
@@ -260,6 +306,7 @@ impl Env {
             inbound: o.inbound.into(),
             replies: o.replies.into(),
             seen: self.seen.clone(),
+            accepts_pin: o.accepts_pin,
         };
         let sink = RecSink {
             entries: self.entries.clone(),
@@ -278,8 +325,7 @@ impl Env {
             self.home.clone(),
             std::slice::from_ref(&self.snaps),
         )
-        .unwrap()
-        .with_clock(Box::new(move || clock.load(Ordering::SeqCst)))
+        .map(|e| e.with_clock(Box::new(move || clock.load(Ordering::SeqCst))))
     }
 
     fn engine(
@@ -824,6 +870,139 @@ async fn pin_lock_expires_with_the_injected_clock() {
     e.handle(msg("delete")).await;
     assert!(!f.exists());
     assert_eq!(env.seen.prompts().len(), 4);
+}
+
+#[tokio::test]
+async fn pin_lockout_survives_an_engine_restart() {
+    let env = env();
+    env.set_pin();
+    let f = env.file("a.txt", "A");
+    let calls: Vec<ToolCall> = (0..3)
+        .map(|i| call(&format!("t{i}"), "delete_file", path_arg(&f)))
+        .collect();
+    {
+        let mut e = env.engine(
+            vec![reply(None, calls), reply(Some("ok"), vec![])],
+            Opts {
+                replies: vec![yes_pin("000000"), yes_pin("111111"), yes_pin("222222")],
+                ..Opts::default()
+            },
+        );
+        e.handle(msg("delete")).await;
+    }
+    assert_eq!(env.seen.prompts().len(), 3);
+    let guard = fs::read(env.home.join(PIN_GUARD_FILE)).unwrap();
+    assert_eq!(guard.len(), 16);
+    // A new engine on the same home (a restart) is still locked.
+    let mut e = env.engine(
+        vec![
+            reply(None, vec![call("t9", "delete_file", path_arg(&f))]),
+            reply(Some("locked"), vec![]),
+        ],
+        Opts {
+            replies: vec![yes_pin(PIN)],
+            ..Opts::default()
+        },
+    );
+    env.advance(10_000);
+    e.handle(msg("delete")).await;
+    assert!(f.exists());
+    assert_eq!(env.seen.prompts().len(), 3, "no prompt while locked");
+    assert_eq!(env.decisions().last().unwrap(), "refused: pin locked");
+    assert!(env
+        .seen
+        .sent()
+        .contains(&"PIN approvals locked for 50 s".to_string()));
+}
+
+#[tokio::test]
+async fn corrupt_pin_guard_file_refuses_engine_start() {
+    use warden_agent::engine::EngineConfigError;
+    let env = env();
+    let p = env.home.join(PIN_GUARD_FILE);
+    for bad in [&b""[..], &[0u8; 15][..], &[0u8; 17][..], &[7u8; 4096][..]] {
+        fs::write(&p, bad).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        let r = env.try_engine_with(MockPlanner::scripted(vec![]), Opts::default());
+        assert_eq!(
+            r.err(),
+            Some(EngineConfigError::PinGuardState(io::ErrorKind::InvalidData)),
+            "{} bytes",
+            bad.len()
+        );
+    }
+    // A symlink is refused too, even to a well-formed file.
+    let real = env.home.join("real");
+    fs::write(&real, [0u8; 16]).unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(&p).unwrap();
+    std::os::unix::fs::symlink(&real, &p).unwrap();
+    let r = env.try_engine_with(MockPlanner::scripted(vec![]), Opts::default());
+    assert_eq!(
+        r.err(),
+        Some(EngineConfigError::PinGuardState(io::ErrorKind::InvalidData))
+    );
+    // A well-formed file starts fine.
+    fs::remove_file(&p).unwrap();
+    fs::rename(&real, &p).unwrap();
+    assert!(env
+        .try_engine_with(MockPlanner::scripted(vec![]), Opts::default())
+        .is_ok());
+}
+
+#[tokio::test]
+async fn group_writable_pin_guard_file_is_refused() {
+    use warden_agent::engine::EngineConfigError;
+    let env = env();
+    let p = env.home.join(PIN_GUARD_FILE);
+    fs::write(&p, [0u8; 16]).unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o620)).unwrap();
+    let r = env.try_engine_with(MockPlanner::scripted(vec![]), Opts::default());
+    assert_eq!(
+        r.err(),
+        Some(EngineConfigError::PinGuardState(
+            io::ErrorKind::PermissionDenied
+        ))
+    );
+}
+
+#[tokio::test]
+async fn unwritable_pin_guard_disables_pin_approvals() {
+    let env = env();
+    env.set_pin();
+    let f = env.file("a.txt", "A");
+    let del = |id: &str| reply(None, vec![call(id, "delete_file", path_arg(&f))]);
+    let mut e = env.engine(
+        vec![
+            del("t1"),
+            reply(Some("bad"), vec![]),
+            del("t2"),
+            reply(Some("refused"), vec![]),
+        ],
+        Opts {
+            replies: vec![yes_pin("000000"), yes_pin(PIN)],
+            ..Opts::default()
+        },
+    );
+    fs::set_permissions(&env.home, fs::Permissions::from_mode(0o500)).unwrap();
+    e.handle(msg("delete")).await;
+    e.handle(msg("delete")).await;
+    fs::set_permissions(&env.home, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(f.exists());
+    assert_eq!(
+        env.decisions(),
+        vec![
+            "requested",
+            "refused: bad pin",
+            // Disabled before prompting: no prompt, no `requested`.
+            "refused: pin unavailable",
+        ]
+    );
+    assert_eq!(env.seen.prompts().len(), 1);
+    let warning = "warning: cannot save the PIN lockout; PIN approvals are disabled until restart";
+    assert!(env.seen.sent().contains(&warning.to_string()));
+    let (_, results) = blocks(&e.planner().requests()[3]);
+    assert_eq!(results.last().unwrap().1, "pin unavailable");
 }
 
 #[tokio::test]
@@ -1439,7 +1618,12 @@ async fn late_pin_after_timeout_never_reaches_planner() {
     assert_eq!(reqs.len(), 1, "the late reply was not sent as chat");
     let all = everything(&env, &reqs);
     assert!(!all.contains(PIN), "the late PIN leaked");
-    assert_eq!(env.seen.sent().last().unwrap(), "no approval pending");
+    // `yes <PIN>` without the code is treated as PIN-like and retracted.
+    assert_eq!(
+        env.seen.sent().last().unwrap(),
+        "that message looks like your PIN; it was not sent"
+    );
+    assert_eq!(env.seen.retracted(), vec![owner()]);
 }
 
 #[tokio::test]
@@ -1775,6 +1959,7 @@ fn try_engine(
         inbound: VecDeque::new(),
         replies: VecDeque::new(),
         seen: env.seen.clone(),
+        accepts_pin: true,
     };
     Engine::try_new(
         EngineConfig::new(owner(), env.root.clone(), env.root.clone()),
@@ -2061,6 +2246,7 @@ async fn root_alias_and_canonical_spellings_both_work() {
         inbound: VecDeque::new(),
         replies: vec![yes(), yes()].into(),
         seen: env.seen.clone(),
+        accepts_pin: true,
     };
     let planner = MockPlanner::scripted(vec![
         reply(
@@ -2129,6 +2315,7 @@ fn try_new_detects_a_home_inside_an_aliased_root() {
             inbound: VecDeque::new(),
             replies: VecDeque::new(),
             seen: env.seen.clone(),
+            accepts_pin: true,
         };
         let sink = RecSink {
             entries: env.entries.clone(),
@@ -2955,4 +3142,243 @@ async fn requested_append_failure_means_no_prompt_and_no_run() {
     let (_, results) = blocks(&e.planner().requests()[1]);
     assert_eq!(results[0].1, "audit unavailable");
     assert!(results[0].2);
+}
+
+// ------------------------------------------- recipients and multiple owners
+
+fn sid(s: &str) -> SenderId {
+    SenderId(s.into())
+}
+
+fn from(sender: &str, text: &str) -> Inbound {
+    Inbound {
+        sender: sid(sender),
+        text: text.into(),
+    }
+}
+
+fn two_owners() -> Box<dyn FnOnce(&mut EngineConfig)> {
+    Box::new(|c| c.owners = vec![sid("a"), sid("b")])
+}
+
+#[tokio::test]
+async fn second_owner_is_served_and_replies_go_to_the_sender() {
+    let env = env();
+    let mut e = env.engine(
+        vec![
+            reply(
+                Some("writing"),
+                vec![call(
+                    "t1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "hi"}),
+                )],
+            ),
+            reply(Some("done"), vec![]),
+        ],
+        Opts {
+            replies: vec![yes()],
+            tweak: two_owners(),
+            ..Opts::default()
+        },
+    );
+    e.handle(from("b", "write a.txt")).await;
+    assert_eq!(e.planner().requests().len(), 2, "b is an owner");
+    assert_eq!(fs::read_to_string(env.root.join("a.txt")).unwrap(), "hi");
+    let sent = env.seen.sent_to();
+    assert!(sent.len() >= 2, "{sent:?}");
+    assert!(sent.iter().all(|(to, _)| *to == sid("b")), "{sent:?}");
+    let prompts = env.seen.prompts_to();
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].0, sid("b"));
+}
+
+#[tokio::test]
+async fn approval_is_asked_of_the_sender_only() {
+    let env = env();
+    let write = |id: &str, name: &str| {
+        reply(
+            None,
+            vec![call(
+                id,
+                "write_file",
+                json!({"path": name, "content": "x"}),
+            )],
+        )
+    };
+    let mut e = env.engine(
+        vec![
+            write("t1", "a.txt"),
+            reply(Some("ok"), vec![]),
+            write("t2", "b.txt"),
+            reply(Some("ok"), vec![]),
+        ],
+        Opts {
+            replies: vec![yes(), Reply::Is(ApprovalReply::No)],
+            tweak: two_owners(),
+            ..Opts::default()
+        },
+    );
+    e.handle(from("a", "write a")).await;
+    e.handle(from("b", "write b")).await;
+    let prompts = env.seen.prompts_to();
+    assert_eq!(prompts.len(), 2);
+    assert_eq!(prompts[0].0, sid("a"));
+    assert_eq!(prompts[1].0, sid("b"));
+    assert!(env.root.join("a.txt").exists());
+    assert!(!env.root.join("b.txt").exists());
+    // Every message of a's run went to a, and of b's run to b.
+    let sent = env.seen.sent_to();
+    let split = sent.iter().position(|(to, _)| *to == sid("b")).unwrap();
+    assert!(sent[..split].iter().all(|(to, _)| *to == sid("a")));
+    assert!(sent[split..].iter().all(|(to, _)| *to == sid("b")));
+}
+
+#[tokio::test]
+async fn yespin_on_a_channel_without_pin_support_is_refused_without_prompt() {
+    let env = env();
+    env.set_pin();
+    let f = env.file("a.txt", "A");
+    let mut e = env.engine(
+        vec![
+            reply(None, vec![call("t1", "delete_file", path_arg(&f))]),
+            reply(Some("could not"), vec![]),
+        ],
+        Opts {
+            replies: vec![yes_pin(PIN)],
+            accepts_pin: false,
+            ..Opts::default()
+        },
+    );
+    e.handle(msg("delete a.txt")).await;
+    assert!(f.exists(), "nothing ran");
+    assert!(env.seen.prompts().is_empty(), "no prompt");
+    assert_eq!(
+        env.decisions(),
+        vec!["refused: pin not accepted on this channel".to_string()]
+    );
+    assert!(env
+        .seen
+        .sent()
+        .iter()
+        .any(|s| s
+            == "this needs your PIN, which this channel does not accept; do it at the computer"));
+    let reqs = e.planner().requests();
+    let (_, results) = blocks(&reqs[1]);
+    assert_eq!(results[0].1, "pin not accepted on this channel");
+    assert!(results[0].2);
+}
+
+#[tokio::test]
+async fn pin_like_message_is_retracted() {
+    let env = env();
+    env.set_pin();
+    let mut e = env.engine(vec![], Opts::default());
+    e.handle(msg(&format!("my pin is {PIN}"))).await;
+    assert_eq!(env.decisions(), vec!["ignored: pin-like message"]);
+    assert_eq!(env.seen.retracted(), vec![owner()]);
+}
+
+#[tokio::test]
+async fn approval_shaped_message_with_three_tokens_is_retracted() {
+    let env = env();
+    let mut e = env.engine(vec![], Opts::default());
+    e.handle(msg("yes 4821 123456")).await;
+    assert_eq!(env.seen.sent(), vec!["no approval pending"]);
+    assert_eq!(env.seen.retracted(), vec![owner()]);
+    assert!(e.planner().requests().is_empty());
+}
+
+#[tokio::test]
+async fn two_token_yes_is_not_retracted() {
+    let env = env();
+    let mut e = env.engine(vec![], Opts::default());
+    e.handle(msg("yes 4821")).await;
+    e.handle(msg("no")).await;
+    assert_eq!(env.seen.sent(), vec!["no approval pending"; 2]);
+    assert!(env.seen.retracted().is_empty());
+}
+
+#[tokio::test]
+async fn truncated_marker_survives_a_long_reply() {
+    // Plain text, and text whose escapes make it display wider than it is.
+    for text in ["a".repeat(10_000), "a\u{1b}".repeat(5_000)] {
+        let env = env();
+        let mut e = env.engine(
+            vec![Ok(PlanResponse {
+                text: Some(text),
+                calls: vec![],
+                truncated: true,
+            })],
+            Opts::default(),
+        );
+        e.handle(msg("go")).await;
+        let sent = env.seen.sent();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].ends_with("\n[reply truncated]"));
+        let shown = sanitize_for_display(&sent[0]);
+        assert!(
+            shown.ends_with("\n[reply truncated]"),
+            "{}",
+            &shown[shown.len() - 40..]
+        );
+        assert!(shown.chars().count() <= 4096);
+    }
+}
+
+#[tokio::test]
+async fn yes_then_pin_without_code_is_retracted() {
+    let env = env();
+    env.set_pin();
+    let mut e = env.engine(vec![reply(Some("chat"), vec![])], Opts::default());
+    e.handle(msg(&format!("yes {PIN}"))).await;
+    e.handle(msg(&format!("yes\n{PIN}"))).await;
+    assert!(
+        e.planner().requests().is_empty(),
+        "never reaches the planner"
+    );
+    assert_eq!(env.seen.retracted(), vec![owner(), owner()]);
+    assert_eq!(
+        env.seen.sent(),
+        vec!["that message looks like your PIN; it was not sent"; 2]
+    );
+    assert_eq!(env.decisions(), vec!["ignored: pin-like message"; 2]);
+    assert!(!everything(&env, &[]).contains(PIN));
+    // `yes <code>` that is not the PIN is still only "no approval pending".
+    e.handle(msg("yes 4821")).await;
+    assert_eq!(env.seen.retracted().len(), 2);
+    assert_eq!(env.seen.sent().last().unwrap(), "no approval pending");
+}
+
+#[tokio::test]
+async fn pin_gate_is_checked_before_the_pin_lock() {
+    let env = env();
+    env.set_pin();
+    let f = env.file("a.txt", "A");
+    let calls: Vec<ToolCall> = (0..3)
+        .map(|i| call(&format!("t{i}"), "delete_file", path_arg(&f)))
+        .collect();
+    let mut e = env.engine(
+        vec![
+            reply(None, calls),
+            reply(Some("ok"), vec![]),
+            reply(None, vec![call("t9", "delete_file", path_arg(&f))]),
+            reply(Some("ok"), vec![]),
+        ],
+        Opts {
+            replies: vec![yes_pin("000000"), yes_pin("111111"), yes_pin("222222")],
+            ..Opts::default()
+        },
+    );
+    e.handle(msg("delete")).await;
+    assert_eq!(env.decisions().last().unwrap(), "refused: bad pin");
+    // The guard is now locked; the channel stops accepting PINs.
+    env.seen.pin_off.store(true, Ordering::SeqCst);
+    e.handle(msg("delete again")).await;
+    assert!(f.exists());
+    assert_eq!(
+        env.decisions().last().unwrap(),
+        "refused: pin not accepted on this channel"
+    );
+    assert_eq!(env.seen.prompts().len(), 3);
 }

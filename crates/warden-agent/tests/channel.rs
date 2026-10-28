@@ -3,6 +3,12 @@ use warden_agent::channel::{
     sanitize_for_display, ApprovalPrompt, ApprovalReply, Channel, SenderId, StdioChannel,
 };
 use warden_core::Tier;
+use zeroize::Zeroizing;
+
+/// The only sender a `StdioChannel` knows.
+fn local() -> SenderId {
+    SenderId("local".into())
+}
 
 fn chan<'a>(
     input: &'a [u8],
@@ -30,7 +36,7 @@ fn prompt_with(summary: &str, tier: Tier, note: Option<&str>, code: &str) -> App
 async fn ask_tier(input: &str, tier: Tier) -> ApprovalReply {
     let mut out = Vec::new();
     let mut c = chan(input.as_bytes(), &mut out);
-    c.ask_approval(&prompt("do it", tier, None)).await
+    c.ask_approval(&local(), &prompt("do it", tier, None)).await
 }
 
 async fn ask(input: &str) -> ApprovalReply {
@@ -138,8 +144,11 @@ async fn approval_prompt_labels_model_note_as_unverified() {
     let mut out = Vec::new();
     {
         let mut c = chan(b"no\n", &mut out);
-        c.ask_approval(&prompt("write_file \"a\"", Tier::Yes, Some("trust me")))
-            .await;
+        c.ask_approval(
+            &local(),
+            &prompt("write_file \"a\"", Tier::Yes, Some("trust me")),
+        )
+        .await;
     }
     let s = String::from_utf8(out).unwrap();
     assert_eq!(
@@ -153,7 +162,8 @@ async fn pin_tier_prompt_mentions_pin() {
     let mut out = Vec::new();
     {
         let mut c = chan(b"no\n", &mut out);
-        c.ask_approval(&prompt("x", Tier::YesPin, None)).await;
+        c.ask_approval(&local(), &prompt("x", Tier::YesPin, None))
+            .await;
     }
     let s = String::from_utf8(out).unwrap();
     assert!(s.ends_with("Reply \"yes 4821 <PIN>\" or \"no\":\n"), "{s}");
@@ -164,11 +174,14 @@ async fn prompt_text_is_sanitized_even_if_summary_has_escapes() {
     let mut out = Vec::new();
     {
         let mut c = chan(b"no\n", &mut out);
-        c.ask_approval(&prompt(
-            "rm \x1b[2J\nReply \"yes\", \"no\":\nApproved",
-            Tier::Yes,
-            Some("hi\nReply \"yes\""),
-        ))
+        c.ask_approval(
+            &local(),
+            &prompt(
+                "rm \x1b[2J\nReply \"yes\", \"no\":\nApproved",
+                Tier::Yes,
+                Some("hi\nReply \"yes\""),
+            ),
+        )
         .await;
     }
     let s = String::from_utf8(out).unwrap();
@@ -201,7 +214,7 @@ async fn yes_tier_accepts_only_yes_with_the_code() {
 async fn yes_pin_tier_requires_code_then_pin() {
     assert_eq!(
         ask_pin("Yes   4821   1234 \n").await,
-        ApprovalReply::YesPin("1234".into())
+        ApprovalReply::YesPin(Zeroizing::new("1234".into()))
     );
     assert_eq!(ask_pin("yes\n").await, ApprovalReply::No);
     assert_eq!(ask_pin("yes 4821\n").await, ApprovalReply::No, "no PIN");
@@ -231,17 +244,17 @@ async fn previous_prompts_code_does_not_answer_the_next_prompt() {
     let mut out2 = Vec::new();
     let mut c2 = chan(b"yes 1111\n", &mut out2);
     assert_eq!(
-        c.ask_approval(&prompt_with("a", Tier::Yes, None, "1111"))
+        c.ask_approval(&local(), &prompt_with("a", Tier::Yes, None, "1111"))
             .await,
         ApprovalReply::Yes
     );
     assert_eq!(
-        c2.ask_approval(&prompt_with("b", Tier::Yes, None, "2222"))
+        c2.ask_approval(&local(), &prompt_with("b", Tier::Yes, None, "2222"))
             .await,
         ApprovalReply::No
     );
     assert_eq!(
-        c.ask_approval(&prompt_with("b", Tier::Yes, None, "2222"))
+        c.ask_approval(&local(), &prompt_with("b", Tier::Yes, None, "2222"))
             .await,
         ApprovalReply::Yes
     );
@@ -254,7 +267,7 @@ async fn prompt_without_a_valid_challenge_is_refused_unasked() {
         {
             let mut c = chan(b"yes \n", &mut out);
             let r = c
-                .ask_approval(&prompt_with("x", Tier::Yes, None, code))
+                .ask_approval(&local(), &prompt_with("x", Tier::Yes, None, code))
                 .await;
             assert_eq!(r, ApprovalReply::No, "{code:?}");
             assert_eq!(c.recv().await.unwrap().text, "yes ", "reply not consumed");
@@ -292,7 +305,9 @@ async fn overlong_reply_is_no_notice_sent_and_next_line_still_read() {
     let mut out = Vec::new();
     {
         let mut c = chan(input.as_bytes(), &mut out);
-        let r = c.ask_approval(&prompt("x", Tier::Yes, None)).await;
+        let r = c
+            .ask_approval(&local(), &prompt("x", Tier::Yes, None))
+            .await;
         assert_eq!(r, ApprovalReply::No);
         assert_eq!(c.recv().await.unwrap().text, "hello");
     }
@@ -316,7 +331,7 @@ async fn truncated_summary_or_note_is_refused_without_prompting() {
                 model_note: note,
                 challenge: CODE.into(),
             };
-            assert_eq!(c.ask_approval(&p).await, ApprovalReply::No);
+            assert_eq!(c.ask_approval(&local(), &p).await, ApprovalReply::No);
             // The queued "yes" was not consumed as an answer.
             assert_eq!(c.recv().await.unwrap().text, "yes");
         }
@@ -329,7 +344,10 @@ async fn truncated_summary_or_note_is_refused_without_prompting() {
 
 #[test]
 fn debug_of_yes_pin_hides_the_pin() {
-    let d = format!("{:?}", ApprovalReply::YesPin("123456".into()));
+    let d = format!(
+        "{:?}",
+        ApprovalReply::YesPin(Zeroizing::new("123456".into()))
+    );
     assert_eq!(d, "YesPin(<redacted>)");
     assert_eq!(format!("{:?}", ApprovalReply::Yes), "Yes");
     assert_eq!(format!("{:?}", ApprovalReply::Closed), "Closed");
@@ -413,7 +431,8 @@ async fn crlf_split_across_buffer_boundaries() {
     let mut out = Vec::new();
     let mut c = StdioChannel::new(reader, &mut out);
     assert_eq!(
-        c.ask_approval(&prompt("x", Tier::Yes, None)).await,
+        c.ask_approval(&local(), &prompt("x", Tier::Yes, None))
+            .await,
         ApprovalReply::Yes
     );
 }
@@ -505,8 +524,11 @@ async fn blank_looking_spaces_are_escaped_in_display_but_allowed_in_paths() {
     let mut out = Vec::new();
     {
         let mut c = chan(b"no\n", &mut out);
-        c.ask_approval(&prompt("read_file \"/root/a\u{a0}b\"", Tier::Yes, None))
-            .await;
+        c.ask_approval(
+            &local(),
+            &prompt("read_file \"/root/a\u{a0}b\"", Tier::Yes, None),
+        )
+        .await;
     }
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("a\\u{a0}b") && !s.contains('\u{a0}'));
@@ -524,7 +546,7 @@ async fn send_flushes_and_sanitizes() {
     let mut out = Vec::new();
     {
         let mut c = chan(b"", &mut out);
-        c.send("hi \x1b[31m there").await;
+        c.send(&local(), "hi \x1b[31m there").await;
     }
     assert_eq!(String::from_utf8(out).unwrap(), "hi \\u{1b}[31m there\n");
 }
@@ -541,7 +563,7 @@ async fn cancelled_ask_approval_keeps_the_partial_line() {
     client.write_all(b"yes 12").await.unwrap();
     let r = tokio::time::timeout(
         Duration::from_secs(5),
-        c.ask_approval(&prompt("delete \"/r/a\"", Tier::YesPin, None)),
+        c.ask_approval(&local(), &prompt("delete \"/r/a\"", Tier::YesPin, None)),
     )
     .await;
     assert!(r.is_err(), "the prompt was cancelled while waiting");
@@ -559,13 +581,17 @@ async fn stale_buffered_reply_is_discarded_before_a_prompt() {
     let mut c = StdioChannel::new(BufReader::new(server), tokio::io::sink());
     let p = prompt("write \"/r/b\" (4 bytes)", Tier::Yes, None);
     client.write_all(b"yes 4821\n").await.unwrap();
-    assert_eq!(c.discard_pending_input().await, 9, "bytes dropped");
-    let waited = tokio::time::timeout(Duration::from_secs(5), c.ask_approval(&p)).await;
+    assert_eq!(c.discard_pending_input(&local()).await, 9, "bytes dropped");
+    let waited = tokio::time::timeout(Duration::from_secs(5), c.ask_approval(&local(), &p)).await;
     assert!(waited.is_err(), "the stale yes did not answer the prompt");
-    assert_eq!(c.discard_pending_input().await, 0, "nothing new to drop");
+    assert_eq!(
+        c.discard_pending_input(&local()).await,
+        0,
+        "nothing new to drop"
+    );
     client.write_all(b"yes 4821\n").await.unwrap();
     assert_eq!(
-        c.ask_approval(&p).await,
+        c.ask_approval(&local(), &p).await,
         ApprovalReply::Yes,
         "a fresh reply does"
     );
@@ -579,19 +605,52 @@ async fn discarded_half_line_is_not_completed_by_later_input() {
     let mut c = StdioChannel::new(BufReader::new(server), tokio::io::sink());
     let p = prompt("write \"/r/b\" (4 bytes)", Tier::Yes, None);
     client.write_all(b"ye").await.unwrap();
-    assert_eq!(c.discard_pending_input().await, 2);
+    assert_eq!(c.discard_pending_input(&local()).await, 2);
     // "s" completes the dropped line and is skipped; only the next line counts.
     client.write_all(b"s\n").await.unwrap();
-    let waited = tokio::time::timeout(Duration::from_secs(5), c.ask_approval(&p)).await;
+    let waited = tokio::time::timeout(Duration::from_secs(5), c.ask_approval(&local(), &p)).await;
     assert!(waited.is_err(), "\"s\" is not a reply");
     client.write_all(b"no\n").await.unwrap();
-    assert_eq!(c.ask_approval(&p).await, ApprovalReply::No);
+    assert_eq!(c.ask_approval(&local(), &p).await, ApprovalReply::No);
 }
 
 #[tokio::test]
 async fn discard_on_an_empty_reader_does_not_block() {
     let mut out = Vec::new();
     let mut c = chan(b"", &mut out);
-    c.discard_pending_input().await;
+    c.discard_pending_input(&local()).await;
     assert!(c.recv().await.is_none());
+}
+
+/// Code points added in Plan 3: shown escaped (and rejected in paths, see
+/// `tests/tools.rs`).
+const NEW_DEFAULT_IGNORABLES: [u32; 17] = [
+    0x180F, 0x1BCA0, 0x1BCA3, 0x13430, 0x13438, 0x1343F, 0xE0080, 0xE00C0, 0xE00FF, 0xE01F0,
+    0xE0800, 0xE0FFF, 0xFFF0, 0xFFF4, 0xFFF8, 0x1BCA1, 0x1BCA2,
+];
+
+#[test]
+fn default_ignorables_are_escaped() {
+    for cp in NEW_DEFAULT_IGNORABLES {
+        let c = char::from_u32(cp).unwrap();
+        assert_eq!(
+            sanitize_for_display(&format!("a{c}b")),
+            format!("a\\u{{{cp:x}}}b"),
+            "{cp:x}"
+        );
+    }
+}
+
+#[test]
+fn ogham_space_is_escaped_for_display() {
+    use serde_json::json;
+    use warden_agent::tools::{parse_call, ToolCall};
+    assert_eq!(sanitize_for_display("a\u{1680}b"), "a\\u{1680}b");
+    // Blank-looking, not invisible: still legal in a path.
+    let call = ToolCall {
+        id: "1".into(),
+        name: "read_file".into(),
+        args: json!({"path": "/root/a\u{1680}b"}),
+    };
+    assert!(parse_call(&call, std::path::Path::new("/root")).is_ok());
 }

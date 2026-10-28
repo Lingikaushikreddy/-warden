@@ -13,6 +13,7 @@ use std::task::Poll;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use warden_core::Tier;
+use zeroize::Zeroizing;
 
 use crate::tools::is_forbidden_path_char;
 
@@ -41,8 +42,9 @@ pub struct Inbound {
 pub enum ApprovalReply {
     Yes,
     No,
-    /// "yes" together with a PIN. The engine ignores the PIN for `Tier::Yes`.
-    YesPin(String),
+    /// "yes" together with a PIN, held in zeroizing memory. The engine
+    /// ignores the PIN for `Tier::Yes`.
+    YesPin(Zeroizing<String>),
     /// No reply at all: the channel closed (EOF) before a complete reply
     /// line. Treated as a refusal, audited distinctly.
     Closed,
@@ -74,16 +76,25 @@ pub struct ApprovalPrompt {
     pub challenge: String,
 }
 
-/// A two-way conversation with the owner.
+/// A two-way conversation with the owners.
+///
+/// Every outbound call names its recipient (`to`): the engine sends
+/// everything it says while handling a message to that message's sender. A
+/// local channel with a single sender (such as [`StdioChannel`]) may ignore
+/// `to`; a remote channel must deliver to `to` and nobody else.
 pub trait Channel {
     /// Next message, or `None` when the channel is closed.
+    ///
+    /// Must be cancel-safe: a caller may drop this future (for example in a
+    /// `select!` with a shutdown signal) and call `recv` again without
+    /// losing or splitting a message.
     fn recv(&mut self) -> impl Future<Output = Option<Inbound>> + Send;
 
-    /// Show text to the owner. The engine has already redacted secrets; the
+    /// Show text to `to`. The engine has already redacted secrets; the
     /// channel still sanitizes for display.
-    fn send(&mut self, text: &str) -> impl Future<Output = ()> + Send;
+    fn send(&mut self, to: &SenderId, text: &str) -> impl Future<Output = ()> + Send;
 
-    /// Ask the owner to approve an action.
+    /// Ask `to` to approve an action.
     ///
     /// Reply rules (stdio): the prompt shows `prompt.challenge`. For tiers
     /// other than `YesPin`, only `yes <code>` (`yes` case-insensitive,
@@ -97,25 +108,45 @@ pub trait Channel {
     /// stream. Input queued before the prompt can answer it. An interactive
     /// terminal front end should discard pending input before prompting, and
     /// the engine must keep chat text and approvals as separate states. The
-    /// PIN is returned as a plain `String` (not zeroized); the engine must
-    /// compare it in constant time.
+    /// PIN is returned in a `Zeroizing<String>`; the engine must compare it
+    /// in constant time.
     ///
-    /// Contract: this must only return a reply that came from the OWNER. The
-    /// engine does not re-check who answered. Implementations must return
+    /// Contract: this must only return a reply that came from `to` (one of
+    /// the owners, the sender of the message being handled). The engine does
+    /// not re-check who answered, and with several owners a reply from any
+    /// other owner must not count either. Implementations must return
     /// `ApprovalReply::No` on any doubt (closed channel, unparseable reply,
     /// reply from anyone else).
     fn ask_approval(
         &mut self,
+        to: &SenderId,
         prompt: &ApprovalPrompt,
     ) -> impl Future<Output = ApprovalReply> + Send;
 
-    /// Drop any input that is already waiting, so that it cannot answer the
-    /// next prompt, and return how many bytes were dropped (0 if none). The
-    /// engine calls this right before every [`Channel::ask_approval`] and
-    /// tells the owner when something was dropped. Must not block.
-    /// Default: nothing to drop.
-    fn discard_pending_input(&mut self) -> impl Future<Output = usize> + Send {
+    /// Drop any input from `to` that is already waiting, so that it cannot
+    /// answer the next prompt, and return how many bytes were dropped (0 if
+    /// none). The engine calls this right before every
+    /// [`Channel::ask_approval`] and tells the owner when something was
+    /// dropped. Must not block. Default: nothing to drop.
+    fn discard_pending_input(&mut self, to: &SenderId) -> impl Future<Output = usize> + Send {
+        let _ = to;
         async { 0 }
+    }
+
+    /// Whether a PIN may be typed over this channel by `to`. When `false`,
+    /// the engine refuses every `YesPin` action asked for by `to` without a
+    /// prompt. Default: `true` (a local channel).
+    fn accepts_pin(&self, to: &SenderId) -> bool {
+        let _ = to;
+        true
+    }
+
+    /// Best-effort removal of the most recent message received from `to`
+    /// (the engine calls it after dropping a message that may hold the PIN).
+    /// Default: nothing to remove.
+    fn retract_last(&mut self, to: &SenderId) -> impl Future<Output = ()> + Send {
+        let _ = to;
+        async {}
     }
 }
 
@@ -132,7 +163,7 @@ fn valid_challenge(c: &str) -> bool {
 ///   trimmed, 1-128 chars) is `YesPin(PIN)`;
 /// - anything else (bare `yes`, a wrong or previous code, `yes <PIN>`
 ///   without the code) is `No`.
-fn parse_reply(text: &str, needs_pin: bool, code: &str) -> ApprovalReply {
+pub(crate) fn parse_reply(text: &str, needs_pin: bool, code: &str) -> ApprovalReply {
     let t = text.trim();
     let Some((first, rest)) = t.split_once(char::is_whitespace) else {
         return ApprovalReply::No;
@@ -155,7 +186,7 @@ fn parse_reply(text: &str, needs_pin: bool, code: &str) -> ApprovalReply {
         };
     }
     if (1..=MAX_PIN_CHARS).contains(&after.chars().count()) {
-        ApprovalReply::YesPin(after.to_string())
+        ApprovalReply::YesPin(Zeroizing::new(after.to_string()))
     } else {
         ApprovalReply::No
     }
@@ -166,8 +197,39 @@ fn parse_reply(text: &str, needs_pin: bool, code: &str) -> ApprovalReply {
 fn is_blank_looking(c: char) -> bool {
     matches!(
         c,
-        '\u{00A0}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+        '\u{00A0}' | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
     )
+}
+
+/// Is `c` shown as a `\u{hex}` escape?
+fn is_escaped(c: char) -> bool {
+    c == '\r'
+        || is_blank_looking(c)
+        || (c != '\n' && c != '\t' && (is_forbidden_path_char(c) || c == '\u{7f}'))
+}
+
+/// How many characters `c` takes once sanitized for display.
+fn display_len(c: char) -> usize {
+    if is_escaped(c) {
+        // `\u{` + hex digits + `}`
+        let digits = format!("{:x}", c as u32).len();
+        4 + digits
+    } else {
+        1
+    }
+}
+
+/// The longest prefix of `s` whose display form ([`sanitize_for_display`],
+/// before any cap) is at most `max` characters.
+pub(crate) fn display_prefix(s: &str, max: usize) -> &str {
+    let mut used = 0usize;
+    for (i, c) in s.char_indices() {
+        used += display_len(c);
+        if used > max {
+            return &s[..i];
+        }
+    }
+    s
 }
 
 /// Sanitize and report whether the 4096-character cap truncated the text.
@@ -176,10 +238,7 @@ fn sanitize_capped(s: &str) -> (String, bool) {
     let mut count = 0usize;
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        let escape = c == '\r'
-            || is_blank_looking(c)
-            || (c != '\n' && c != '\t' && (is_forbidden_path_char(c) || c == '\u{7f}'));
-        let piece: String = if escape {
+        let piece: String = if is_escaped(c) {
             format!("\\u{{{:x}}}", c as u32)
         } else {
             c.to_string()
@@ -221,6 +280,37 @@ pub fn sanitize_for_display(s: &str) -> String {
 fn block(s: &str) -> Option<String> {
     let (t, truncated) = sanitize_capped(s);
     (!truncated).then(|| t.replace('\n', "\n  | "))
+}
+
+/// The prompt text, or the refusal shown instead of it.
+fn render(prompt: &ApprovalPrompt) -> Result<String, &'static str> {
+    let summary = block(&prompt.summary);
+    let note = prompt.model_note.as_deref().map(block);
+    let (Some(summary), true) = (summary, note.as_ref().is_none_or(|n| n.is_some())) else {
+        return Err("request too long to approve safely; refused");
+    };
+    if !valid_challenge(&prompt.challenge) {
+        return Err("approval prompt has no valid code; refused");
+    }
+    let code = prompt.challenge.as_str();
+    let mut s = format!("Approval needed ({:?}):\n  {}\n", prompt.tier, summary);
+    if let Some(Some(note)) = note {
+        s.push_str(&format!("  model says (unverified): {note}\n"));
+    }
+    if prompt.tier == Tier::YesPin {
+        s.push_str(&format!("Reply \"yes {code} <PIN>\" or \"no\":\n"));
+    } else {
+        s.push_str(&format!("Reply \"yes {code}\" or \"no\":\n"));
+    }
+    Ok(s)
+}
+
+/// The approval prompt as [`StdioChannel`] prints it (sanitized, multi-line
+/// text indented with `  | `). `None` when the summary or note would be
+/// truncated or the challenge is invalid: such a prompt must be refused
+/// without asking.
+pub(crate) fn render_prompt(prompt: &ApprovalPrompt) -> Option<String> {
+    render(prompt).ok()
 }
 
 fn finish(mut bytes: Vec<u8>, terminated: bool) -> Line {
@@ -372,7 +462,7 @@ where
         }
     }
 
-    async fn send(&mut self, text: &str) {
+    async fn send(&mut self, _to: &SenderId, text: &str) {
         let mut s = sanitize_for_display(text);
         s.push('\n');
         self.write(&s).await;
@@ -388,7 +478,7 @@ where
     /// runs arrive later and are read as the reply; and an owner who
     /// answers a fresh prompt by completing a dropped half line must type
     /// the reply again.
-    async fn discard_pending_input(&mut self) -> usize {
+    async fn discard_pending_input(&mut self, _to: &SenderId) -> usize {
         let mut mid_line = !self.partial.is_empty() || self.overflow || self.skip_line;
         let mut dropped = self.partial.len() + usize::from(self.overflow);
         self.partial.clear();
@@ -419,31 +509,16 @@ where
         dropped
     }
 
-    async fn ask_approval(&mut self, prompt: &ApprovalPrompt) -> ApprovalReply {
-        let summary = block(&prompt.summary);
-        let note = prompt.model_note.as_deref().map(block);
-        let (Some(summary), true) = (summary, note.as_ref().is_none_or(|n| n.is_some())) else {
-            self.write("request too long to approve safely; refused\n")
-                .await;
+    /// `to` is ignored: the only sender is `local`.
+    async fn ask_approval(&mut self, _to: &SenderId, prompt: &ApprovalPrompt) -> ApprovalReply {
+        let Some(s) = render_prompt(prompt) else {
+            let refusal = render(prompt).err().unwrap_or("refused");
+            self.write(&format!("{refusal}\n")).await;
             return ApprovalReply::No;
         };
-        if !valid_challenge(&prompt.challenge) {
-            self.write("approval prompt has no valid code; refused\n")
-                .await;
-            return ApprovalReply::No;
-        }
-        let code = prompt.challenge.as_str();
-        let needs_pin = prompt.tier == Tier::YesPin;
-        let mut s = format!("Approval needed ({:?}):\n  {}\n", prompt.tier, summary);
-        if let Some(Some(note)) = note {
-            s.push_str(&format!("  model says (unverified): {note}\n"));
-        }
-        if needs_pin {
-            s.push_str(&format!("Reply \"yes {code} <PIN>\" or \"no\":\n"));
-        } else {
-            s.push_str(&format!("Reply \"yes {code}\" or \"no\":\n"));
-        }
         self.write(&s).await;
+        let needs_pin = prompt.tier == Tier::YesPin;
+        let code = prompt.challenge.as_str();
 
         let bytes = match self.read_line().await {
             Line::Text {
@@ -463,5 +538,56 @@ where
         let text = String::from_utf8_lossy(&bytes).into_owned();
         drop(bytes);
         parse_reply(&text, needs_pin, code)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `render_prompt` is exactly what `StdioChannel` prints for a prompt
+    /// (and nothing else is printed before the reply is read).
+    #[tokio::test]
+    async fn render_prompt_matches_stdio_output() {
+        let prompts = [
+            (Tier::Yes, "write_file \"/r/a\" (2 bytes)", None, "4821"),
+            (
+                Tier::YesPin,
+                "delete_file \"/r/a\nfake line\"",
+                Some("trust me\n\u{1b}[2J"),
+                "0042",
+            ),
+            (Tier::Yes, "x\u{202e}y", Some(""), "Ab9"),
+        ];
+        for (tier, summary, note, code) in prompts {
+            let p = ApprovalPrompt {
+                summary: summary.into(),
+                tier,
+                model_note: note.map(Into::into),
+                challenge: code.into(),
+            };
+            let mut out = Vec::new();
+            {
+                let mut c = StdioChannel::new(&b"no\n"[..], &mut out);
+                let to = SenderId("local".into());
+                assert_eq!(c.ask_approval(&to, &p).await, ApprovalReply::No);
+            }
+            let rendered = render_prompt(&p).expect("renders");
+            assert_eq!(String::from_utf8(out).unwrap(), rendered, "{summary:?}");
+        }
+        // Refused prompts render nothing.
+        let bad_code = ApprovalPrompt {
+            summary: "x".into(),
+            tier: Tier::Yes,
+            model_note: None,
+            challenge: "12-4".into(),
+        };
+        assert_eq!(render_prompt(&bad_code), None);
+        let long = ApprovalPrompt {
+            summary: "a".repeat(5000),
+            challenge: "1".into(),
+            ..bad_code
+        };
+        assert_eq!(render_prompt(&long), None);
     }
 }
