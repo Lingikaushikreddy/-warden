@@ -30,8 +30,12 @@
 //!   0600. Created only together with a new key: a missing log next to an
 //!   existing key is `NotFound` (fail closed, a lost log must not reset the
 //!   spent set). A length that is not a multiple of 24 is `InvalidData`.
-//!   Records with `expires_at_ms + MAX_SKEW_MS <= now_ms` are dropped on open
+//!   Records with `expires_at_ms + MAX_SKEW_MS <= mark` are dropped on open
 //!   by an atomic rewrite (temp file, `sync_all`, rename, directory fsync).
+//! - `clock-mark`: the clock high-water mark, the largest `now_ms` the store
+//!   has seen, as 8 bytes (`u64` big-endian), 0600. Created when missing
+//!   (also for stores made before it existed) atomically via a temp file
+//!   and rename; any other size is `InvalidData`, never repaired.
 //!
 //! Persist-before-execute (docs/SECURITY-NOTES.md, "Contract for the agent
 //! crate"): after a successful redeem, the nonce record is appended and
@@ -41,10 +45,14 @@
 //! is poisoned: every later `authorize` returns [`AuthorizeError::Poisoned`]
 //! until the store is reopened (which re-validates the log).
 //!
-//! Pruning is only as good as `now_ms`: it must be milliseconds since the
-//! Unix epoch from a sane clock. A clock that jumps forward on open prunes
-//! records early; a later clock rollback could then let those approvals be
-//! replayed. This module does not read the clock.
+//! Clock high-water mark: `now_ms` must be milliseconds since the Unix epoch;
+//! this module does not read the clock. `open` writes and syncs
+//! `mark = max(stored, now_ms)` BEFORE pruning and prunes with `mark`.
+//! `authorize` uses `max(now_ms, mark)` for grant, redeem and the token's
+//! expiry, and syncs a newer mark before granting. A clock that goes back is
+//! clamped up to the mark rather than refused, so an approval pruned under a
+//! forward jump stays `Expired` after the clock returns
+//! ([`ApproverStore::clock_behind_ms`] reports the gap seen at open).
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
@@ -52,7 +60,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use warden_core::{
     classify, Action, Approval, ApprovalError, Approver, PolicyConfig, Tier, MAX_SKEW_MS,
@@ -65,6 +73,9 @@ const KEY_TMP: &str = "approver.key.tmp";
 const SPENT_FILE: &str = "spent-nonces";
 const SPENT_TMP: &str = "spent-nonces.tmp";
 const LOCK_FILE: &str = "approver.lock";
+const MARK_FILE: &str = "clock-mark";
+const MARK_TMP: &str = "clock-mark.tmp";
+const MARK_LEN: u64 = 8;
 const RECORD_LEN: usize = 24;
 
 /// Never follow a symlink in the final component; never block opening a FIFO.
@@ -176,6 +187,10 @@ pub struct ApproverStore {
     _lock: File,
     /// Set on any failed append; blocks `authorize` until reopen.
     poisoned: bool,
+    /// The clock high-water mark, as last durably written.
+    mark: u64,
+    /// How far `now_ms` was behind the stored mark at open (0 if not).
+    behind_ms: u64,
     #[cfg(feature = "test-hooks")]
     last_approval: Option<Approval>,
     #[cfg(feature = "test-hooks")]
@@ -189,6 +204,7 @@ impl fmt::Debug for ApproverStore {
             .field("home", &self.home)
             .field("approver", &self.approver)
             .field("poisoned", &self.poisoned)
+            .field("mark", &self.mark)
             .finish_non_exhaustive()
     }
 }
@@ -308,6 +324,55 @@ fn ensure_spent_log(home: &Path) -> io::Result<()> {
     }
 }
 
+/// Open the existing mark for reading and writing, checked like the other
+/// store files. `NotFound` if there is none.
+fn open_mark_file(home: &Path) -> io::Result<File> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(OPEN_FLAGS)
+        .open(home.join(MARK_FILE))?;
+    let meta = check_private_file(&f, "clock mark")?;
+    if meta.len() != MARK_LEN {
+        return Err(invalid("clock mark must be exactly 8 bytes"));
+    }
+    Ok(f)
+}
+
+/// Overwrite the mark in place and `sync_data` it.
+fn write_mark(f: &File, mark: u64) -> io::Result<()> {
+    f.write_all_at(&mark.to_be_bytes(), 0)?;
+    f.sync_data()
+}
+
+/// Load the mark (creating it at `now_ms` if missing), raise it to
+/// `max(stored, now_ms)` durably, and return `(mark, stored)`.
+fn load_mark(home: &Path, now_ms: u64) -> io::Result<(u64, u64)> {
+    let f = match open_mark_file(home) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let tmp = home.join(MARK_TMP);
+            remove_if_exists(&tmp)?;
+            {
+                let mut t = create_private(&tmp)?;
+                t.write_all(&now_ms.to_be_bytes())?;
+                t.sync_all()?;
+            }
+            fs::rename(&tmp, home.join(MARK_FILE))?;
+            fsync_dir(home)?;
+            return Ok((now_ms, now_ms));
+        }
+        Err(e) => return Err(e),
+    };
+    let mut bytes = [0u8; 8];
+    f.read_exact_at(&mut bytes, 0)?;
+    let stored = u64::from_be_bytes(bytes);
+    if now_ms > stored {
+        write_mark(&f, now_ms)?;
+    }
+    Ok((stored.max(now_ms), stored))
+}
+
 /// Read the spent log, dropping expired records (atomic rewrite if any were).
 /// A missing log is `NotFound`.
 fn load_spent(home: &Path, now_ms: u64) -> io::Result<Vec<[u8; 16]>> {
@@ -356,8 +421,9 @@ fn load_spent(home: &Path, now_ms: u64) -> io::Result<Vec<[u8; 16]>> {
 
 impl ApproverStore {
     /// Open (or create) the store in `home`, which must be on a local
-    /// filesystem. `now_ms` (milliseconds since the Unix epoch) decides which
-    /// spent records have expired and are dropped.
+    /// filesystem. The clock mark is raised to `max(stored, now_ms)` and
+    /// synced first; that mark (not `now_ms`) decides which spent records
+    /// have expired and are dropped.
     pub fn open(home: &Path, now_ms: u64) -> io::Result<ApproverStore> {
         DirBuilder::new().recursive(true).mode(0o700).create(home)?;
         let lock = lock(home)?;
@@ -371,12 +437,16 @@ impl ApproverStore {
                 create_key(home)?
             }
         };
-        let spent = load_spent(home, now_ms)?;
+        // Mark before pruning: a later rollback cannot un-expire a record.
+        let (mark, stored) = load_mark(home, now_ms)?;
+        let spent = load_spent(home, mark)?;
         Ok(ApproverStore {
             home: home.to_path_buf(),
             approver: Approver::from_signing_key_with_spent(key, spent),
             _lock: lock,
             poisoned: false,
+            mark,
+            behind_ms: stored.saturating_sub(now_ms),
             #[cfg(feature = "test-hooks")]
             last_approval: None,
             #[cfg(feature = "test-hooks")]
@@ -389,18 +459,46 @@ impl ApproverStore {
         &self.home
     }
 
+    /// The clock high-water mark: the largest `now_ms` durably recorded.
+    pub fn clock_mark_ms(&self) -> u64 {
+        self.mark
+    }
+
+    /// How far `now_ms` was behind the stored mark when the store was opened
+    /// (0 if it was not).
+    pub fn clock_behind_ms(&self) -> u64 {
+        self.behind_ms
+    }
+
+    /// `max(now_ms, mark)`: the time approvals are granted and redeemed at.
+    fn effective_ms(&self, now_ms: u64) -> u64 {
+        now_ms.max(self.mark)
+    }
+
+    /// Durably raise the mark to `now_ms` if it is newer.
+    fn advance_mark(&mut self, now_ms: u64) -> io::Result<()> {
+        if now_ms > self.mark {
+            write_mark(&open_mark_file(&self.home)?, now_ms)?;
+            self.mark = now_ms;
+        }
+        Ok(())
+    }
+
     /// Grant and redeem an approval for `action` at the tier `classify`
     /// gives it under `cfg`, record its nonce durably, then return the token.
     ///
     /// **This does not verify consent.** The caller must already have
     /// collected the user's consent matching the action's tier (a yes for
     /// `Yes`; a yes plus the PIN for `YesPin`) before calling it. The token
-    /// expires at `now_ms + ttl_ms` but is not bound to `cfg`: the executor
-    /// must act under the same policy.
+    /// expires at `max(now_ms, mark) + ttl_ms` but is not bound to `cfg`: the
+    /// executor must act under the same policy.
     ///
-    /// `Blocked` actions are refused before any state changes. A persist
-    /// failure returns [`AuthorizeError::Persist`] and no token; the nonce
-    /// stays spent in memory and the store is poisoned (fail closed).
+    /// `Blocked` actions are refused before any state changes. A newer
+    /// `now_ms` is written to the clock mark and synced before granting; if
+    /// that fails, [`AuthorizeError::Persist`] is returned with no token, no
+    /// nonce spent and no poisoning. A nonce persist failure returns
+    /// [`AuthorizeError::Persist`] and no token; the nonce stays spent in
+    /// memory and the store is poisoned (fail closed).
     pub fn authorize(
         &mut self,
         action: &Action,
@@ -415,6 +513,9 @@ impl ApproverStore {
         if tier == Tier::Blocked {
             return Err(AuthorizeError::Approval(ApprovalError::Blocked));
         }
+        self.advance_mark(now_ms)
+            .map_err(|e| AuthorizeError::Persist(e.kind()))?;
+        let now_ms = self.effective_ms(now_ms);
         let approval = self
             .approver
             .grant(action, tier, now_ms, ttl_ms)
@@ -517,7 +618,8 @@ impl ApproverStore {
         self.approver.spent()
     }
 
-    /// Redeem against the store's in-memory approver without persisting.
+    /// Redeem against the store's in-memory approver without persisting, at
+    /// the same effective time as `authorize` (`max(now_ms, mark)`).
     #[cfg(feature = "test-hooks")]
     pub fn redeem_for_test(
         &mut self,
@@ -526,6 +628,7 @@ impl ApproverStore {
         approval: &Approval,
         now_ms: u64,
     ) -> Result<(), ApprovalError> {
+        let now_ms = self.effective_ms(now_ms);
         self.approver.redeem(action, cfg, approval, now_ms)
     }
 }

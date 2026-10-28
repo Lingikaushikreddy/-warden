@@ -57,6 +57,9 @@ use crate::{EXIT_ERROR, EXIT_OK};
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 /// Audit action id of the session start/end entries.
 const SESSION_ID: &str = "session";
+/// Warn (and audit) when the clock is further than this behind the
+/// approver store's high-water mark.
+const CLOCK_WARN_MS: u64 = 30_000;
 /// The only sender the stdio channel produces.
 const STDIO_OWNER: &str = "local";
 
@@ -277,6 +280,26 @@ fn open_parts(home: &Path, config: &Path, cfg: &Config, root: PathBuf) -> Result
         );
         EXIT_ERROR
     })?;
+    // The clock went back since the last run: approvals are clamped up to
+    // the high-water mark. Say so, and record it.
+    let behind_ms = approvals.clock_behind_ms();
+    if behind_ms > CLOCK_WARN_MS {
+        err!(
+            "warning: the system clock is {} s behind the last time Warden ran; approvals use the later time",
+            behind_ms / 1000
+        );
+        SharedAudit(Arc::clone(&audit))
+            .append(
+                SESSION_ID,
+                "agent session",
+                Tier::Auto,
+                "clock behind high-water mark",
+            )
+            .map_err(|e| {
+                err!("error: cannot append to audit log: {e}");
+                EXIT_ERROR
+            })?;
+    }
     let snapshots = home.join("snapshots");
     let store = SnapshotStore::open(&snapshots).map_err(|e| {
         err!("error: cannot open the snapshot store: {e}");

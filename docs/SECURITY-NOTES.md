@@ -226,9 +226,9 @@ be on a local filesystem, because the single-owner guarantee is an advisory
   passed to `authorize`.
 - **Files.** `approver.key` (32 bytes, 0600, created atomically via temp file
   + `hard_link`), `spent-nonces` (24-byte records `nonce || expires_at_ms BE`,
-  0600), `approver.lock` (0600). All are opened with `O_NOFOLLOW |
-  O_NONBLOCK` and checked through the handle: regular file, no group/other
-  bits. A wrong-size key or a log whose length is not a multiple of 24 is
+  0600), `approver.lock` (0600), `clock-mark` (8 bytes, 0600, see below).
+  All are opened with `O_NOFOLLOW | O_NONBLOCK` and checked through the
+  handle: regular file, no group/other bits. A wrong-size key or a log whose length is not a multiple of 24 is
   `InvalidData` and is never repaired.
 - **A missing log is fatal.** `spent-nonces` is created only together with a
   new key. If the key exists and the log does not, `open` fails `NotFound`:
@@ -240,10 +240,8 @@ be on a local filesystem, because the single-owner guarantee is an advisory
   poisoned: `authorize` returns `Poisoned` until the store is reopened, which
   re-validates the log.
 - **Pruning.** On open, a record is dropped only when
-  `expires_at_ms + MAX_SKEW_MS <= now_ms`, so the pruning tolerance matches
-  `redeem`'s. Pruning trusts `now_ms`: a clock that jumps forward on open
-  prunes early, and if it then goes back those approvals could be replayed
-  within their window.
+  `expires_at_ms + MAX_SKEW_MS <= mark` (the clock high-water mark below), so
+  the pruning tolerance matches `redeem`'s.
 - **Locks and child processes.** The `flock` belongs to the open file
   description. A child forked by any thread while a store is open shares
   it until the child execs (the descriptor is close-on-exec), so the lock
@@ -253,9 +251,29 @@ be on a local filesystem, because the single-owner guarantee is an advisory
   test files only). A long-running engine that spawns processes should not
   rely on drop-then-reopen being instant.
 
-Deferred (Plan 3): persist a high-water mark of the largest `now_ms` seen
-(next to the log) and refuse to open or prune with an earlier clock, closing
-the clock-rollback replay above.
+**Clock high-water mark.** `clock-mark` holds the largest `now_ms` the store
+has seen: 8 bytes, `u64` big-endian, 0600, opened and checked like the other
+files (any other size is `InvalidData`, never repaired). It is created when
+missing, also for stores made before it existed, atomically via a temp file
+and rename. `open` writes and `sync_data`s `mark = max(stored, now_ms)`
+BEFORE pruning, and prunes with `mark`, not `now_ms`. `authorize` grants and
+redeems at `max(now_ms, mark)` and sets the token's `expires_at_ms` from it;
+when `now_ms` is newer, the mark is written and synced first, and if that
+fails `authorize` returns `Persist` with no token, no nonce spent and no
+poisoning. This closes the clock-rollback replay: a record pruned under a
+forward jump stays `Expired` after the clock goes back, because redeem time
+never goes below the mark.
+
+Decision: a clock that is behind the mark is clamped up to it, not refused.
+Refusing would brick the agent until the clock is fixed, and clamping already
+closes the replay. The cost: while the clock is behind, approvals and tokens
+expire relative to the later time (they live longer in wall-clock terms by up
+to the gap, never shorter), and a mark pushed far into the future by a bad
+clock stays there (delete `clock-mark` only with the agent stopped and the
+clock fixed; that re-opens the rollback window for records already pruned).
+`warden agent` warns on stderr and audits `clock behind high-water mark`
+(action id `session`) when the clock is more than 30 s behind the mark at
+open.
 
 ## Snapshots and restore
 
