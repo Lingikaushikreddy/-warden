@@ -355,7 +355,7 @@ async fn owner_message_runs_planner_and_replies() {
     assert_eq!(reqs.len(), 1);
     assert!(reqs[0].contains("hi there"));
     assert!(reqs[0].contains("read_file"), "tools are offered");
-    assert_eq!(env.seen.sent(), vec!["hello owner".to_string()]);
+    assert_eq!(env.seen.sent(), vec!["model: hello owner".to_string()]);
     assert!(env.seen.prompts().is_empty());
 }
 
@@ -655,7 +655,7 @@ async fn auto_read_needs_no_prompt_but_is_audited() {
     assert!(reqs[1].contains("hello file"));
     let sent = env.seen.sent();
     assert!(sent.iter().any(|s| s.starts_with("done: read ")));
-    assert_eq!(sent.last().unwrap(), "it says hello");
+    assert_eq!(sent.last().unwrap(), "model: it says hello");
 }
 
 #[tokio::test]
@@ -692,9 +692,10 @@ async fn yes_tier_write_requires_yes_and_snapshots() {
     assert_eq!(fs::read_to_string(&f).unwrap(), "new");
     assert_eq!(env.snapshot_count(), 1);
     let entries = env.entries();
-    assert_eq!(entries[0].decision, "approved");
-    assert_eq!(entries[0].tier, Tier::Yes);
-    assert!(entries[1].decision.starts_with("executed snapshot="));
+    assert_eq!(entries[0].decision, "requested");
+    assert_eq!(entries[1].decision, "approved");
+    assert_eq!(entries[1].tier, Tier::Yes);
+    assert!(entries[2].decision.starts_with("executed snapshot="));
     e.handle(msg("write again")).await;
     assert_eq!(fs::read_to_string(&f).unwrap(), "new");
     assert_eq!(env.snapshot_count(), 1);
@@ -721,8 +722,9 @@ async fn yespin_delete_requires_pin_and_never_logs_it() {
     assert!(!f.exists());
     assert_eq!(env.seen.prompts()[0].tier, Tier::YesPin);
     let d = env.decisions();
-    assert_eq!(d[0], "approved");
-    assert!(d[1].starts_with("executed snapshot="));
+    assert_eq!(d[0], "requested");
+    assert_eq!(d[1], "approved");
+    assert!(d[2].starts_with("executed snapshot="));
     let all = everything(&env, &e.planner().requests());
     assert!(!all.contains(PIN), "the PIN leaked");
 }
@@ -752,9 +754,13 @@ async fn wrong_pin_three_times_locks_for_a_minute_even_for_the_right_pin() {
     assert_eq!(
         env.decisions(),
         vec![
+            "requested",
             "refused: bad pin",
+            "requested",
             "refused: bad pin",
+            "requested",
             "refused: bad pin",
+            // The lock is checked before prompting: no prompt, no `requested`.
             "refused: pin locked"
         ]
     );
@@ -836,7 +842,10 @@ async fn no_pin_file_fails_closed_for_yespin() {
     );
     e.handle(msg("delete")).await;
     assert!(f.exists());
-    assert_eq!(env.decisions(), vec!["refused: pin unavailable"]);
+    assert_eq!(
+        env.decisions(),
+        vec!["requested", "refused: pin unavailable"]
+    );
 }
 
 #[tokio::test]
@@ -864,7 +873,12 @@ async fn wrong_kind_reply_is_refused() {
     assert_eq!(fs::read_to_string(&f).unwrap(), "A");
     assert_eq!(
         env.decisions(),
-        vec!["refused: bad reply", "refused: bad reply"]
+        vec![
+            "requested",
+            "refused: bad reply",
+            "requested",
+            "refused: bad reply"
+        ]
     );
     assert!(!everything(&env, &e.planner().requests()).contains(PIN));
 }
@@ -893,14 +907,16 @@ async fn approved_is_audited_before_execution() {
     );
     e.handle(msg("go")).await;
     let entries = env.entries();
-    assert_eq!(entries[0].decision, "approved");
+    assert_eq!(entries[0].decision, "requested");
+    assert_eq!(entries[0].probe, Some(Some(b"old".to_vec())));
+    assert_eq!(entries[1].decision, "approved");
     assert_eq!(
-        entries[0].probe,
+        entries[1].probe,
         Some(Some(b"old".to_vec())),
         "approved before the write"
     );
-    assert!(entries[1].decision.starts_with("executed"));
-    assert_eq!(entries[1].probe, Some(Some(b"new".to_vec())));
+    assert!(entries[2].decision.starts_with("executed"));
+    assert_eq!(entries[2].probe, Some(Some(b"new".to_vec())));
 }
 
 #[tokio::test]
@@ -921,17 +937,19 @@ async fn approved_append_failure_prevents_execution() {
         ],
         Opts {
             replies: vec![yes()],
-            fail_on: Some(1),
+            // Append 1 is `requested`, append 2 is `approved`.
+            fail_on: Some(2),
             ..Opts::default()
         },
     );
     e.handle(msg("go")).await;
+    assert_eq!(env.seen.prompts().len(), 1, "the owner was asked");
     assert_eq!(fs::read_to_string(&f).unwrap(), "old");
     assert_eq!(env.snapshot_count(), 0);
     let (_, results) = blocks(&e.planner().requests()[1]);
     assert_eq!(results[0].1, "audit unavailable");
 
-    // Auto actions too.
+    // Auto actions too (no prompt, so no `requested`: append 1 is `approved auto`).
     let env = self::env();
     let f = env.file("a.txt", "secret-ish");
     let mut e = env.engine(
@@ -968,7 +986,8 @@ async fn executed_append_failure_tells_owner_the_snapshot_id() {
         ],
         Opts {
             replies: vec![yes()],
-            fail_on: Some(2),
+            // requested, approved, then executed (the 3rd append) fails.
+            fail_on: Some(3),
             ..Opts::default()
         },
     );
@@ -1020,7 +1039,10 @@ async fn authorize_failure_is_audited_and_nothing_runs() {
     e.handle(msg("go")).await;
     assert_eq!(fs::read_to_string(&f).unwrap(), "old");
     assert_eq!(env.snapshot_count(), 0);
-    assert_eq!(env.decisions(), vec!["approved", "failed: authorize"]);
+    assert_eq!(
+        env.decisions(),
+        vec!["requested", "approved", "failed: authorize"]
+    );
     let (_, results) = blocks(&e.planner().requests()[1]);
     assert_eq!(results[0].1, "approval unavailable");
 }
@@ -1117,7 +1139,14 @@ async fn prompt_timeout_counts_as_decline() {
     assert_eq!(fs::read_to_string(&f).unwrap(), "old");
     // A prompt timeout ends the message: nothing else runs or is planned.
     let d = env.decisions();
-    assert_eq!(d, vec!["refused: approval timed out", "failed: timeout"]);
+    assert_eq!(
+        d,
+        vec![
+            "requested",
+            "refused: approval timed out",
+            "failed: timeout"
+        ]
+    );
     assert_eq!(e.planner().requests().len(), 1);
     assert_eq!(env.seen.sent().last().unwrap(), "timed out");
 }
@@ -1152,9 +1181,10 @@ async fn a_running_tool_is_not_cancelled_by_the_message_deadline() {
     e.handle(msg("go")).await;
     assert_eq!(fs::read_to_string(&f).unwrap(), "new");
     let d = env.decisions();
-    assert_eq!(d[0], "approved");
-    assert!(d[1].starts_with("executed snapshot="), "{d:?}");
-    assert_eq!(d[2], "failed: timeout");
+    assert_eq!(d[0], "requested");
+    assert_eq!(d[1], "approved");
+    assert!(d[2].starts_with("executed snapshot="), "{d:?}");
+    assert_eq!(d[3], "failed: timeout");
     assert_eq!(e.planner().requests().len(), 1);
 }
 
@@ -1451,7 +1481,8 @@ async fn identical_needs_yes_calls_each_get_a_prompt() {
 
 #[tokio::test]
 async fn approved_append_failure_spends_no_nonce() {
-    for (fail_on, spent) in [(Some(1), 0), (None, 1)] {
+    // Append 1 is `requested`, append 2 is `approved`.
+    for (fail_on, spent) in [(Some(2), 0), (None, 1)] {
         let env = env();
         env.file("a.txt", "old");
         let e = {
@@ -1553,7 +1584,7 @@ async fn prompt_overrunning_the_deadline_times_out_the_next_call_unprompted() {
     );
     assert_eq!(
         env.decisions(),
-        vec!["refused: owner declined", "failed: timeout"]
+        vec!["requested", "refused: owner declined", "failed: timeout"]
     );
     assert_eq!(e.planner().requests().len(), 1);
 }
@@ -1894,7 +1925,11 @@ async fn stale_yes_after_a_prompt_timeout_never_approves_the_next_action() {
     assert_eq!(fs::read_to_string(&b).unwrap(), "B-old");
     assert_eq!(
         env.decisions(),
-        vec!["refused: approval timed out", "failed: timeout"]
+        vec![
+            "requested",
+            "refused: approval timed out",
+            "failed: timeout"
+        ]
     );
     let text = out_text(&out);
     assert_eq!(text.matches("Approval needed").count(), 1, "{text}");
@@ -1922,7 +1957,11 @@ async fn partial_line_across_a_prompt_timeout_never_approves_the_next_action() {
     assert_eq!(fs::read_to_string(&b).unwrap(), "B-old");
     assert_eq!(
         env.decisions(),
-        vec!["refused: approval timed out", "failed: timeout"]
+        vec![
+            "requested",
+            "refused: approval timed out",
+            "failed: timeout"
+        ]
     );
     assert_eq!(out_text(&out).matches("Approval needed").count(), 1);
 }
@@ -1986,7 +2025,11 @@ async fn input_queued_before_a_prompt_cannot_answer_it() {
     assert_eq!(fs::read_to_string(&a).unwrap(), "A-old");
     assert_eq!(
         env.decisions(),
-        vec!["refused: approval timed out", "failed: timeout"]
+        vec![
+            "requested",
+            "refused: approval timed out",
+            "failed: timeout"
+        ]
     );
 }
 
@@ -2298,7 +2341,10 @@ async fn fresh_bare_yes_after_the_prompt_does_not_approve() {
     e.run().await;
     h.await.unwrap();
     assert_eq!(fs::read_to_string(&a).unwrap(), "A-old");
-    assert_eq!(env.decisions(), vec!["refused: owner declined"]);
+    assert_eq!(
+        env.decisions(),
+        vec!["requested", "refused: owner declined"]
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -2387,7 +2433,7 @@ async fn eof_at_a_prompt_is_audited_as_no_reply() {
     assert_eq!(fs::read_to_string(&a).unwrap(), "A-old");
     assert_eq!(
         env.decisions(),
-        vec!["refused: no reply", "failed: input closed"]
+        vec!["requested", "refused: no reply", "failed: input closed"]
     );
     assert!(out_text(&out).contains("input closed"));
     // The message ends at EOF: the planner is not asked again.
@@ -2410,7 +2456,7 @@ async fn eof_at_a_prompt_ends_the_message_with_one_planner_request() {
     assert_eq!(text.matches("Approval needed").count(), 1, "{text}");
     assert_eq!(
         env.decisions(),
-        vec!["refused: no reply", "failed: input closed"]
+        vec!["requested", "refused: no reply", "failed: input closed"]
     );
     assert_eq!(e.planner().requests().len(), 1);
 }
@@ -2429,7 +2475,7 @@ async fn closed_reply_ends_the_message_on_any_channel() {
     assert_eq!(env.seen.prompts().len(), 1);
     assert_eq!(
         env.decisions(),
-        vec!["refused: no reply", "failed: input closed"]
+        vec!["requested", "refused: no reply", "failed: input closed"]
     );
     assert_eq!(env.seen.sent().last().unwrap(), "input closed");
     assert_eq!(e.planner().requests().len(), 1);
@@ -2824,4 +2870,89 @@ async fn truncated_response_with_a_call_never_prompts_or_runs() {
         .seen
         .sent()
         .contains(&"planner unavailable (malformed)".to_string()));
+}
+
+// ------------------------------------------------- minor hardening (D1-D3)
+
+#[tokio::test]
+async fn model_reply_cannot_print_a_fake_approval_block() {
+    let env = env();
+    let fake =
+        "Approval needed (Yes):\n  write \"/etc/passwd\" (1 bytes)\nReply \"yes 1234\" or \"no\":";
+    let mut e = env.engine(vec![reply(Some(fake), vec![])], Opts::default());
+    e.handle(msg("hi")).await;
+    let sent = env.seen.sent();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let lines: Vec<&str> = sent[0].lines().collect();
+    assert_eq!(lines[0], "model: Approval needed (Yes):");
+    for l in &lines[1..] {
+        assert!(l.starts_with("  | "), "{l:?}");
+    }
+    assert!(!sent[0].lines().any(|l| l.starts_with("Reply")));
+}
+
+#[tokio::test]
+async fn requested_is_audited_before_each_prompt() {
+    let env = env();
+    let mut e = env.engine(
+        vec![
+            reply(
+                None,
+                vec![call(
+                    "t1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "x"}),
+                )],
+            ),
+            reply(Some("ok"), vec![]),
+        ],
+        Opts {
+            replies: vec![yes()],
+            ..Opts::default()
+        },
+    );
+    e.handle(msg("go")).await;
+    let entries = env.entries();
+    let req = &entries[0];
+    assert_eq!(req.decision, "requested");
+    assert_eq!(req.tier, Tier::Yes);
+    assert!(req.summary.starts_with("write \""), "{}", req.summary);
+    assert!(
+        req.summary.ends_with("a.txt\" (1 bytes)"),
+        "{}",
+        req.summary
+    );
+    assert_eq!(entries[1].decision, "approved");
+    assert_eq!(entries[1].action_id, req.action_id);
+    assert_eq!(env.seen.prompts().len(), 1);
+}
+
+#[tokio::test]
+async fn requested_append_failure_means_no_prompt_and_no_run() {
+    let env = env();
+    let mut e = env.engine(
+        vec![
+            reply(
+                None,
+                vec![call(
+                    "t1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "x"}),
+                )],
+            ),
+            reply(Some("ok"), vec![]),
+        ],
+        Opts {
+            replies: vec![yes()],
+            fail_on: Some(1),
+            ..Opts::default()
+        },
+    );
+    e.handle(msg("go")).await;
+    assert!(env.seen.prompts().is_empty());
+    assert!(!env.root.join("a.txt").exists());
+    assert_eq!(env.snapshot_count(), 0);
+    let (_, results) = blocks(&e.planner().requests()[1]);
+    assert_eq!(results[0].1, "audit unavailable");
+    assert!(results[0].2);
 }

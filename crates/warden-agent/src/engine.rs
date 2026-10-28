@@ -261,6 +261,16 @@ pub fn is_approval_shaped(text: &str) -> bool {
     first.eq_ignore_ascii_case("yes") && parts.next().is_some()
 }
 
+/// The model's final text as shown to the owner: `model: ` before the
+/// first line and `  | ` before every later one (the style of prompt
+/// summaries), so model text can never print a line that looks like Warden's
+/// own output, such as an approval block with a `Reply "yes <code>"` line.
+fn model_reply(text: &str) -> String {
+    let mut out = String::from("model: ");
+    out.push_str(&text.replace('\n', "\n  | "));
+    out
+}
+
 /// Would this summary, as displayed, be longer than [`MAX_SUMMARY_CHARS`]?
 fn summary_too_long(summary: &str) -> bool {
     sanitize_for_display(summary).chars().count() > MAX_SUMMARY_CHARS
@@ -283,6 +293,9 @@ fn cap_note(note: &str) -> String {
 /// asked to approve an action `run` would refuse as `OutsideRoot` (a case
 /// variant or an unknown alias spelling of the root); `..` escapes and
 /// symlinked parents pointing out are refused too.
+///
+/// Blocking (it canonicalizes): the engine calls it through
+/// [`Engine::paths_inside_blocking`].
 fn paths_inside(action: &Action, executor: &Executor) -> bool {
     action.capabilities.iter().all(|c| match c {
         Capability::ReadPath(p) | Capability::WritePath(p) | Capability::DeletePath(p) => {
@@ -621,6 +634,16 @@ where
         (self.clock)()
     }
 
+    /// [`paths_inside`] on a blocking thread (it canonicalizes paths). A
+    /// failed task answers `false`, which refuses the action.
+    async fn paths_inside_blocking(&self, action: &Action) -> bool {
+        let exec = Arc::clone(&self.executor);
+        let a = action.clone();
+        tokio::task::spawn_blocking(move || paths_inside(&a, &exec))
+            .await
+            .unwrap_or(false)
+    }
+
     /// The single place `classify` is applied.
     pub(crate) fn decide(&mut self, action: &Action) -> Decision {
         match classify(action, &self.policy) {
@@ -760,7 +783,7 @@ where
                 let mut out = if text.trim().is_empty() {
                     "(no reply)".to_string()
                 } else {
-                    text
+                    model_reply(&text)
                 };
                 if resp.truncated {
                     out.push_str("\n[reply truncated]");
@@ -956,6 +979,7 @@ where
         };
         let action = to_action(&tool, &new_id());
         let decision = self.decide(&action);
+        let inside = decision != Decision::Blocked && self.paths_inside_blocking(&action).await;
         let tier = match decision {
             Decision::Blocked => {
                 return self
@@ -981,7 +1005,7 @@ where
                     )
                     .await;
             }
-            _ if !paths_inside(&action, &self.executor) => {
+            _ if !inside => {
                 // Lexical; the executor still checks canonically. Nothing
                 // outside the root can run, so never ask for consent.
                 let tier = classify(&action, &self.policy);
@@ -1034,6 +1058,14 @@ where
             model_note: note.map(cap_note),
             challenge: self.new_challenge(),
         };
+        // Leave a trace before asking, so a process killed at the prompt
+        // still shows what was asked. No trace, no prompt, no run.
+        if !self
+            .audit(&action.id, &action.summary, tier, "requested")
+            .await
+        {
+            return self.audit_unavailable(&action).await;
+        }
         // Input already waiting cannot be a reply to a prompt not yet shown
         // (it cannot contain the new code either); say so, so typed-ahead
         // chat is not lost silently.
