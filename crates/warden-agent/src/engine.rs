@@ -791,19 +791,18 @@ where
 
         self.sender = inbound.sender;
         let text = Zeroizing::new(inbound.text);
-        if is_approval_shaped(&text) {
-            // Possibly a late approval reply (it may carry the PIN): never
-            // chat, never sent to the planner, never logged. With a code and
-            // something after it, it may hold the PIN: retract it.
-            let retract = text.split_whitespace().count() >= RETRACT_MIN_TOKENS;
-            drop(text);
-            if retract {
-                self.channel.retract_last(&self.sender).await;
-            }
-            self.say("no approval pending").await;
-            return;
-        }
-        if self.is_pin_like(&text).await {
+        // Approval-shaped text is possibly a late approval reply: never chat,
+        // never sent to the planner, never logged. Of it, only `yes <x>` (two
+        // tokens) is checked for the PIN: an owner who forgot the code may
+        // have typed `yes <PIN>`.
+        let shaped = is_approval_shaped(&text);
+        let tokens = text.split_whitespace().count();
+        let pin_like = if shaped {
+            tokens == 2 && self.is_pin_like(&text).await
+        } else {
+            self.is_pin_like(&text).await
+        };
+        if pin_like {
             drop(text);
             self.channel.retract_last(&self.sender).await;
             self.say("that message looks like your PIN; it was not sent")
@@ -815,6 +814,15 @@ where
                 "ignored: pin-like message",
             )
             .await;
+            return;
+        }
+        if shaped {
+            drop(text);
+            // With a code and something after it, it may hold the PIN.
+            if tokens >= RETRACT_MIN_TOKENS {
+                self.channel.retract_last(&self.sender).await;
+            }
+            self.say("no approval pending").await;
             return;
         }
         self.end_message = None;

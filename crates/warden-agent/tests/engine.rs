@@ -91,6 +91,8 @@ struct Seen {
     prompts: Arc<Mutex<Vec<(SenderId, ApprovalPrompt)>>>,
     /// Every `retract_last`, with its sender.
     retracted: Arc<Mutex<Vec<SenderId>>>,
+    /// Set to make `accepts_pin` answer `false` from now on.
+    pin_off: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Seen {
@@ -150,7 +152,7 @@ impl Channel for TestChannel {
     }
 
     fn accepts_pin(&self, _to: &SenderId) -> bool {
-        self.accepts_pin
+        self.accepts_pin && !self.seen.pin_off.load(Ordering::SeqCst)
     }
 
     async fn retract_last(&mut self, to: &SenderId) {
@@ -1475,7 +1477,12 @@ async fn late_pin_after_timeout_never_reaches_planner() {
     assert_eq!(reqs.len(), 1, "the late reply was not sent as chat");
     let all = everything(&env, &reqs);
     assert!(!all.contains(PIN), "the late PIN leaked");
-    assert_eq!(env.seen.sent().last().unwrap(), "no approval pending");
+    // `yes <PIN>` without the code is treated as PIN-like and retracted.
+    assert_eq!(
+        env.seen.sent().last().unwrap(),
+        "that message looks like your PIN; it was not sent"
+    );
+    assert_eq!(env.seen.retracted(), vec![owner()]);
 }
 
 #[tokio::test]
@@ -3176,4 +3183,61 @@ async fn truncated_marker_survives_a_long_reply() {
         );
         assert!(shown.chars().count() <= 4096);
     }
+}
+
+#[tokio::test]
+async fn yes_then_pin_without_code_is_retracted() {
+    let env = env();
+    env.set_pin();
+    let mut e = env.engine(vec![reply(Some("chat"), vec![])], Opts::default());
+    e.handle(msg(&format!("yes {PIN}"))).await;
+    e.handle(msg(&format!("yes\n{PIN}"))).await;
+    assert!(
+        e.planner().requests().is_empty(),
+        "never reaches the planner"
+    );
+    assert_eq!(env.seen.retracted(), vec![owner(), owner()]);
+    assert_eq!(
+        env.seen.sent(),
+        vec!["that message looks like your PIN; it was not sent"; 2]
+    );
+    assert_eq!(env.decisions(), vec!["ignored: pin-like message"; 2]);
+    assert!(!everything(&env, &[]).contains(PIN));
+    // `yes <code>` that is not the PIN is still only "no approval pending".
+    e.handle(msg("yes 4821")).await;
+    assert_eq!(env.seen.retracted().len(), 2);
+    assert_eq!(env.seen.sent().last().unwrap(), "no approval pending");
+}
+
+#[tokio::test]
+async fn pin_gate_is_checked_before_the_pin_lock() {
+    let env = env();
+    env.set_pin();
+    let f = env.file("a.txt", "A");
+    let calls: Vec<ToolCall> = (0..3)
+        .map(|i| call(&format!("t{i}"), "delete_file", path_arg(&f)))
+        .collect();
+    let mut e = env.engine(
+        vec![
+            reply(None, calls),
+            reply(Some("ok"), vec![]),
+            reply(None, vec![call("t9", "delete_file", path_arg(&f))]),
+            reply(Some("ok"), vec![]),
+        ],
+        Opts {
+            replies: vec![yes_pin("000000"), yes_pin("111111"), yes_pin("222222")],
+            ..Opts::default()
+        },
+    );
+    e.handle(msg("delete")).await;
+    assert_eq!(env.decisions().last().unwrap(), "refused: bad pin");
+    // The guard is now locked; the channel stops accepting PINs.
+    env.seen.pin_off.store(true, Ordering::SeqCst);
+    e.handle(msg("delete again")).await;
+    assert!(f.exists());
+    assert_eq!(
+        env.decisions().last().unwrap(),
+        "refused: pin not accepted on this channel"
+    );
+    assert_eq!(env.seen.prompts().len(), 3);
 }

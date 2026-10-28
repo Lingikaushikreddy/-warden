@@ -675,8 +675,12 @@ planner and the executor are wired together.
 - **Retraction of messages that may hold the PIN.** After a message is
   dropped as PIN-like, or as approval-shaped with 3 or more whitespace
   tokens (`yes <code> <PIN>`), the engine calls `retract_last(sender)`.
-  Best effort only; a two-token `yes <code>` or a bare `no` is not
-  retracted.
+  A two-token approval-shaped message (`yes <x>`, any whitespace) is also
+  checked with the PIN-like check (same bounds, constant time); if it holds
+  the PIN (an owner who forgot the code), it is handled as a PIN-like
+  message: retracted, `ignored: pin-like message` audited, never sent to
+  the planner. Best effort only; a bare `yes`/`no` or `yes <code>` that is
+  not the PIN is not retracted.
 - **The truncation marker always survives.** A model reply the provider
   cut off is first cut so that, together with `\n[reply truncated]`, it
   fits in the 4096 characters a channel displays (counting display
