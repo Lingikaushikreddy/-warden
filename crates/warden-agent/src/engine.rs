@@ -549,7 +549,9 @@ where
 {
     /// `home` holds the PIN file (`<home>/pin`, as the CLI writes it). The
     /// executor must have been built for `cfg.root`. `state_dirs` are the
-    /// other directories holding Warden state (audit log, snapshot store).
+    /// other paths holding Warden state (audit log, snapshot store, the
+    /// config file); a file is matched as itself, a directory with
+    /// everything inside it.
     ///
     /// Fails with [`EngineConfigError::UnprotectedHome`] when `home`, the
     /// approver store's home or any of `state_dirs` lies inside `cfg.root`

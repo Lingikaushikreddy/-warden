@@ -7,8 +7,9 @@
 //!
 //! 1. create the data dir (0700); refuse it if it is a symlink, not owned by
 //!    the current user, or writable by group or others;
-//! 2. load the config (`<home>/config.toml` or `--config`); refuse an owner
-//!    other than `local` (the stdio channel's only sender);
+//! 2. load the config (`<home>/config.toml` or `--config`) and resolve its
+//!    canonical path; refuse an owner other than `local` (the stdio
+//!    channel's only sender);
 //! 3. resolve `root`: it must exist, be a directory, not be `/`, and not be
 //!    `$HOME` or an ancestor of it unless `--allow-home-root` (an unset or
 //!    unresolvable `HOME` also needs the flag);
@@ -16,9 +17,15 @@
 //!    named by `api_key_env`, never from the file);
 //! 5. open the audit log (a broken or locked log is refused);
 //! 6. open the approver store and the snapshot store, build the executor
-//!    with the data dir and the snapshot dir protected (the snapshot dir is
-//!    inside the data dir; protecting it too is defense in depth);
-//! 7. `Engine::try_new` (refuses unprotected state dirs inside the root);
+//!    with the data dir, the snapshot dir and the config file protected (the
+//!    snapshot dir is inside the data dir; protecting it too is defense in
+//!    depth). The config file is protected wherever it lives, so even a
+//!    `--config` inside the root can never be read, rewritten or deleted by
+//!    a tool: the agent cannot change its own root or provider. Only the
+//!    file is protected, not its directory, so a config at the top of the
+//!    root does not lock the whole root;
+//! 7. `Engine::try_new` (refuses unprotected state dirs or a config file
+//!    inside the root);
 //! 8. audit `agent session started`, run until stdin closes, audit `agent
 //!    session ended` (best effort), exit 0.
 //!
@@ -98,6 +105,8 @@ struct Parts {
     executor: Executor,
     home: PathBuf,
     snapshots: PathBuf,
+    /// The config file, canonical.
+    config: PathBuf,
 }
 
 pub fn cmd_agent(home: &Path, config: Option<PathBuf>, allow_home_root: bool) -> u8 {
@@ -199,6 +208,15 @@ fn start(home: &Path, config: Option<PathBuf>, allow_home_root: bool) -> Result<
         err!("error: {}", sanitize_for_display(&e.to_string()));
         EXIT_ERROR
     })?;
+    // Canonical, so the executor protects the file itself whatever spelling
+    // (relative, symlinked parent, `/tmp` vs `/private/tmp`) was given.
+    let config_path = fs::canonicalize(&config_path).map_err(|e| {
+        err!(
+            "error: config {} cannot be resolved: {e}",
+            shown(&config_path)
+        );
+        EXIT_ERROR
+    })?;
     if cfg.owner != STDIO_OWNER {
         err!("error: the stdio channel only supports owner = \"local\"; remove `owner` from the config");
         return Err(EXIT_ERROR);
@@ -234,7 +252,7 @@ fn start(home: &Path, config: Option<PathBuf>, allow_home_root: bool) -> Result<
                         err!("error: cannot set up the planner: {e}");
                         EXIT_ERROR
                     })?;
-            run(planner, open_parts(home, &cfg, root)?)
+            run(planner, open_parts(home, &config_path, &cfg, root)?)
         }
         #[cfg(feature = "test-hooks")]
         Provider::Mock { script } => {
@@ -243,14 +261,14 @@ fn start(home: &Path, config: Option<PathBuf>, allow_home_root: bool) -> Result<
                     err!("error: cannot load the planner script: {e}");
                     EXIT_ERROR
                 })?;
-            run(planner, open_parts(home, &cfg, root)?)
+            run(planner, open_parts(home, &config_path, &cfg, root)?)
         }
     }
 }
 
 /// Steps 5-6: the audit log first (a broken log stops everything), then the
 /// approver store, the snapshot store and the executor.
-fn open_parts(home: &Path, cfg: &Config, root: PathBuf) -> Result<Parts, u8> {
+fn open_parts(home: &Path, config: &Path, cfg: &Config, root: PathBuf) -> Result<Parts, u8> {
     let audit = Arc::new(Mutex::new(open_audit(home)?));
     let approvals = ApproverStore::open(home, now_ms()).map_err(|e| {
         err!(
@@ -264,14 +282,14 @@ fn open_parts(home: &Path, cfg: &Config, root: PathBuf) -> Result<Parts, u8> {
         err!("error: cannot open the snapshot store: {e}");
         EXIT_ERROR
     })?;
-    let executor = Executor::new(&root, vec![home.to_path_buf(), snapshots.clone()], store)
-        .map_err(|e| {
-            err!(
-                "error: cannot set up the executor for root {}: {e}",
-                shown(&root)
-            );
-            EXIT_ERROR
-        })?;
+    let protected = vec![home.to_path_buf(), snapshots.clone(), config.to_path_buf()];
+    let executor = Executor::new(&root, protected, store).map_err(|e| {
+        err!(
+            "error: cannot set up the executor for root {}: {e}",
+            shown(&root)
+        );
+        EXIT_ERROR
+    })?;
     // Relative tool paths resolve against the (canonical) root, never the
     // process's working directory, and the system prompt names the root.
     let cwd = root.clone();
@@ -282,6 +300,7 @@ fn open_parts(home: &Path, cfg: &Config, root: PathBuf) -> Result<Parts, u8> {
         executor,
         home: home.to_path_buf(),
         snapshots,
+        config: config.to_path_buf(),
     })
 }
 
@@ -329,6 +348,7 @@ fn run<P: Planner>(planner: P, parts: Parts) -> Result<u8, u8> {
         executor,
         home,
         snapshots,
+        config,
     } = parts;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -358,7 +378,7 @@ fn run<P: Planner>(planner: P, parts: Parts) -> Result<u8, u8> {
             approvals,
             executor,
             home,
-            &[snapshots],
+            &[snapshots, config],
         ) {
             Ok(e) => e,
             Err(e) => {

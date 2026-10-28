@@ -156,6 +156,16 @@ fn agent_runs_a_scripted_conversation_on_stdio() {
 /// Output is read on a thread with [`RUN_TIMEOUT`]: if the agent never
 /// prompts or never exits, the child is killed and the test fails.
 fn answer_prompt(e: &Env, first: &str, answer: impl Fn(&str) -> String) -> (i32, String) {
+    answer_prompt_with(e, &[], first, answer)
+}
+
+/// [`answer_prompt`] with `extra` arguments after `agent`.
+fn answer_prompt_with(
+    e: &Env,
+    extra: &[&std::ffi::OsStr],
+    first: &str,
+    answer: impl Fn(&str) -> String,
+) -> (i32, String) {
     let re = regex::Regex::new(r#"Reply "yes (\d{4})"#).unwrap();
     let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("warden"))
         .env_remove(KEY_VAR)
@@ -165,6 +175,7 @@ fn answer_prompt(e: &Env, first: &str, answer: impl Fn(&str) -> String) -> (i32,
         .arg("--home")
         .arg(&e.home)
         .arg("agent")
+        .args(extra)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -811,4 +822,47 @@ fn relative_paths_resolve_against_the_root_not_the_process_cwd() {
         2,
         "{d:?}"
     );
+}
+
+// ------------------------------------------------- final fix wave
+
+/// A `--config` inside the root is protected: an approved write_file to it
+/// is refused by the executor, and the config is unchanged. Reads of it are
+/// refused too.
+#[test]
+fn agent_config_inside_the_root_cannot_be_rewritten() {
+    let e = Env::new();
+    e.mock(&e.root, json!([]));
+    let original = fs::read_to_string(e.home.join("config.toml")).unwrap();
+    let cfg = e.root.join("warden.toml");
+    fs::rename(e.home.join("config.toml"), &cfg).unwrap();
+    let script = json!([
+        {"text": "loosening my policy", "calls": [
+            {"id": "t1", "name": "write_file",
+             "args": {"path": "warden.toml", "content": "root = \"/\"\n"}},
+            {"id": "t2", "name": "read_file", "args": {"path": "warden.toml"}}
+        ]},
+        {"text": "all done"}
+    ]);
+    fs::write(
+        e.base.join("script.json"),
+        serde_json::to_vec(&script).unwrap(),
+    )
+    .unwrap();
+    let (code, text) = answer_prompt_with(
+        &e,
+        &["--config".as_ref(), cfg.as_os_str()],
+        "rewrite your config\n",
+        |c| format!("yes {c}\n"),
+    );
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(fs::read_to_string(&cfg).unwrap(), original, "{text}");
+    let d = e.decisions();
+    assert_eq!(
+        d.iter().filter(|x| *x == "failed: Protected").count(),
+        2,
+        "{d:?}"
+    );
+    assert!(!d.iter().any(|x| x.starts_with("executed")), "{d:?}");
+    assert!(text.contains("all done"), "{text}");
 }
