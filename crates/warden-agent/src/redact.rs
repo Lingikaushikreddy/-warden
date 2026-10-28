@@ -81,8 +81,9 @@
 //! `sk-ant-<letters><2 digits>-...`) match anywhere, even mid-word, so chains
 //! of keys are caught. The variable-length ones that also occur inside
 //! ordinary words (`sk-`, `sk_/rk_live_/test_`, `hf_`, `glpat-`, `xapp-`,
-//! `xox?-`, `github_pat_`) need a left boundary: start of text or a char that
-//! is not a letter or digit (`_`, `-`, quotes, `=`, `(` all count), so
+//! `xox?-`, `github_pat_`, and Telegram bot tokens
+//! `<8-10 digits>:<35 chars>`) need a left boundary: start of text or a char
+//! that is not a letter or digit (`_`, `-`, quotes, `=`, `(` all count), so
 //! `risk-assessment-for-the-quarter` and `network_test_connectivitycheck`
 //! are left alone. A bounded key glued to an unbounded one
 //! (`AKIA...EXAMPLEsk-...`) is caught on the next pass, after the first
@@ -280,6 +281,7 @@ fn build_patterns() -> Patterns {
             r"|xapp-[A-Za-z0-9-]{10,}",
             r"|xox[abprs]-[A-Za-z0-9-]{10,}",
             r"|github_pat_[A-Za-z0-9_]{22,}",
+            r"|[0-9]{8,10}:[A-Za-z0-9_-]{35}",
             r")",
             r"|sk-ant-[a-z]+[0-9]{2}-[A-Za-z0-9_-]{16,}",
             r"|gh[pousr]_[A-Za-z0-9]{36}",
@@ -890,10 +892,11 @@ fn redact_pass(input: &str, report: &mut RedactionReport) -> Option<String> {
 
     let s = replace_simple(input, &p.pem, "private_key", report)?;
     let s = replace_simple(&s, &p.jwt, "jwt", report)?;
-    // Every key starts with an ASCII letter and the boundary char `lb` never
-    // is one, so a match that starts with anything else carries `lb` first.
+    // Every key starts with an ASCII letter or digit (a Telegram bot token
+    // starts with its bot id) and the boundary char `lb` is never a letter or
+    // digit, so a match that starts with anything else carries `lb` first.
     let s = rewrite_found(&s, &p.api_key, "api_key", report, |m, out| {
-        if let Some(c) = m.chars().next().filter(|c| !c.is_ascii_alphabetic()) {
+        if let Some(c) = m.chars().next().filter(|c| !c.is_ascii_alphanumeric()) {
             out.push(c);
         }
         push_placeholder(out, "api_key");

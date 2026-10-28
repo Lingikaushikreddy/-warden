@@ -1268,3 +1268,44 @@ fn new_secret_words_false_positive_guards() {
     // `pass` only as a glued fragment is not a word.
     assert_eq!(out("token_bypass_count: 3"), "token_bypass_count: 3");
 }
+
+#[test]
+fn telegram_bot_token_is_redacted() {
+    let tail = "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawQ";
+    assert_eq!(tail.len(), 35);
+    for c in [
+        format!("123456789:{tail}"),
+        format!("12345678:{tail}"),
+        format!("1234567890:{tail}"),
+    ] {
+        let (r, rep) = redact(&format!("key {c} end"));
+        assert_eq!(r.as_str(), "key [REDACTED:api_key] end", "{c}");
+        assert_eq!(rep.kinds, vec!["api_key"]);
+        assert_eq!(rep.count, 1);
+        // At the start of the text and after a boundary char.
+        assert_eq!(out(&c), "[REDACTED:api_key]", "{c}");
+        assert_eq!(
+            out(&format!("bot{c}")),
+            format!("bot{c}"),
+            "needs a boundary"
+        );
+        assert_eq!(
+            out(&format!("url=/bot/{c}/x")),
+            "url=/bot/[REDACTED:api_key]/x"
+        );
+    }
+}
+
+#[test]
+fn ratios_and_times_are_not_redacted() {
+    let short = "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw";
+    assert_eq!(short.len(), 34);
+    for line in [
+        "meet at 10:30".to_string(),
+        "ratio 12345678:abc".to_string(),
+        format!("x 123456789:{short}"),
+        format!("x 1234567:{short}Q"),
+    ] {
+        assert_eq!(out(&line), line, "{line}");
+    }
+}

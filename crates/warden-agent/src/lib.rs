@@ -14,6 +14,7 @@ pub mod channel;
 pub mod config;
 pub mod engine;
 pub mod exec;
+mod http;
 pub mod planner;
 pub mod redact;
 pub mod tools;
