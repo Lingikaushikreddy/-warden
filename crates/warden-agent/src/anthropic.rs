@@ -356,9 +356,16 @@ fn parse_response(body: &[u8]) -> Result<PlanResponse, PlannerError> {
             _ => {} // thinking, server tools, ...: ignored
         }
     }
-    let truncated = v.get("stop_reason").and_then(Value::as_str) == Some("max_tokens");
+    let stop = v.get("stop_reason").and_then(Value::as_str);
+    let truncated = stop == Some("max_tokens");
     if truncated && !calls.is_empty() {
         return Err(PlannerError::Malformed("response truncated".into()));
+    }
+    // Tool calls are trusted to be complete only under a stop reason known
+    // to mean the turn ended normally. Anything else (null, a context-window
+    // stop, a reason added later) may mean a cut-off call: fail closed.
+    if !calls.is_empty() && !matches!(stop, Some("tool_use" | "end_turn" | "stop_sequence")) {
+        return Err(PlannerError::Malformed("unexpected stop reason".into()));
     }
     let text = (saw_text && !text.is_empty()).then_some(text);
     Ok(PlanResponse {

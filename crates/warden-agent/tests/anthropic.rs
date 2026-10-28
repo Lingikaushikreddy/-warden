@@ -160,7 +160,7 @@ async fn parses_text_and_tool_use() {
     let server = MockServer::start().await;
     mount_ok(
         &server,
-        json!({"content": [
+        json!({"stop_reason": "tool_use", "content": [
             {"type": "text", "text": "Let me look. "},
             {"type": "tool_use", "id": "toolu_01A", "name": "read_file", "input": {"path": "a.txt"}},
             {"type": "text", "text": "Then delete."},
@@ -197,7 +197,7 @@ async fn ignores_unknown_block_types() {
     let server = MockServer::start().await;
     mount_ok(
         &server,
-        json!({"content": [
+        json!({"stop_reason": "tool_use", "content": [
             {"type": "thinking", "thinking": "hmm", "signature": "x"},
             {"type": "redacted_thinking", "data": "zzz"},
             {"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {}},
@@ -239,7 +239,7 @@ async fn bad_tool_id_is_malformed() {
     let id64 = "A".repeat(64);
     mount_ok(
         &server,
-        json!({"content": [{"type": "tool_use", "id": id64, "name": "list_dir", "input": {}}]}),
+        json!({"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": id64, "name": "list_dir", "input": {}}]}),
     )
     .await;
     assert!(planner(&server.uri()).plan(&request()).await.is_ok());
@@ -251,7 +251,7 @@ async fn too_many_tool_use_blocks_is_malformed() {
     let server = MockServer::start().await;
     mount_ok(
         &server,
-        json!({"content": (0..64).map(block).collect::<Vec<_>>()}),
+        json!({"stop_reason": "tool_use", "content": (0..64).map(block).collect::<Vec<_>>()}),
     )
     .await;
     assert_eq!(
@@ -803,15 +803,18 @@ async fn max_tokens_with_text_only_is_returned_flagged() {
 }
 
 #[tokio::test]
-async fn other_stop_reasons_are_unchanged_and_unknown_ones_ignored() {
+async fn known_stop_reasons_accept_calls_and_unknown_ones_only_text() {
     let text = json!([{"type": "text", "text": "hi"}]);
     let with_call = json!([{"type": "text", "text": "hi"}, tool_use_block()]);
     for (reason, content, calls) in [
         (json!("end_turn"), text.clone(), 0),
         (json!("tool_use"), with_call.clone(), 1),
         (json!("stop_sequence"), text.clone(), 0),
-        (json!("some_future_reason"), with_call.clone(), 1),
-        (json!(null), with_call.clone(), 1),
+        (json!("end_turn"), with_call.clone(), 1),
+        (json!("stop_sequence"), with_call.clone(), 1),
+        // Unknown or missing reasons are fine for text-only replies.
+        (json!("some_future_reason"), text.clone(), 0),
+        (json!(null), text.clone(), 0),
         (json!(7), text.clone(), 0),
     ] {
         let server = MockServer::start().await;
@@ -820,5 +823,27 @@ async fn other_stop_reasons_are_unchanged_and_unknown_ones_ignored() {
         assert_eq!(out.text.as_deref(), Some("hi"), "{reason}");
         assert_eq!(out.calls.len(), calls, "{reason}");
         assert!(!out.truncated, "{reason}");
+    }
+}
+
+#[tokio::test]
+async fn calls_under_an_unknown_or_missing_stop_reason_are_malformed() {
+    let with_call = json!([{"type": "text", "text": "hi"}, tool_use_block()]);
+    for reason in [
+        json!("some_future_reason"),
+        json!("model_context_window_exceeded"),
+        json!("pause_turn"),
+        json!("refusal"),
+        json!(null),
+        json!(7),
+    ] {
+        let server = MockServer::start().await;
+        mount_ok(&server, body_with(reason.clone(), with_call.clone())).await;
+        let err = planner(&server.uri()).plan(&request()).await.unwrap_err();
+        assert_eq!(
+            err,
+            PlannerError::Malformed("unexpected stop reason".into()),
+            "{reason}"
+        );
     }
 }
