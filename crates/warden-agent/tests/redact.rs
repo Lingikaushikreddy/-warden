@@ -1284,11 +1284,10 @@ fn telegram_bot_token_is_redacted() {
         assert_eq!(rep.count, 1);
         // At the start of the text and after a boundary char.
         assert_eq!(out(&c), "[REDACTED:api_key]", "{c}");
-        assert_eq!(
-            out(&format!("bot{c}")),
-            format!("bot{c}"),
-            "needs a boundary"
-        );
+        // Glued to the letters `bot` (the Bot API URL path): `bot` is kept.
+        assert_eq!(out(&format!("bot{c}")), "bot[REDACTED:api_key]", "{c}");
+        // Glued to any other letter: needs a boundary.
+        assert_eq!(out(&format!("x{c}")), format!("x{c}"), "{c}");
         assert_eq!(
             out(&format!("url=/bot/{c}/x")),
             "url=/bot/[REDACTED:api_key]/x"
@@ -1308,4 +1307,32 @@ fn ratios_and_times_are_not_redacted() {
     ] {
         assert_eq!(out(&line), line, "{line}");
     }
+}
+
+#[test]
+fn telegram_token_in_bot_api_url_is_redacted() {
+    let secret = "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawQ";
+    let line = format!("curl https://api.telegram.org/bot123456789:{secret}/getMe");
+    let (r, rep) = redact(&line);
+    assert!(
+        r.as_str().contains("/bot[REDACTED:api_key]/getMe"),
+        "{}",
+        r.as_str()
+    );
+    assert!(!r.as_str().contains(secret), "{}", r.as_str());
+    assert!(!r.as_str().contains("123456789:"), "{}", r.as_str());
+    assert_eq!(
+        r.as_str(),
+        "curl https://api.telegram.org/bot[REDACTED:api_key]/getMe"
+    );
+    assert_eq!(rep.kinds, vec!["api_key"]);
+    assert_eq!(rep.count, 1);
+    // Idempotent.
+    assert_eq!(out(r.as_str()), r.as_str());
+    // Two URLs on one line, and the file-download path shape.
+    let two = format!("a/bot1234567890:{secret}/sendMessage b/file/bot12345678:{secret}/doc.pdf");
+    assert_eq!(
+        out(&two),
+        "a/bot[REDACTED:api_key]/sendMessage b/file/bot[REDACTED:api_key]/doc.pdf"
+    );
 }

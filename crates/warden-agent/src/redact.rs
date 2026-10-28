@@ -91,6 +91,10 @@
 //! kebab name with an `sk-` word followed by 20+ chars is still
 //! over-redacted (`use-sk-learn-pipeline-configuration-v2` becomes
 //! `use-[REDACTED:api_key]`); it is not special-cased.
+//! A Telegram bot token is also matched right after the letters `bot`, its
+//! place in a Bot API URL (`https://api.telegram.org/bot<token>/getMe`);
+//! `bot` is kept (`/bot[REDACTED:api_key]/getMe`). Because any `bot` counts,
+//! `robot<token>` is redacted too.
 //!
 //! Fail closed: `redact` repeats its passes until the text stops changing
 //! (a placeholder can create a new boundary for a later pattern). If it has
@@ -287,6 +291,9 @@ fn build_patterns() -> Patterns {
             r"|gh[pousr]_[A-Za-z0-9]{36}",
             r"|(?:AKIA|ASIA)[0-9A-Z]{16}",
             r"|AIza[0-9A-Za-z_-]{35}",
+            // A Telegram bot token in a Bot API URL path follows the letters
+            // `bot` (`/bot<id>:<secret>/getMe`), so it has no boundary.
+            r"|bot[0-9]{8,10}:[A-Za-z0-9_-]{35}",
         )),
         url_userinfo: re(r#"([A-Za-z][A-Za-z0-9+.-]*://[^\s/:@"'<>]*:)([^\s/@"'<>]+)@"#),
         bearer: re(&format!(
@@ -895,8 +902,12 @@ fn redact_pass(input: &str, report: &mut RedactionReport) -> Option<String> {
     // Every key starts with an ASCII letter or digit (a Telegram bot token
     // starts with its bot id) and the boundary char `lb` is never a letter or
     // digit, so a match that starts with anything else carries `lb` first.
+    // No key starts with `bot`, so such a match is the Bot API URL form:
+    // `bot` is kept and only the token replaced.
     let s = rewrite_found(&s, &p.api_key, "api_key", report, |m, out| {
-        if let Some(c) = m.chars().next().filter(|c| !c.is_ascii_alphanumeric()) {
+        if m.starts_with("bot") {
+            out.push_str("bot");
+        } else if let Some(c) = m.chars().next().filter(|c| !c.is_ascii_alphanumeric()) {
             out.push(c);
         }
         push_placeholder(out, "api_key");

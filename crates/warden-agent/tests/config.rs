@@ -476,3 +476,31 @@ fn telegram_bot_token_env_must_be_a_variable_name() {
         assert!(!e.to_string().contains("AKIA"), "{e}");
     }
 }
+
+#[test]
+fn bot_token_env_must_differ_from_api_key_env() {
+    // Against the default api_key_env.
+    let e = tg("owner_ids = [42]\nbot_token_env = \"ANTHROPIC_API_KEY\"\n").unwrap_err();
+    assert!(
+        matches!(e, ConfigError::Invalid("telegram.bot_token_env", _)),
+        "{e:?}"
+    );
+    assert!(e.to_string().contains("api_key_env"), "{e}");
+    // Against a configured api_key_env.
+    let d = tempfile::tempdir().unwrap();
+    let p = write(
+        d.path(),
+        "root = \"/srv\"\napi_key_env = \"MY_KEY\"\n[telegram]\nowner_ids = [42]\nbot_token_env = \"MY_KEY\"\n",
+    );
+    let e = Config::load(&p).unwrap_err();
+    assert!(
+        matches!(e, ConfigError::Invalid("telegram.bot_token_env", _)),
+        "{e:?}"
+    );
+    // A configured api_key_env frees the default name.
+    let p = write(
+        d.path(),
+        "root = \"/srv\"\napi_key_env = \"MY_KEY\"\n[telegram]\nowner_ids = [42]\nbot_token_env = \"ANTHROPIC_API_KEY\"\n",
+    );
+    assert!(Config::load(&p).is_ok());
+}

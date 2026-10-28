@@ -315,7 +315,9 @@ fn check_env_name(field: &'static str, s: &str) -> Result<(), ConfigError> {
 }
 
 /// Parse the `[telegram]` table. Secret-looking keys were refused before.
-fn telegram(t: &toml::Table) -> Result<TelegramConfig, ConfigError> {
+/// `api_key_env` is the effective planner key variable, which the bot token
+/// variable must differ from.
+fn telegram(t: &toml::Table, api_key_env: &str) -> Result<TelegramConfig, ConfigError> {
     for k in t.keys() {
         if !TELEGRAM_FIELDS.iter().any(|(f, _)| f == k) {
             return Err(ConfigError::UnknownField(format!(
@@ -362,6 +364,14 @@ fn telegram(t: &toml::Table) -> Result<TelegramConfig, ConfigError> {
         Some(_) => return Err(ConfigError::WrongType(ENV)),
     };
     check_env_name(ENV, &bot_token_env)?;
+    // The bot token goes into a URL path sent to the Telegram API; the same
+    // variable would send the planner's API key there.
+    if bot_token_env == api_key_env {
+        return Err(ConfigError::Invalid(
+            ENV,
+            "must name a different environment variable than `api_key_env`",
+        ));
+    }
 
     let allow_pin_approvals = match t.get("allow_pin_approvals") {
         None => false,
@@ -485,7 +495,10 @@ impl Config {
         // its error is reported without detail all the same.
         let raw: Raw = table.try_into().map_err(|_| ConfigError::Syntax(None))?;
         let mut config = Config::from_raw(raw)?;
-        config.telegram = telegram.as_ref().map(self::telegram).transpose()?;
+        config.telegram = telegram
+            .as_ref()
+            .map(|t| self::telegram(t, &config.api_key_env))
+            .transpose()?;
         Ok(config)
     }
 
