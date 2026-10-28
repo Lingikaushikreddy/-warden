@@ -527,7 +527,7 @@ agent engine on stdin/stdout. The pieces, each with its own section here:
   `redact.rs` "Known limits"); it will miss unknown secret formats, and the
   remote planner sees whatever it misses.
 - **Consent and the PIN**: see "Channel" (per-prompt challenge code) and
-  "Engine" (PIN lockout in memory, late replies, PIN-like chat).
+  "Engine" (persisted PIN lockout, late replies, PIN-like chat).
 - **Approvals and execution**: see "Agent approver store" and "Agent
   executor".
 
@@ -556,14 +556,26 @@ planner and the executor are wired together.
   unavailable`). The PIN is held in `Zeroizing<String>` and dropped right
   after the check; it never appears in the audit log, tool results,
   channel messages or error text.
-- **PIN lockout is in memory only.** Three consecutive bad PINs lock
-  PIN-tier approvals for 60 s of the injected wall clock. The lock is
-  checked BEFORE prompting: while locked, a `YesPin` action is refused
-  without a prompt (`refused: pin locked`, owner told `PIN approvals locked
-  for <n> s`) and the PIN file is not read; a correct PIN resets the
-  count. A restart clears the lockout, so it limits online guessing
-  through one running engine, not offline guessing of the PIN file (see
-  "CLI PIN").
+- **PIN lockout is persisted and escalates.** Three consecutive bad PINs
+  lock PIN-tier approvals for `60_000 << level` ms of the injected wall
+  clock, capped at a day (`PIN_LOCK_MAX_MS = 86_400_000`); `level` rises by 1
+  on each lock, so repeated lockouts last 60 s, 120 s, 240 s and so on. A
+  correct PIN resets the count and the level. The lock is checked BEFORE
+  prompting: while locked, a `YesPin` action is refused without a prompt
+  (`refused: pin locked`, owner told `PIN approvals locked for <n> s`) and
+  the PIN file is not read. The state (`failures`, `level`,
+  `locked_until_ms`, 16 bytes) lives in `<home>/pin-guard`; `Engine::try_new`
+  loads it (missing means no lockout) and refuses to start
+  (`EngineConfigError::PinGuardState`) if it is malformed, a symlink, not a
+  regular file or has group/other permission bits. It is rewritten
+  atomically (0600 temp file, `sync_all`, rename, directory fsync) after
+  every PIN check, so a restart does not clear a lockout. If the write
+  fails, PIN-tier approvals are refused (`refused: pin unavailable`, no
+  prompt) until restart and the owner is told `warning: cannot save the PIN
+  lockout; PIN approvals are disabled until restart`. Limits: it limits
+  online guessing through the engine, not offline guessing of the PIN file
+  (see "CLI PIN"); anyone who can write the PIN home can reset it, and the
+  lock follows the wall clock, so a clock moved forward ends it early.
 - **Consent only for runnable actions.** Before any prompt, an action
   with a path capability the executor would refuse as outside the root is
   refused. The engine asks the executor itself

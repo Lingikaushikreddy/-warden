@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,7 +18,7 @@ use warden_agent::authorize::ApproverStore;
 use warden_agent::channel::{
     sanitize_for_display, ApprovalPrompt, ApprovalReply, Channel, Inbound, SenderId, StdioChannel,
 };
-use warden_agent::engine::{AuditSink, Engine, EngineConfig};
+use warden_agent::engine::{AuditSink, Engine, EngineConfig, PIN_GUARD_FILE};
 use warden_agent::exec::Executor;
 use warden_agent::planner::{MockPlanner, PlanRequest, PlanResponse, Planner, PlannerError};
 use warden_agent::tools::ToolCall;
@@ -281,6 +282,14 @@ impl Env {
     }
 
     fn engine_with<P: Planner>(&self, planner: P, o: Opts) -> Engine<P, TestChannel, RecSink> {
+        self.try_engine_with(planner, o).unwrap()
+    }
+
+    fn try_engine_with<P: Planner>(
+        &self,
+        planner: P,
+        o: Opts,
+    ) -> Result<Engine<P, TestChannel, RecSink>, warden_agent::engine::EngineConfigError> {
         let mut store = ApproverStore::open(&self.home, NOW).unwrap();
         (o.store_hook)(&mut store);
         let snapshots = SnapshotStore::open(&self.snaps).unwrap();
@@ -316,8 +325,7 @@ impl Env {
             self.home.clone(),
             std::slice::from_ref(&self.snaps),
         )
-        .unwrap()
-        .with_clock(Box::new(move || clock.load(Ordering::SeqCst)))
+        .map(|e| e.with_clock(Box::new(move || clock.load(Ordering::SeqCst))))
     }
 
     fn engine(
@@ -862,6 +870,139 @@ async fn pin_lock_expires_with_the_injected_clock() {
     e.handle(msg("delete")).await;
     assert!(!f.exists());
     assert_eq!(env.seen.prompts().len(), 4);
+}
+
+#[tokio::test]
+async fn pin_lockout_survives_an_engine_restart() {
+    let env = env();
+    env.set_pin();
+    let f = env.file("a.txt", "A");
+    let calls: Vec<ToolCall> = (0..3)
+        .map(|i| call(&format!("t{i}"), "delete_file", path_arg(&f)))
+        .collect();
+    {
+        let mut e = env.engine(
+            vec![reply(None, calls), reply(Some("ok"), vec![])],
+            Opts {
+                replies: vec![yes_pin("000000"), yes_pin("111111"), yes_pin("222222")],
+                ..Opts::default()
+            },
+        );
+        e.handle(msg("delete")).await;
+    }
+    assert_eq!(env.seen.prompts().len(), 3);
+    let guard = fs::read(env.home.join(PIN_GUARD_FILE)).unwrap();
+    assert_eq!(guard.len(), 16);
+    // A new engine on the same home (a restart) is still locked.
+    let mut e = env.engine(
+        vec![
+            reply(None, vec![call("t9", "delete_file", path_arg(&f))]),
+            reply(Some("locked"), vec![]),
+        ],
+        Opts {
+            replies: vec![yes_pin(PIN)],
+            ..Opts::default()
+        },
+    );
+    env.advance(10_000);
+    e.handle(msg("delete")).await;
+    assert!(f.exists());
+    assert_eq!(env.seen.prompts().len(), 3, "no prompt while locked");
+    assert_eq!(env.decisions().last().unwrap(), "refused: pin locked");
+    assert!(env
+        .seen
+        .sent()
+        .contains(&"PIN approvals locked for 50 s".to_string()));
+}
+
+#[tokio::test]
+async fn corrupt_pin_guard_file_refuses_engine_start() {
+    use warden_agent::engine::EngineConfigError;
+    let env = env();
+    let p = env.home.join(PIN_GUARD_FILE);
+    for bad in [&b""[..], &[0u8; 15][..], &[0u8; 17][..], &[7u8; 4096][..]] {
+        fs::write(&p, bad).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        let r = env.try_engine_with(MockPlanner::scripted(vec![]), Opts::default());
+        assert_eq!(
+            r.err(),
+            Some(EngineConfigError::PinGuardState(io::ErrorKind::InvalidData)),
+            "{} bytes",
+            bad.len()
+        );
+    }
+    // A symlink is refused too, even to a well-formed file.
+    let real = env.home.join("real");
+    fs::write(&real, [0u8; 16]).unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(&p).unwrap();
+    std::os::unix::fs::symlink(&real, &p).unwrap();
+    let r = env.try_engine_with(MockPlanner::scripted(vec![]), Opts::default());
+    assert_eq!(
+        r.err(),
+        Some(EngineConfigError::PinGuardState(io::ErrorKind::InvalidData))
+    );
+    // A well-formed file starts fine.
+    fs::remove_file(&p).unwrap();
+    fs::rename(&real, &p).unwrap();
+    assert!(env
+        .try_engine_with(MockPlanner::scripted(vec![]), Opts::default())
+        .is_ok());
+}
+
+#[tokio::test]
+async fn group_writable_pin_guard_file_is_refused() {
+    use warden_agent::engine::EngineConfigError;
+    let env = env();
+    let p = env.home.join(PIN_GUARD_FILE);
+    fs::write(&p, [0u8; 16]).unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o620)).unwrap();
+    let r = env.try_engine_with(MockPlanner::scripted(vec![]), Opts::default());
+    assert_eq!(
+        r.err(),
+        Some(EngineConfigError::PinGuardState(
+            io::ErrorKind::PermissionDenied
+        ))
+    );
+}
+
+#[tokio::test]
+async fn unwritable_pin_guard_disables_pin_approvals() {
+    let env = env();
+    env.set_pin();
+    let f = env.file("a.txt", "A");
+    let del = |id: &str| reply(None, vec![call(id, "delete_file", path_arg(&f))]);
+    let mut e = env.engine(
+        vec![
+            del("t1"),
+            reply(Some("bad"), vec![]),
+            del("t2"),
+            reply(Some("refused"), vec![]),
+        ],
+        Opts {
+            replies: vec![yes_pin("000000"), yes_pin(PIN)],
+            ..Opts::default()
+        },
+    );
+    fs::set_permissions(&env.home, fs::Permissions::from_mode(0o500)).unwrap();
+    e.handle(msg("delete")).await;
+    e.handle(msg("delete")).await;
+    fs::set_permissions(&env.home, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(f.exists());
+    assert_eq!(
+        env.decisions(),
+        vec![
+            "requested",
+            "refused: bad pin",
+            // Disabled before prompting: no prompt, no `requested`.
+            "refused: pin unavailable",
+        ]
+    );
+    assert_eq!(env.seen.prompts().len(), 1);
+    let warning = "warning: cannot save the PIN lockout; PIN approvals are disabled until restart";
+    assert!(env.seen.sent().contains(&warning.to_string()));
+    let (_, results) = blocks(&e.planner().requests()[3]);
+    assert_eq!(results.last().unwrap().1, "pin unavailable");
 }
 
 #[tokio::test]

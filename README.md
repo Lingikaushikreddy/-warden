@@ -46,7 +46,8 @@ anything that matters.
   prompt appears approves it. Anything else, including a bare `yes`, is a
   no. A prompt that times out, or input that closes, ends the message.
 - **PIN.** Deletes need the PIN set with `warden init-pin`. Three wrong PINs
-  lock PIN approvals for 60 seconds (in memory only). A chat message that
+  lock PIN approvals for 60 seconds, doubling on each further lockout (at
+  most a day); the lockout survives a restart. A chat message that
   looks like your PIN is dropped instead of being sent to the model.
 - **Signed, single-use approvals.** Inside the engine, each consent becomes
   a signed, expiring, single-use approval whose nonce is recorded on disk

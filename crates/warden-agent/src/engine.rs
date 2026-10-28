@@ -68,12 +68,20 @@ use crate::channel::{
 use crate::exec::{ExecError, Executor, READ_OVERLAP_BYTES};
 use crate::planner::{Block, PlanRequest, Planner, PlannerError, Role, ToolId, Turn};
 use crate::redact::{redact, Redacted};
+use crate::state;
 use crate::tools::{parse_call, to_action, tool_specs, Tool, ToolCall, ToolError};
 
 /// Consecutive bad PINs that lock PIN-tier approvals.
 const PIN_MAX_FAILURES: u32 = 3;
-/// How long a PIN lockout lasts.
+/// How long the first PIN lockout lasts (each further one doubles).
 const PIN_LOCK_MS: u64 = 60_000;
+/// Longest PIN lockout.
+pub const PIN_LOCK_MAX_MS: u64 = 86_400_000;
+/// File name of the persisted [`PinGuard`] inside the PIN home.
+pub const PIN_GUARD_FILE: &str = "pin-guard";
+/// Told to the owner when the PIN lockout could not be saved.
+const PIN_GUARD_UNSAVED: &str =
+    "warning: cannot save the PIN lockout; PIN approvals are disabled until restart";
 /// At most one `ignored: non-owner` audit entry per this many milliseconds.
 const NON_OWNER_AUDIT_EVERY_MS: u64 = 60_000;
 /// How many recent challenge codes a new one must differ from.
@@ -220,6 +228,10 @@ pub enum EngineConfigError {
     /// audit log, snapshot store) lies inside the root and is not protected
     /// by the executor, so an approved write could edit it.
     UnprotectedHome(PathBuf),
+    /// `<home>/pin-guard` (the persisted PIN lockout) is malformed,
+    /// insecure (a symlink, not a regular file, group/other permission
+    /// bits) or unreadable.
+    PinGuardState(io::ErrorKind),
 }
 
 impl fmt::Display for EngineConfigError {
@@ -230,6 +242,12 @@ impl fmt::Display for EngineConfigError {
                 "state directory {} is inside the root and not protected by the executor",
                 p.display()
             ),
+            EngineConfigError::PinGuardState(k) => {
+                write!(
+                    f,
+                    "cannot load the PIN lockout state ({PIN_GUARD_FILE}): {k}"
+                )
+            }
         }
     }
 }
@@ -329,18 +347,53 @@ pub enum PinState {
     Locked { until_ms: u64 },
 }
 
-/// In-memory PIN rate limit: 3 consecutive bad PINs lock PIN-tier
-/// approvals for 60 s; a correct PIN resets the count. Not persisted, so a
-/// restart clears it.
-#[derive(Debug, Default)]
+/// PIN rate limit: 3 consecutive bad PINs lock PIN-tier approvals. A lock
+/// lasts `60_000 << level` ms, capped at [`PIN_LOCK_MAX_MS`]; `level` rises
+/// by 1 on each lock, so repeated lockouts escalate (60 s, 120 s, 240 s …,
+/// at most a day). A correct PIN resets the count and the level. The engine
+/// persists it in `<home>/pin-guard` ([`PIN_GUARD_FILE`]) so a restart does
+/// not clear it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PinGuard {
     failures: u32,
+    level: u32,
     locked_until: Option<u64>,
 }
 
 impl PinGuard {
     pub fn new() -> PinGuard {
         PinGuard::default()
+    }
+
+    /// `failures` (u32 BE) || `level` (u32 BE) || `locked_until_ms` (u64 BE,
+    /// 0 = not locked).
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[..4].copy_from_slice(&self.failures.to_be_bytes());
+        b[4..8].copy_from_slice(&self.level.to_be_bytes());
+        b[8..].copy_from_slice(&self.locked_until.unwrap_or(0).to_be_bytes());
+        b
+    }
+
+    /// The inverse of [`PinGuard::to_bytes`]; `None` unless `b` is exactly
+    /// 16 bytes.
+    pub fn from_bytes(b: &[u8]) -> Option<PinGuard> {
+        let b: &[u8; 16] = b.try_into().ok()?;
+        let (f, rest) = b.split_at(4);
+        let (l, u) = rest.split_at(4);
+        let until = u64::from_be_bytes(u.try_into().ok()?);
+        Some(PinGuard {
+            failures: u32::from_be_bytes(f.try_into().ok()?),
+            level: u32::from_be_bytes(l.try_into().ok()?),
+            locked_until: (until != 0).then_some(until),
+        })
+    }
+
+    /// How long the next lock lasts.
+    fn lock_ms(&self) -> u64 {
+        // 60_000 << 11 is already past the cap; bounding the shift keeps it
+        // from overflowing.
+        (PIN_LOCK_MS << self.level.min(20)).min(PIN_LOCK_MAX_MS)
     }
 
     pub fn state(&self, now_ms: u64) -> PinState {
@@ -354,6 +407,7 @@ impl PinGuard {
     pub fn record(&mut self, now_ms: u64, ok: bool) {
         if ok {
             self.failures = 0;
+            self.level = 0;
             self.locked_until = None;
             return;
         }
@@ -363,7 +417,8 @@ impl PinGuard {
         }
         self.failures = self.failures.saturating_add(1);
         if self.failures >= PIN_MAX_FAILURES {
-            self.locked_until = Some(now_ms.saturating_add(PIN_LOCK_MS));
+            self.locked_until = Some(now_ms.saturating_add(self.lock_ms()));
+            self.level = self.level.saturating_add(1);
             self.failures = 0;
         }
     }
@@ -580,6 +635,12 @@ pub struct Engine<P: Planner, C: Channel, A: AuditSink> {
     executor: Arc<Executor>,
     pin_path: PathBuf,
     pin_guard: PinGuard,
+    /// `<home>/pin-guard`, rewritten after every PIN check.
+    pin_guard_path: PathBuf,
+    /// Set when writing `pin_guard_path` failed: PIN-tier approvals are
+    /// refused until restart, so a lockout that is not on disk cannot be
+    /// escaped by a restart.
+    pin_guard_unsaved: bool,
     clock: Clock,
     last_non_owner_audit_ms: Option<u64>,
     /// Set when an owner prompt timed out or the input closed: the current
@@ -624,9 +685,14 @@ where
     /// config file); a file is matched as itself, a directory with
     /// everything inside it.
     ///
+    /// The PIN lockout is loaded from `<home>/pin-guard` ([`PIN_GUARD_FILE`];
+    /// missing means none).
+    ///
     /// Fails with [`EngineConfigError::UnprotectedHome`] when `home`, the
     /// approver store's home or any of `state_dirs` lies inside `cfg.root`
-    /// and is not protected by the executor ([`Executor::protects`]).
+    /// and is not protected by the executor ([`Executor::protects`]), and
+    /// with [`EngineConfigError::PinGuardState`] when the lockout file is
+    /// malformed, insecure or unreadable.
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         cfg: EngineConfig,
@@ -661,6 +727,13 @@ where
             allowed_roots.push(root_as_given);
         }
         let policy = PolicyConfig { allowed_roots };
+        let pin_guard_path = home.join(PIN_GUARD_FILE);
+        let pin_guard = match state::read_private(&pin_guard_path, 16) {
+            Ok(None) => PinGuard::new(),
+            Ok(Some(b)) => PinGuard::from_bytes(&b)
+                .ok_or(EngineConfigError::PinGuardState(io::ErrorKind::InvalidData))?,
+            Err(e) => return Err(EngineConfigError::PinGuardState(e.kind())),
+        };
         Ok(Engine {
             cfg,
             policy,
@@ -670,7 +743,9 @@ where
             approvals: Arc::new(Mutex::new(approvals)),
             executor: Arc::new(executor),
             pin_path: home.join(PIN_FILE),
-            pin_guard: PinGuard::new(),
+            pin_guard,
+            pin_guard_path,
+            pin_guard_unsaved: false,
             clock: Box::new(system_clock_ms),
             last_non_owner_audit_ms: None,
             end_message: None,
@@ -1147,6 +1222,14 @@ where
             self.say(PIN_NOT_ACCEPTED).await;
             return Outcome::error("pin not accepted on this channel");
         }
+        if tier == Tier::YesPin && self.pin_guard_unsaved {
+            // Checked before prompting: no PIN is asked for that could not
+            // be rate-limited across a restart.
+            self.say(PIN_GUARD_UNSAVED).await;
+            return self
+                .refuse(&action, tier, "refused: pin unavailable", "pin unavailable")
+                .await;
+        }
         if tier == Tier::YesPin {
             let now = self.now();
             if let PinState::Locked { until_ms } = self.pin_guard.state(now) {
@@ -1261,10 +1344,22 @@ where
         match checked {
             Ok(Ok(PinCheck::Match)) => {
                 self.pin_guard.record(now, true);
+                if !self.save_pin_guard().await {
+                    return Some(
+                        self.refuse(
+                            action,
+                            Tier::YesPin,
+                            "refused: pin unavailable",
+                            "pin unavailable",
+                        )
+                        .await,
+                    );
+                }
                 None
             }
             Ok(Ok(PinCheck::Mismatch)) => {
                 self.pin_guard.record(now, false);
+                self.save_pin_guard().await;
                 Some(
                     self.refuse(action, Tier::YesPin, "refused: bad pin", "bad pin")
                         .await,
@@ -1281,6 +1376,20 @@ where
                 .await,
             ),
         }
+    }
+
+    /// Write the [`PinGuard`] to `<home>/pin-guard` on a blocking thread.
+    /// On failure, disable PIN-tier approvals until restart, tell the owner
+    /// and answer `false`.
+    async fn save_pin_guard(&mut self) -> bool {
+        let (path, bytes) = (self.pin_guard_path.clone(), self.pin_guard.to_bytes());
+        let res = tokio::task::spawn_blocking(move || state::write_atomic(&path, &bytes)).await;
+        if matches!(res, Ok(Ok(()))) {
+            return true;
+        }
+        self.pin_guard_unsaved = true;
+        self.say(PIN_GUARD_UNSAVED).await;
+        false
     }
 
     async fn audit_unavailable(&mut self, action: &Action) -> Outcome {
@@ -1464,6 +1573,81 @@ mod tests {
         // After expiry the count starts again from zero.
         g.record(60_006, false);
         assert_eq!(g.state(60_006), PinState::Open);
+    }
+
+    /// Three bad PINs at `t`; returns the lock length.
+    fn lock_at(g: &mut PinGuard, t: u64) -> u64 {
+        for i in 0..3 {
+            g.record(t + i, false);
+        }
+        match g.state(t + 2) {
+            PinState::Locked { until_ms } => until_ms - (t + 2),
+            PinState::Open => panic!("not locked at {t}"),
+        }
+    }
+
+    #[test]
+    fn pin_guard_bytes_roundtrip() {
+        let fresh = PinGuard::new();
+        assert_eq!(fresh.to_bytes(), [0u8; 16]);
+        assert_eq!(
+            PinGuard::from_bytes(&fresh.to_bytes()),
+            Some(PinGuard::new())
+        );
+
+        let mut g = PinGuard::new();
+        lock_at(&mut g, 1_000);
+        let b = g.to_bytes();
+        assert_eq!(&b[..4], &0u32.to_be_bytes());
+        assert_eq!(&b[4..8], &1u32.to_be_bytes());
+        assert_eq!(&b[8..], &61_002u64.to_be_bytes());
+        assert_eq!(PinGuard::from_bytes(&b).as_ref(), Some(&g));
+        g.record(1_000_000, false); // lock expired: one failure, level kept
+        let b = g.to_bytes();
+        assert_eq!(&b[..4], &1u32.to_be_bytes());
+        assert_eq!(&b[4..8], &1u32.to_be_bytes());
+        assert_eq!(&b[8..], &0u64.to_be_bytes());
+        let back = PinGuard::from_bytes(&b).unwrap();
+        assert_eq!(back, g);
+        assert_eq!(back.to_bytes(), b);
+
+        let mut locked = PinGuard::new();
+        lock_at(&mut locked, 5);
+        let back = PinGuard::from_bytes(&locked.to_bytes()).unwrap();
+        assert_eq!(back.state(10), PinState::Locked { until_ms: 60_007 });
+
+        assert_eq!(PinGuard::from_bytes(&[]), None);
+        assert_eq!(PinGuard::from_bytes(&[0u8; 15]), None);
+        assert_eq!(PinGuard::from_bytes(&[0u8; 17]), None);
+    }
+
+    #[test]
+    fn lock_doubles_on_each_consecutive_lockout_and_caps_at_a_day() {
+        let mut g = PinGuard::new();
+        let mut t = 0u64;
+        let mut locks = Vec::new();
+        for _ in 0..40 {
+            let len = lock_at(&mut g, t);
+            locks.push(len);
+            t += len + 2;
+            assert_eq!(g.state(t), PinState::Open);
+        }
+        assert_eq!(&locks[..4], &[60_000, 120_000, 240_000, 480_000]);
+        for w in locks.windows(2) {
+            assert!(w[1] == (w[0] * 2).min(PIN_LOCK_MAX_MS), "{w:?}");
+        }
+        assert!(locks.iter().all(|&l| l <= PIN_LOCK_MAX_MS));
+        assert_eq!(*locks.last().unwrap(), 86_400_000);
+    }
+
+    #[test]
+    fn correct_pin_resets_level() {
+        let mut g = PinGuard::new();
+        assert_eq!(lock_at(&mut g, 0), 60_000);
+        assert_eq!(lock_at(&mut g, 100_000), 120_000);
+        g.record(1_000_000, true);
+        assert_eq!(g, PinGuard::new());
+        assert_eq!(lock_at(&mut g, 2_000_000), 60_000);
     }
 
     #[test]
