@@ -24,9 +24,12 @@
 //! `read_file` result is redacted WHOLE (the executor reads up to
 //! `MAX_READ_BYTES` + 4096 bytes whatever the model asked for), then the
 //! redacted text is cut to the model's `max_bytes`, then every tool result
-//! is cut to `result_max_bytes` and redacted again. No cut ever applies to
-//! unredacted text, so `max_bytes` cannot be used to read a secret's
-//! prefix. The planner is
+//! is cut to `result_max_bytes` and redacted again. No model-chosen cut
+//! ever applies to unredacted text, so `max_bytes` cannot be used to read a
+//! secret's prefix. When the file is longer than the executor's buffer, the
+//! buffer edge is a raw cut: the result is limited to what the reads with
+//! and without the last 4096 bytes agree on, so a secret cut by that edge
+//! never reaches the model (`edge_safe`). The planner is
 //! untrusted: the system prompt asks it to treat file content as data, but
 //! no safety property depends on that prompt.
 //!
@@ -62,7 +65,7 @@ use crate::authorize::{ApproverStore, Authorized};
 use crate::channel::{
     sanitize_for_display, ApprovalPrompt, ApprovalReply, Channel, Inbound, SenderId,
 };
-use crate::exec::{ExecError, Executor};
+use crate::exec::{ExecError, Executor, READ_OVERLAP_BYTES};
 use crate::planner::{Block, PlanRequest, Planner, PlannerError, Role, ToolId, Turn};
 use crate::redact::{redact, Redacted};
 use crate::tools::{parse_call, to_action, tool_specs, Tool, ToolCall, ToolError};
@@ -448,8 +451,18 @@ fn bounded(text: &str, max: usize) -> Redacted {
 /// file was longer than what the executor read (`longer`). Cutting before
 /// redacting would let the model choose a cut inside a secret and read its
 /// prefix.
+///
+/// When `longer`, the executor's buffer edge is itself a raw cut, and a
+/// secret straddling it is no longer recognised. Redaction shrinks text
+/// (a long JWT becomes a short placeholder), so the redacted offset of that
+/// edge can fall below any `max_bytes`; the cut-off secret must never be
+/// eligible at all. See [`edge_safe`].
 fn read_result(raw: &str, max_bytes: u64, longer: bool) -> String {
-    let red = redact(raw).0.into_string();
+    let red = if longer {
+        edge_safe(raw)
+    } else {
+        redact(raw).0.into_string()
+    };
     let max = usize::try_from(max_bytes).unwrap_or(usize::MAX);
     if red.len() <= max && !longer {
         return red;
@@ -460,6 +473,48 @@ fn read_result(raw: &str, max_bytes: u64, longer: bool) -> String {
     }
     let mut out = red.get(..cut).unwrap_or("").to_string();
     out.push_str(&format!("\n[truncated at {max_bytes} bytes]"));
+    out
+}
+
+/// Redacted text of a read cut at the buffer edge (the end of `raw`), with
+/// nothing derived from a secret straddling that edge.
+///
+/// Let `inner` be `raw.len() - READ_OVERLAP_BYTES` (on a char boundary),
+/// `full = redact(raw)` and `head = redact(raw[..inner])`. The result is the
+/// longest common prefix of `full` and `head`. Why this is sound, for
+/// secrets of at most [`READ_OVERLAP_BYTES`] (the overlap's premise):
+///
+/// - a secret cut by the buffer edge is a suffix of `raw` no longer than
+///   the overlap, so it lies wholly after `inner`: none of its bytes exist in
+///   `head`. Every byte of the result is a byte of `head` at the same
+///   position, so the result cannot contain it. (Dropping the overlap before
+///   redacting, alone, would not do: it moves the raw cut to `inner`.)
+/// - a secret cut at `inner` may be unrecognised in `head`, but it ends
+///   before the edge, so it is whole in `full` and replaced there by a
+///   placeholder: `full` and `head` differ where it starts (or, if both
+///   redacted it, inside placeholder text), so the result stops there.
+/// - every other secret is whole in both and redacted in both.
+///
+/// The model chooses only `max_bytes`, which cuts this result after
+/// redaction; it cannot steer where `full` and `head` diverge.
+fn edge_safe(raw: &str) -> String {
+    let overlap = usize::try_from(READ_OVERLAP_BYTES).unwrap_or(usize::MAX);
+    let mut inner = raw.len().saturating_sub(overlap);
+    while inner > 0 && !raw.is_char_boundary(inner) {
+        inner -= 1;
+    }
+    let full = redact(raw).0.into_string();
+    let head = redact(raw.get(..inner).unwrap_or("")).0.into_string();
+    let mut k = full
+        .bytes()
+        .zip(head.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while k > 0 && !(full.is_char_boundary(k) && head.is_char_boundary(k)) {
+        k -= 1;
+    }
+    let mut out = full;
+    out.truncate(k);
     out
 }
 
@@ -1204,7 +1259,17 @@ where
         let exec = Arc::clone(&self.executor);
         let (a, t) = (action.clone(), tool.clone());
         let now = self.now();
-        let res = tokio::task::spawn_blocking(move || exec.run(&a, &t, token, now)).await;
+        // Redacting a read (up to ~1 MiB) is CPU work: do it on the blocking
+        // thread too, never on the async runtime.
+        let res = tokio::task::spawn_blocking(move || {
+            exec.run(&a, &t, token, now).map(|mut out| {
+                if let Tool::ReadFile { max_bytes, .. } = &t {
+                    out.text = read_result(&out.text, *max_bytes, out.truncated);
+                }
+                out
+            })
+        })
+        .await;
         let untrusted = matches!(tool, Tool::ReadFile { .. } | Tool::ListDir { .. });
         let (decision, snapshot, outcome) = match res {
             Ok(Ok(out)) => {
@@ -1213,14 +1278,8 @@ where
                     Some(id) => format!("executed snapshot={id}"),
                     None => "executed".to_string(),
                 };
-                let text = match tool {
-                    Tool::ReadFile { max_bytes, .. } => {
-                        read_result(&out.text, *max_bytes, out.truncated)
-                    }
-                    _ => out.text,
-                };
                 let o = Outcome {
-                    text,
+                    text: out.text,
                     is_error: false,
                     untrusted,
                 };
@@ -1264,7 +1323,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::READ_BUFFER_BYTES;
     use crate::planner::MockPlanner;
+    use crate::tools::MAX_READ_BYTES;
     use warden_core::{Capability, SnapshotStore};
 
     struct NullChannel;
@@ -1401,8 +1462,74 @@ mod tests {
             assert!(!r.contains(&key[..12]), "{n}: {r}");
         }
         assert_eq!(read_result("abc", 3, false), "abc");
-        assert_eq!(read_result("abc", 3, true), "abc\n[truncated at 3 bytes]");
+        // A cut-off read drops its last READ_OVERLAP_BYTES (here: all of it).
+        assert_eq!(read_result("abc", 3, true), "\n[truncated at 3 bytes]");
         assert_eq!(read_result("éé", 3, false), "é\n[truncated at 3 bytes]");
+    }
+
+    /// Review PoC shape: ~1 MiB of JWTs that redact to short placeholders,
+    /// then an AWS key cut by the executor's buffer edge. Before the fix the
+    /// shrunk redacted text put the cut-off `AKIAQ7RZ` under max_bytes.
+    #[test]
+    fn a_secret_cut_by_the_buffer_edge_never_leaks_after_shrinking() {
+        let key = format!("{}{}", concat!("AK", "IA"), "Q7RZ4M2KX9TB3WJP");
+        let buf_len = usize::try_from(READ_BUFFER_BYTES).unwrap();
+        let jwt = format!(
+            "eyJ{}.{}.{}\n",
+            "a".repeat(400),
+            "b".repeat(400),
+            "c".repeat(200)
+        );
+        for keep in [4, 8, 12, 19] {
+            let mut file = String::new();
+            while file.len() + jwt.len() < buf_len - keep {
+                file.push_str(&jwt);
+            }
+            while file.len() < buf_len - keep {
+                file.push(' ');
+            }
+            file.push_str(&key);
+            file.push_str(" tail\n");
+            let buf = &file[..buf_len]; // what the executor returns
+            let r = read_result(buf, MAX_READ_BYTES, true);
+            assert!(r.len() < 65_536, "the JWTs shrank: {}", r.len());
+            assert!(
+                !r.contains(&key[..4]),
+                "keep={keep}: {}",
+                &r[r.len() - 80..]
+            );
+            let out = bounded(&r, 32_768);
+            assert!(!out.as_str().contains(&key[..4]), "keep={keep}");
+            assert!(r.ends_with("\n[truncated at 1048576 bytes]"));
+        }
+    }
+
+    /// A secret cut at the inner point (`READ_OVERLAP_BYTES` before the
+    /// edge) is whole in the full text, so it is redacted, not leaked.
+    #[test]
+    fn a_secret_at_the_inner_cut_is_redacted() {
+        let key = format!("{}{}", concat!("AK", "IA"), "Q7RZ4M2KX9TB3WJP");
+        let buf_len = usize::try_from(READ_BUFFER_BYTES).unwrap();
+        let overlap = usize::try_from(READ_OVERLAP_BYTES).unwrap();
+        for keep in [4, 8, 12, 19] {
+            let mut buf = " ".repeat(buf_len - overlap - keep);
+            buf.push_str(&key);
+            while buf.len() < buf_len {
+                buf.push('x');
+            }
+            let r = read_result(&buf, MAX_READ_BYTES, true);
+            assert!(!r.contains(&key[..4]), "keep={keep}");
+            // Text before the secret is kept.
+            assert!(r.starts_with("     "), "keep={keep}");
+        }
+    }
+
+    #[test]
+    fn edge_safe_keeps_plain_text_up_to_the_overlap() {
+        let raw = "a".repeat(10_000);
+        let overlap = usize::try_from(READ_OVERLAP_BYTES).unwrap();
+        assert_eq!(edge_safe(&raw), "a".repeat(10_000 - overlap));
+        assert_eq!(edge_safe("é".repeat(3000).as_str()).len() % 2, 0);
     }
 
     #[test]
