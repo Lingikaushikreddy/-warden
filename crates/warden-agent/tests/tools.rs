@@ -477,3 +477,20 @@ fn read_file_array_args_with_number_are_bad_args() {
         Err(ToolError::BadArgs(_))
     ));
 }
+
+#[test]
+fn new_default_ignorables_are_rejected_in_paths() {
+    let cps = [
+        0x180Fu32, 0x1BCA0, 0x1BCA1, 0x1BCA2, 0x1BCA3, 0x13430, 0x13438, 0x1343F, 0xE0080, 0xE00C0,
+        0xE00FF, 0xE01F0, 0xE0800, 0xE0FFF, 0xFFF0, 0xFFF4, 0xFFF8,
+    ];
+    for cp in cps {
+        let c = char::from_u32(cp).unwrap();
+        assert!(path_err(&format!("/root/a{c}b")), "{cp:x}");
+    }
+    // Neighbours stay legal.
+    for cp in [0x1810u32, 0x1BC9F, 0x1BCA4, 0x1342F, 0x13440, 0xFFEF] {
+        let c = char::from_u32(cp).unwrap();
+        assert!(!path_err(&format!("/root/a{c}b")), "{cp:x}");
+    }
+}

@@ -63,7 +63,7 @@ use zeroize::Zeroizing;
 
 use crate::authorize::{ApproverStore, Authorized};
 use crate::channel::{
-    sanitize_for_display, ApprovalPrompt, ApprovalReply, Channel, Inbound, SenderId,
+    display_prefix, sanitize_for_display, ApprovalPrompt, ApprovalReply, Channel, Inbound, SenderId,
 };
 use crate::exec::{ExecError, Executor, READ_OVERLAP_BYTES};
 use crate::planner::{Block, PlanRequest, Planner, PlannerError, Role, ToolId, Turn};
@@ -98,6 +98,18 @@ const PIN_FILE: &str = "pin";
 const MAX_NOTE_CHARS: usize = 500;
 /// A summary whose display form is longer than this is refused unprompted.
 const MAX_SUMMARY_CHARS: usize = 3000;
+/// Most characters a channel displays per message (as `sanitize_for_display`
+/// caps it).
+const MAX_DISPLAY_CHARS: usize = 4096;
+/// Appended to a model reply the provider cut off.
+const REPLY_TRUNCATED: &str = "\n[reply truncated]";
+/// Told to the owner when a `YesPin` action is asked for over a channel
+/// that does not accept PINs.
+const PIN_NOT_ACCEPTED: &str =
+    "this needs your PIN, which this channel does not accept; do it at the computer";
+/// Approval-shaped messages with at least this many whitespace tokens may
+/// carry a PIN (`yes <code> <PIN>`) and are retracted.
+const RETRACT_MIN_TOKENS: usize = 3;
 
 /// Default system prompt, without the folder sentence that
 /// [`default_system_prompt`] appends. Safety does not depend on it.
@@ -153,8 +165,10 @@ impl AuditSink for AuditLog {
 /// Engine settings.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// The only sender whose messages are acted on.
-    pub owner: SenderId,
+    /// The senders whose messages are acted on. Each is served on its own:
+    /// everything said while handling a message, approval prompts included,
+    /// goes to that message's sender only.
+    pub owners: Vec<SenderId>,
     /// The single allowed root (policy and executor).
     pub root: PathBuf,
     /// Relative tool paths resolve against this.
@@ -177,15 +191,15 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
-    /// Defaults: 8 steps, 16 calls, 120 s approval tokens, 32 KiB results,
-    /// 300 s per message, 120 s per owner prompt, and
-    /// [`default_system_prompt`] for `root` and `cwd` (canonicalized when
-    /// they exist, as `Engine::try_new` stores them).
+    /// One owner (`owners: vec![owner]`). Defaults: 8 steps, 16 calls,
+    /// 120 s approval tokens, 32 KiB results, 300 s per message, 120 s per
+    /// owner prompt, and [`default_system_prompt`] for `root` and `cwd`
+    /// (canonicalized when they exist, as `Engine::try_new` stores them).
     pub fn new(owner: SenderId, root: PathBuf, cwd: PathBuf) -> EngineConfig {
         let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         let system_prompt = default_system_prompt(&canon(&root), &canon(&cwd));
         EngineConfig {
-            owner,
+            owners: vec![owner],
             root,
             cwd,
             max_steps: 8,
@@ -550,7 +564,7 @@ impl From<ApprovalReply> for Consent {
             ApprovalReply::Yes => Consent::Yes,
             ApprovalReply::No => Consent::No,
             ApprovalReply::Closed => Consent::Closed,
-            ApprovalReply::YesPin(p) => Consent::Pin(Zeroizing::new(p)),
+            ApprovalReply::YesPin(p) => Consent::Pin(p),
         }
     }
 }
@@ -573,6 +587,8 @@ pub struct Engine<P: Planner, C: Channel, A: AuditSink> {
     end_message: Option<EndReason>,
     /// Challenge codes of recent prompts; a new code never repeats one.
     recent_challenges: VecDeque<String>,
+    /// Sender of the message being handled: every outbound call goes here.
+    sender: SenderId,
     /// How many `check_pin` calls the PIN-like check has made (test-hooks).
     #[cfg(feature = "test-hooks")]
     pin_like_checks: Arc<std::sync::atomic::AtomicUsize>,
@@ -659,6 +675,7 @@ where
             last_non_owner_audit_ms: None,
             end_message: None,
             recent_challenges: VecDeque::new(),
+            sender: SenderId(String::new()),
             #[cfg(feature = "test-hooks")]
             pin_like_checks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
@@ -736,17 +753,22 @@ where
         matches!(res, Ok(Ok(())))
     }
 
+    /// Send `text` to the sender of the message being handled.
+    async fn say(&mut self, text: &str) {
+        self.channel.send(&self.sender, text).await;
+    }
+
     /// Audit something where nothing executes either way; tell the owner if
     /// the append failed.
     async fn audit_or_warn(&mut self, action_id: &str, summary: &str, tier: Tier, decision: &str) {
         if !self.audit(action_id, summary, tier, decision).await {
-            self.channel.send("warning: audit append failed").await;
+            self.say("warning: audit append failed").await;
         }
     }
 
     /// Process one inbound message.
     pub async fn handle(&mut self, inbound: Inbound) {
-        if inbound.sender != self.cfg.owner {
+        if !self.cfg.owners.contains(&inbound.sender) {
             let now = self.now();
             // A clock that went backwards resets the window instead of
             // suppressing entries until it catches up.
@@ -767,18 +789,24 @@ where
             return;
         }
 
+        self.sender = inbound.sender;
         let text = Zeroizing::new(inbound.text);
         if is_approval_shaped(&text) {
             // Possibly a late approval reply (it may carry the PIN): never
-            // chat, never sent to the planner, never logged.
+            // chat, never sent to the planner, never logged. With a code and
+            // something after it, it may hold the PIN: retract it.
+            let retract = text.split_whitespace().count() >= RETRACT_MIN_TOKENS;
             drop(text);
-            self.channel.send("no approval pending").await;
+            if retract {
+                self.channel.retract_last(&self.sender).await;
+            }
+            self.say("no approval pending").await;
             return;
         }
         if self.is_pin_like(&text).await {
             drop(text);
-            self.channel
-                .send("that message looks like your PIN; it was not sent")
+            self.channel.retract_last(&self.sender).await;
+            self.say("that message looks like your PIN; it was not sent")
                 .await;
             self.audit_or_warn(
                 &new_id(),
@@ -843,9 +871,14 @@ where
                     model_reply(&text)
                 };
                 if resp.truncated {
-                    out.push_str("\n[reply truncated]");
+                    // Cut first so the marker fits in what the channel
+                    // displays and is never itself cut off.
+                    let keep = MAX_DISPLAY_CHARS - REPLY_TRUNCATED.chars().count();
+                    let n = display_prefix(&out, keep).len();
+                    out.truncate(n);
+                    out.push_str(REPLY_TRUNCATED);
                 }
-                self.channel.send(&out).await;
+                self.say(&out).await;
                 return;
             }
 
@@ -886,7 +919,7 @@ where
                 );
                 self.audit_or_warn(&msg_id, &summary, Tier::Auto, "refused: too many calls")
                     .await;
-                self.channel.send(&format!("refused: {summary}")).await;
+                self.say(&format!("refused: {summary}")).await;
             }
             turns.push(Turn {
                 role: Role::Assistant,
@@ -898,7 +931,7 @@ where
             });
         }
 
-        self.channel.send("step limit reached").await;
+        self.say("step limit reached").await;
         self.audit_or_warn(&msg_id, "message", Tier::Auto, "failed: step limit")
             .await;
     }
@@ -973,21 +1006,19 @@ where
     }
 
     async fn timed_out(&mut self, msg_id: &str) {
-        self.channel.send("timed out").await;
+        self.say("timed out").await;
         self.audit_or_warn(msg_id, "message", Tier::Auto, "failed: timeout")
             .await;
     }
 
     async fn input_closed(&mut self, msg_id: &str) {
-        self.channel.send("input closed").await;
+        self.say("input closed").await;
         self.audit_or_warn(msg_id, "message", Tier::Auto, "failed: input closed")
             .await;
     }
 
     async fn planner_failed(&mut self, msg_id: &str, kind: &str) {
-        self.channel
-            .send(&format!("planner unavailable ({kind})"))
-            .await;
+        self.say(&format!("planner unavailable ({kind})")).await;
         self.audit_or_warn(msg_id, "message", Tier::Auto, "failed: planner")
             .await;
     }
@@ -1011,9 +1042,7 @@ where
     ) -> Outcome {
         self.audit_or_warn(&action.id, &action.summary, tier, decision)
             .await;
-        self.channel
-            .send(&format!("refused: {}", action.summary))
-            .await;
+        self.say(&format!("refused: {}", action.summary)).await;
         Outcome::error(result)
     }
 
@@ -1030,7 +1059,7 @@ where
                     "refused: invalid call",
                 )
                 .await;
-                self.channel.send("refused: invalid tool call").await;
+                self.say("refused: invalid tool call").await;
                 return Outcome::error(format!("invalid call: {reason}"));
             }
         };
@@ -1097,14 +1126,26 @@ where
             Decision::NeedsPin => Tier::YesPin,
         };
 
+        if tier == Tier::YesPin && !self.channel.accepts_pin(&self.sender) {
+            // Checked before the lock and before any challenge or PIN file
+            // read: a PIN typed here would be stored by a third party.
+            self.audit_or_warn(
+                &action.id,
+                &action.summary,
+                tier,
+                "refused: pin not accepted on this channel",
+            )
+            .await;
+            self.say(PIN_NOT_ACCEPTED).await;
+            return Outcome::error("pin not accepted on this channel");
+        }
         if tier == Tier::YesPin {
             let now = self.now();
             if let PinState::Locked { until_ms } = self.pin_guard.state(now) {
                 let secs = until_ms.saturating_sub(now).div_ceil(1000);
                 self.audit_or_warn(&action.id, &action.summary, tier, "refused: pin locked")
                     .await;
-                self.channel
-                    .send(&format!("PIN approvals locked for {secs} s"))
+                self.say(&format!("PIN approvals locked for {secs} s"))
                     .await;
                 return Outcome::error("pin locked");
             }
@@ -1126,14 +1167,12 @@ where
         // Input already waiting cannot be a reply to a prompt not yet shown
         // (it cannot contain the new code either); say so, so typed-ahead
         // chat is not lost silently.
-        if self.channel.discard_pending_input().await > 0 {
-            self.channel
-                .send("earlier unsent input was discarded")
-                .await;
+        if self.channel.discard_pending_input(&self.sender).await > 0 {
+            self.say("earlier unsent input was discarded").await;
         }
         let reply = timeout(
             self.cfg.approval_timeout,
-            self.channel.ask_approval(&prompt),
+            self.channel.ask_approval(&self.sender, &prompt),
         )
         .await
         .ok();
@@ -1237,8 +1276,7 @@ where
     }
 
     async fn audit_unavailable(&mut self, action: &Action) -> Outcome {
-        self.channel
-            .send(&format!("refused: {} (audit unavailable)", action.summary))
+        self.say(&format!("refused: {} (audit unavailable)", action.summary))
             .await;
         Outcome::error("audit unavailable")
     }
@@ -1246,9 +1284,7 @@ where
     async fn authorize_failed(&mut self, action: &Action, tier: Tier) -> Outcome {
         self.audit_or_warn(&action.id, &action.summary, tier, "failed: authorize")
             .await;
-        self.channel
-            .send(&format!("failed: {}", action.summary))
-            .await;
+        self.say(&format!("failed: {}", action.summary)).await;
         Outcome::error("approval unavailable")
     }
 
@@ -1308,14 +1344,14 @@ where
             if let Some(id) = &snapshot {
                 w.push_str(&format!(" (snapshot {id})"));
             }
-            self.channel.send(&w).await;
+            self.say(&w).await;
         }
         let line = match (&outcome.is_error, &snapshot) {
             (false, _) => format!("done: {}", action.summary),
             (true, Some(id)) => format!("failed: {} (snapshot {id})", action.summary),
             (true, None) => format!("failed: {}", action.summary),
         };
-        self.channel.send(&line).await;
+        self.say(&line).await;
         outcome
     }
 }
@@ -1334,8 +1370,12 @@ mod tests {
         async fn recv(&mut self) -> Option<Inbound> {
             None
         }
-        async fn send(&mut self, _text: &str) {}
-        async fn ask_approval(&mut self, _prompt: &ApprovalPrompt) -> ApprovalReply {
+        async fn send(&mut self, _to: &SenderId, _text: &str) {}
+        async fn ask_approval(
+            &mut self,
+            _to: &SenderId,
+            _prompt: &ApprovalPrompt,
+        ) -> ApprovalReply {
             ApprovalReply::No
         }
     }

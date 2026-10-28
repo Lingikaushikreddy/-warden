@@ -144,7 +144,11 @@ fn parse_args<T: serde::de::DeserializeOwned>(call: &ToolCall) -> Result<T, Tool
 /// Characters that could make a displayed path misleading: controls,
 /// Unicode format, bidi and invisible characters, and blank-looking fillers
 /// (Hangul fillers U+115F, U+1160, U+3164, U+FFA0 and the braille blank
-/// U+2800).
+/// U+2800). Default-ignorable and unassigned format-like ranges are included
+/// too: U+180F, the shorthand format controls U+1BCA0-U+1BCA3, the Egyptian
+/// hieroglyph format controls U+13430-U+1343F, the unassigned tag-plane
+/// gaps U+E0080-U+E00FF and U+E01F0-U+E0FFF, and the unassigned specials
+/// U+FFF0-U+FFF8.
 ///
 /// This is deliberately strict: legitimate file names that contain ZWNJ or
 /// ZWJ (U+200C, U+200D; used in some scripts and in emoji sequences), LRM or
@@ -170,7 +174,13 @@ pub(crate) fn is_forbidden_path_char(c: char) -> bool {
             | '\u{180B}'..='\u{180E}'
             | '\u{17B4}' | '\u{17B5}'
             | '\u{1D173}'..='\u{1D17A}'
-            | '\u{FFFC}')
+            | '\u{FFFC}'
+            | '\u{180F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{E0080}'..='\u{E00FF}'
+            | '\u{E01F0}'..='\u{E0FFF}'
+            | '\u{FFF0}'..='\u{FFF8}')
 }
 
 fn resolve(tool: &str, raw: &str, cwd: &Path) -> Result<PathBuf, ToolError> {
