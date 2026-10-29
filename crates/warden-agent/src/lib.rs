@@ -21,3 +21,4 @@ pub mod redact;
 mod state;
 pub mod telegram;
 pub mod tools;
+pub mod whatsapp;
