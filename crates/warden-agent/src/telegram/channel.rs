@@ -32,7 +32,7 @@ use crate::channel::{
     cap_utf16, parse_reply, render_prompt, sanitize_for_display, ApprovalPrompt, ApprovalReply,
     Channel, Inbound, SenderId,
 };
-use crate::engine::{is_approval_shaped, MAX_PIN_LIKE_TOKENS};
+use crate::engine::may_hold_pin;
 use crate::redact::redact;
 
 /// `getUpdates` batch size.
@@ -47,9 +47,6 @@ const MAX_TEXT_UTF16: usize = 4096;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Longest `retry_after` honored by `send`.
 const MAX_RETRY_AFTER_SECS: u64 = 30;
-/// A dropped owner message this short with a run of this many digits may
-/// be a bare PIN and is deleted.
-const PIN_DIGIT_RUN: usize = 4;
 
 const PIN_WARNING: &str = "Your PIN will pass through Telegram's servers; Warden deletes your reply after reading it (best effort).";
 const NOT_TEXT: &str = "only text messages are supported";
@@ -199,28 +196,6 @@ fn system_clock_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-}
-
-/// Might this dropped (never acted on) owner text hold the PIN? It does
-/// when it is approval-shaped with 2+ tokens (`yes <PIN>`, `yes <code>
-/// <PIN>`), or short (at most [`MAX_PIN_LIKE_TOKENS`] tokens) with a run of
-/// [`PIN_DIGIT_RUN`]+ digits (a bare PIN). Such text is deleted.
-fn may_hold_pin(text: &str) -> bool {
-    let tokens = text.split_whitespace().count();
-    if is_approval_shaped(text) && tokens >= 2 {
-        return true;
-    }
-    if tokens == 0 || tokens > MAX_PIN_LIKE_TOKENS {
-        return false;
-    }
-    let mut run = 0usize;
-    for c in text.chars() {
-        run = if c.is_numeric() { run + 1 } else { 0 };
-        if run >= PIN_DIGIT_RUN {
-            return true;
-        }
-    }
-    false
 }
 
 /// The notice for `n` owner messages dropped as older than `secs`.

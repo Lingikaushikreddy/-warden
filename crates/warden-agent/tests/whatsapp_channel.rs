@@ -1265,3 +1265,125 @@ async fn discard_is_bounded_by_what_was_waiting() {
     // What arrived during the drain is still there.
     assert_eq!(ch.recv().await.unwrap().text, "later");
 }
+
+// ------------------------------------------- delete notice for PIN-like text
+
+async fn delete_notices(h: &Harness) -> usize {
+    h.sent_texts()
+        .await
+        .iter()
+        .filter(|(_, t)| t == DELETE_NOTICE)
+        .count()
+}
+
+/// Integration finding I2: owner texts the channel consumes itself (stale
+/// at ingest, an approval reply that is not a Yes, texts dropped by
+/// `discard_pending_input`) may hold the PIN, and WhatsApp cannot delete
+/// them, so the owner is told to delete them.
+#[tokio::test]
+async fn pin_like_text_consumed_by_the_channel_gets_the_delete_notice() {
+    let h = Harness::new().await;
+    let (tx, mut ch) = h.channel();
+    open_window(&tx, &mut ch).await;
+
+    // Stale at ingest: two PIN-like texts in one batch, one notice.
+    tx.send(batch(vec![
+        text_at("wamid.st1", OWNER, "482193", NOW_S - 600),
+        text_at("wamid.st2", OWNER, "yes 4821 482193", NOW_S - 600),
+    ]))
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            ch.recv().await.unwrap().sender,
+            SenderId(format!("wa-stale:{OWNER}"))
+        );
+    }
+    assert!(recv_quiet(&mut ch).await);
+    assert_eq!(delete_notices(&h).await, 1);
+
+    // A stale text that cannot hold a PIN gets no delete notice.
+    tx.send(batch(vec![text_at(
+        "wamid.st3",
+        OWNER,
+        "hello",
+        NOW_S - 600,
+    )]))
+    .await
+    .unwrap();
+    ch.recv().await.unwrap();
+    assert!(recv_quiet(&mut ch).await);
+    assert_eq!(delete_notices(&h).await, 1);
+
+    // An approval reply carrying the PIN is No, and gets the notice.
+    tx.send(batch(vec![text("wamid.r1", OWNER, "yes 4821 482193")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        ch.ask_approval(&owner(), &prompt(Tier::Yes)).await,
+        ApprovalReply::No
+    );
+    assert!(recv_quiet(&mut ch).await);
+    assert_eq!(delete_notices(&h).await, 2);
+
+    // A plain Yes gets none.
+    tx.send(batch(vec![text("wamid.r2", OWNER, "yes 4821")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        ch.ask_approval(&owner(), &prompt(Tier::Yes)).await,
+        ApprovalReply::Yes
+    );
+    assert!(recv_quiet(&mut ch).await);
+    assert_eq!(delete_notices(&h).await, 2);
+
+    // Dropped by discard_pending_input.
+    tx.send(batch(vec![text("wamid.d1", OWNER, "482193")]))
+        .await
+        .unwrap();
+    assert!(ch.discard_pending_input(&owner()).await > 0);
+    assert!(recv_quiet(&mut ch).await);
+    assert_eq!(delete_notices(&h).await, 3);
+}
+
+/// A queued owner text that goes stale before the engine takes it is
+/// consumed by the channel too.
+#[tokio::test]
+async fn queued_pin_like_text_that_goes_stale_gets_the_delete_notice() {
+    let h = Harness::new().await;
+    let now = Arc::new(AtomicU64::new(NOW_MS));
+    let clock = Arc::clone(&now);
+    let (tx, mut ch) = h.channel_with(&[OWNER], Box::new(move || clock.load(Ordering::SeqCst)));
+    tx.send(batch(vec![
+        text("wamid.1", OWNER, "first"),
+        text("wamid.2", OWNER, "482193"),
+    ]))
+    .await
+    .unwrap();
+    assert_eq!(ch.recv().await.unwrap().text, "first");
+    now.fetch_add(600_000, Ordering::SeqCst);
+    assert_eq!(
+        ch.recv().await.unwrap().sender,
+        SenderId(format!("wa-stale:{OWNER}"))
+    );
+    assert!(recv_quiet(&mut ch).await);
+    assert_eq!(delete_notices(&h).await, 1);
+}
+
+/// Outside the 24 h window the delete notice is skipped silently.
+#[tokio::test]
+async fn delete_notice_outside_the_window_is_skipped_and_not_counted() {
+    let h = Harness::new().await;
+    let (tx, mut ch) = h.channel();
+    tx.send(batch(vec![text_at(
+        "wamid.1",
+        OWNER,
+        "482193",
+        NOW_S - 90_000,
+    )]))
+    .await
+    .unwrap();
+    ch.recv().await.unwrap();
+    assert!(recv_quiet(&mut ch).await);
+    assert_eq!(delete_notices(&h).await, 0);
+}

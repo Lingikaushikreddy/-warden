@@ -46,6 +46,7 @@ use crate::channel::{
     cap_utf16, parse_reply, render_prompt, sanitize_for_display, ApprovalPrompt, ApprovalReply,
     Channel, Inbound, SenderId,
 };
+use crate::engine::may_hold_pin;
 use crate::redact::redact;
 
 /// The customer-service window: 24 hours after the owner's last message.
@@ -183,6 +184,9 @@ pub struct WhatsAppChannel {
     last_inbound: HashMap<String, u64>,
     window_drops: Arc<AtomicU64>,
     statuses: Arc<AtomicU64>,
+    /// Owners whose consumed text may hold the PIN in the batch being
+    /// handled; each gets one [`CANNOT_DELETE`] notice when it is done.
+    delete_due: Vec<String>,
     fatal: Option<WhatsAppFatal>,
     /// Shutdown signal ([`Self::with_shutdown`]).
     shutdown: Option<watch::Receiver<bool>>,
@@ -281,6 +285,7 @@ impl WhatsAppChannel {
             last_inbound: HashMap::new(),
             window_drops: Arc::new(AtomicU64::new(0)),
             statuses: Arc::new(AtomicU64::new(0)),
+            delete_due: Vec::new(),
             fatal: None,
             shutdown: None,
         }
@@ -399,6 +404,26 @@ impl WhatsAppChannel {
         }
     }
 
+    /// Note owner text the channel consumed itself (never handed to the
+    /// engine): if it may hold the PIN, the owner is told to delete it once
+    /// the current batch is handled ([`Self::queue_delete_notices`]).
+    fn consumed(&mut self, from: &str, text: &str) {
+        if may_hold_pin(text) && !self.delete_due.iter().any(|f| f == from) {
+            self.delete_due.push(from.to_string());
+        }
+    }
+
+    /// One [`CANNOT_DELETE`] notice per owner noted by [`Self::consumed`],
+    /// inside the window only (outside it is skipped silently, as in
+    /// `retract_last`).
+    fn queue_delete_notices(&mut self) {
+        for from in std::mem::take(&mut self.delete_due) {
+            if self.in_window(&from) {
+                self.notify(&from, CANNOT_DELETE);
+            }
+        }
+    }
+
     /// Queue an item for `recv`. When the queue is full, items without
     /// content (non-owner, refused, stale: the engine only audits them) go
     /// first: an owner item evicts the newest of them, and is itself
@@ -452,7 +477,8 @@ impl WhatsAppChannel {
     ///    fatal and the batch is dropped;
     /// 3. note the inbound time of every owner message;
     /// 4. sort the messages into owner text, stale, owner non-text and
-    ///    pass-through; owners with stale messages get one notice.
+    ///    pass-through; owners with stale messages get one notice, and
+    ///    stale text that may hold the PIN is noted ([`Self::consumed`]).
     fn ingest(&mut self, batch: WebhookBatch) -> Vec<Event> {
         let mut in_batch: HashSet<String> = HashSet::new();
         let mut fresh = Vec::with_capacity(batch.events.len());
@@ -520,6 +546,7 @@ impl WhatsAppChannel {
                             text: String::new(),
                         }));
                     } else if self.is_stale(at_ms) {
+                        self.consumed(&from, &body);
                         count_stale(&mut stale, &from);
                         events.push(Event::Pass(stale_inbound(&from)));
                     } else {
@@ -574,15 +601,18 @@ impl WhatsAppChannel {
             if !self.is_stale(o.at_ms) {
                 continue;
             }
-            count_stale(&mut stale, &o.from);
+            let from = o.from.clone();
+            self.consumed(&from, &item.inbound.text);
+            count_stale(&mut stale, &from);
             *item = Item {
-                inbound: stale_inbound(&o.from),
+                inbound: stale_inbound(&from),
                 origin: None,
             };
         }
         self.queue = queue;
         let expired = !stale.is_empty();
         self.notify_stale(stale);
+        self.queue_delete_notices();
         expired
     }
 
@@ -676,6 +706,7 @@ impl Channel for WhatsAppChannel {
             for ev in self.ingest(batch) {
                 self.enqueue_event(ev);
             }
+            self.queue_delete_notices();
         }
     }
 
@@ -776,15 +807,27 @@ impl Channel for WhatsAppChannel {
                 }
             }
             let Some(reply) = reply else {
+                self.queue_delete_notices();
                 continue;
             };
-            let Some((reply_to, text)) = reply else {
-                return ApprovalReply::No;
+            let answer = match reply {
+                None => ApprovalReply::No,
+                Some((reply_to, text)) => {
+                    let answer = if reply_to.is_some_and(|r| r != prompt_id) {
+                        ApprovalReply::No
+                    } else {
+                        parse_reply(&text, false, &prompt.challenge)
+                    };
+                    // The reply is consumed here; anything but a Yes may
+                    // carry the PIN (`yes <code> <PIN>`).
+                    if answer != ApprovalReply::Yes {
+                        self.consumed(&number, &text);
+                    }
+                    answer
+                }
             };
-            if reply_to.is_some_and(|r| r != prompt_id) {
-                return ApprovalReply::No;
-            }
-            return parse_reply(&text, false, &prompt.challenge);
+            self.queue_delete_notices();
+            return answer;
         }
     }
 
@@ -801,6 +844,7 @@ impl Channel for WhatsAppChannel {
             match &item.origin {
                 Some(o) if o.from == number => {
                     dropped = dropped.saturating_add(item.inbound.text.len().max(1));
+                    self.consumed(&number, &item.inbound.text);
                 }
                 _ => self.queue.push_back(item),
             }
@@ -818,6 +862,7 @@ impl Channel for WhatsAppChannel {
                 match ev {
                     Event::OwnerText { from, text, .. } if from == number => {
                         dropped = dropped.saturating_add(text.len().max(1));
+                        self.consumed(&number, &text);
                     }
                     Event::OwnerNotText { from, .. } if from == number => {
                         dropped = dropped.saturating_add(1);
@@ -825,7 +870,9 @@ impl Channel for WhatsAppChannel {
                     other => self.enqueue_event(other),
                 }
             }
+            self.queue_delete_notices();
         }
+        self.queue_delete_notices();
         self.flush().await;
         dropped
     }

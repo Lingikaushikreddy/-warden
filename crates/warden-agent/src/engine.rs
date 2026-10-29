@@ -291,6 +291,33 @@ fn inside(p: &Path, root: &Path) -> bool {
     lexical || canonical
 }
 
+/// A dropped owner message this short with a run of this many digits may
+/// be a bare PIN.
+const PIN_DIGIT_RUN: usize = 4;
+
+/// Might this dropped (never acted on) owner text hold the PIN? It does
+/// when it is approval-shaped with 2+ tokens (`yes <PIN>`, `yes <code>
+/// <PIN>`), or short (at most [`MAX_PIN_LIKE_TOKENS`] tokens) with a run of
+/// [`PIN_DIGIT_RUN`]+ digits (a bare PIN). Channels that consume such text
+/// themselves delete it (Telegram) or tell the owner to (WhatsApp).
+pub(crate) fn may_hold_pin(text: &str) -> bool {
+    let tokens = text.split_whitespace().count();
+    if is_approval_shaped(text) && tokens >= 2 {
+        return true;
+    }
+    if tokens == 0 || tokens > MAX_PIN_LIKE_TOKENS {
+        return false;
+    }
+    let mut run = 0usize;
+    for c in text.chars() {
+        run = if c.is_numeric() { run + 1 } else { 0 };
+        if run >= PIN_DIGIT_RUN {
+            return true;
+        }
+    }
+    false
+}
+
 /// An owner message that looks like an approval reply: after trimming,
 /// `yes` or `no` (any case), or `yes` followed by whitespace and anything.
 /// Such text is never chat: it may be a late reply carrying the PIN.
