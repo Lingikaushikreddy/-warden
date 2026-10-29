@@ -1,11 +1,14 @@
-//! End-to-end tests for `warden daemon`. Telegram is a loopback wiremock
-//! server (`[telegram] api_base`) running on a tokio runtime owned by the
-//! test; the planner is the `test-hooks` scripted one (`provider = "mock"`).
-//! The daemon is a real child process, stopped with `kill -TERM`.
+//! End-to-end tests for `warden daemon`. Telegram and the WhatsApp Graph
+//! API are loopback wiremock servers (`api_base`) running on tokio runtimes
+//! owned by the test; WhatsApp webhooks are signed and posted to the
+//! daemon's loopback listener over a raw `TcpStream`. The planner is the
+//! `test-hooks` scripted one (`provider = "mock"`). The daemon is a real
+//! child process, stopped with `kill -TERM`.
 
 use std::collections::VecDeque;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Stdio};
@@ -14,7 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use assert_cmd::Command;
+use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
+use sha2::Sha256;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -24,6 +29,18 @@ const TOKEN: &str = "123456789:AAH-secret_half_0123456789abcdefDONOTLEAK";
 const TOKEN_SECRET: &str = "AAH-secret_half_0123456789abcdefDONOTLEAK";
 const OWNER: i64 = 42;
 const STRANGER: i64 = 666;
+/// The WhatsApp owner number and the business phone number id.
+const WA_OWNER: &str = "15550000042";
+const PNID: &str = "106540352242922";
+const WA_TOKEN: &str = "EAAox9yimTcfipZGnzPbDFDyFKm51zfFoWbSrHAE56yUhQqg0eyN1ygQdvpSfF5";
+const WA_APP_SECRET: &str = "6421f64ee9bd453abf694b927b709a78";
+const WA_VERIFY: &str = "cBqyt1T5AlQzhk7Q2bmXktha";
+/// The three default WhatsApp secret env names, with fake values.
+const WA_VARS: [(&str, &str); 3] = [
+    ("WARDEN_WHATSAPP_TOKEN", WA_TOKEN),
+    ("WARDEN_WHATSAPP_APP_SECRET", WA_APP_SECRET),
+    ("WARDEN_WHATSAPP_VERIFY_TOKEN", WA_VERIFY),
+];
 /// Every wait in these tests ends within this, or the test fails.
 const TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -273,6 +290,7 @@ impl Env {
             .env_remove("WARDEN_PIN")
             .env_remove("WARDEN_TEST_FAIL_AUDIT_APPEND")
             .env(TOKEN_VAR, TOKEN)
+            .envs(WA_VARS)
             .env("HOME", &self.user_home)
             .current_dir(&self.root)
             .timeout(TIMEOUT)
@@ -294,6 +312,7 @@ impl Env {
             .env_remove("WARDEN_PIN")
             .env_remove("WARDEN_TEST_FAIL_AUDIT_APPEND")
             .env(TOKEN_VAR, TOKEN)
+            .envs(WA_VARS)
             .env("HOME", &self.user_home)
             .current_dir(&self.root)
             .arg("--home")
@@ -771,7 +790,7 @@ fn insecure_telegram_offset_fails_startup_with_a_recovery_hint() {
 }
 
 #[test]
-fn daemon_without_telegram_table_exits_1() {
+fn daemon_without_any_channel_exits_1() {
     let e = Env::new();
     let s = e.base.join("script.json");
     fs::write(&s, "[]").unwrap();
@@ -784,7 +803,7 @@ fn daemon_without_telegram_table_exits_1() {
     let se = String::from_utf8_lossy(&o.stderr).into_owned();
     assert_eq!(o.status.code(), Some(1), "{se}");
     assert!(
-        se.contains("no channel configured: add a [telegram] table"),
+        se.contains("error: no channel configured: add a [telegram] or [whatsapp] table"),
         "{se}"
     );
     assert!(!e.home.join("audit.jsonl").exists());
@@ -1032,10 +1051,13 @@ fn warden_undo_works_while_the_daemon_is_idle() {
     assert!(tg.deleted.all().is_empty(), "{:?}", tg.deleted.all());
 }
 
-/// Neither the token nor its secret half is in `stdout`, `stderr` or any
-/// file under the data dir.
+/// Every secret value the tests put in the environment.
+const SECRETS: [&str; 5] = [TOKEN, TOKEN_SECRET, WA_TOKEN, WA_APP_SECRET, WA_VERIFY];
+
+/// Neither the bot token (nor its secret half) nor any WhatsApp secret is
+/// in `stdout`, `stderr` or any file under the data dir.
 fn assert_token_absent(e: &Env, stdout: &str, stderr: &str) {
-    for needle in [TOKEN, TOKEN_SECRET] {
+    for needle in SECRETS {
         assert!(!stdout.contains(needle), "stdout: {stdout}");
         assert!(!stderr.contains(needle), "stderr: {stderr}");
     }
@@ -1043,8 +1065,8 @@ fn assert_token_absent(e: &Env, stdout: &str, stderr: &str) {
     files_under(&e.home, &mut files);
     for f in files {
         let text = String::from_utf8_lossy(&fs::read(&f).unwrap()).into_owned();
-        for needle in [TOKEN, TOKEN_SECRET] {
-            assert!(!text.contains(needle), "{} holds the token", f.display());
+        for needle in SECRETS {
+            assert!(!text.contains(needle), "{} holds a secret", f.display());
         }
     }
 }
@@ -1202,22 +1224,6 @@ fn print_service_writes_nothing_to_disk() {
 const WA_TABLE: &str =
     "[whatsapp]\nowner_numbers = [\"+15551234567\"]\nphone_number_id = \"106540352242922\"\n";
 
-/// The three default WhatsApp secret env names, with fake values.
-const WA_VARS: [(&str, &str); 3] = [
-    (
-        "WARDEN_WHATSAPP_TOKEN",
-        "EAAGfakeAccessTokenDONOTLEAK0123456789",
-    ),
-    (
-        "WARDEN_WHATSAPP_APP_SECRET",
-        "fakeappsecretDONOTLEAK0123456789ab",
-    ),
-    (
-        "WARDEN_WHATSAPP_VERIFY_TOKEN",
-        "fakeverifytokenDONOTLEAK987654321",
-    ),
-];
-
 /// A mock-provider config holding `tables` after the top-level fields.
 fn config_with_tables(e: &Env, tables: &str) {
     let s = e.base.join("script.json");
@@ -1326,4 +1332,729 @@ fn print_service_without_any_channel_exits_1() {
         );
         assert!(o.stdout.is_empty(), "{fmt}");
     }
+}
+
+// ------------------------------------------------------------ fake WhatsApp
+
+/// `POST /v26.0/<PNID>/messages`: record the body, answer with
+/// `wamid.test<n>`.
+#[derive(Clone)]
+struct WaRecorder {
+    log: Log,
+    next_id: Arc<AtomicI64>,
+}
+
+impl Respond for WaRecorder {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        let to = v["to"].clone();
+        self.log.0.lock().unwrap().push(v);
+        let n = self.next_id.fetch_add(1, Ordering::SeqCst);
+        ResponseTemplate::new(200).set_body_json(json!({
+            "messaging_product": "whatsapp",
+            "contacts": [{"input": to, "wa_id": to}],
+            "messages": [{"id": format!("wamid.test{n}")}],
+        }))
+    }
+}
+
+/// The Graph API on a test-owned runtime.
+struct Wa {
+    rt: tokio::runtime::Runtime,
+    server: MockServer,
+    sent: Log,
+}
+
+fn graph_path(suffix: &str) -> String {
+    format!("/v26.0/{PNID}{suffix}")
+}
+
+impl Wa {
+    fn start() -> Wa {
+        Wa::start_with_phone(ResponseTemplate::new(200).set_body_json(json!({
+            "display_phone_number": "+1 555-010-0000",
+            "verified_name": "Warden Test",
+            "id": PNID,
+        })))
+    }
+
+    fn start_with_phone(phone: ResponseTemplate) -> Wa {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = rt.block_on(MockServer::start());
+        let sent = Log::default();
+        rt.block_on(async {
+            Mock::given(method("GET"))
+                .and(path(graph_path("")))
+                .respond_with(phone)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(graph_path("/messages")))
+                .respond_with(WaRecorder {
+                    log: sent.clone(),
+                    next_id: Arc::new(AtomicI64::new(1)),
+                })
+                .mount(&server)
+                .await;
+        });
+        Wa { rt, server, sent }
+    }
+
+    fn base(&self) -> String {
+        self.server.uri()
+    }
+
+    /// Text bodies sent to `number`.
+    fn texts_to(&self, number: &str) -> Vec<String> {
+        self.sent
+            .all()
+            .iter()
+            .filter(|v| v["to"] == number)
+            .map(|v| v["text"]["body"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    fn sent_contains(&self, needle: &str) -> bool {
+        self.texts_to(WA_OWNER).iter().any(|t| t.contains(needle))
+    }
+
+    fn count(&self, needle: &str) -> usize {
+        self.texts_to(WA_OWNER)
+            .iter()
+            .filter(|t| t.contains(needle))
+            .count()
+    }
+}
+
+/// A signed-ready webhook body with one text message.
+fn wa_text(wamid: &str, from: &str, text: &str, ts: i64) -> Value {
+    json!({
+        "object": "whatsapp_business_account",
+        "entry": [{"id": "1029384756", "changes": [{"field": "messages", "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {"display_phone_number": "15550100000", "phone_number_id": PNID},
+            "contacts": [{"profile": {"name": "x"}, "wa_id": from}],
+            "messages": [{
+                "from": from,
+                "id": wamid,
+                "timestamp": ts.to_string(),
+                "type": "text",
+                "text": {"body": text},
+            }],
+        }}]}],
+    })
+}
+
+/// Send one raw HTTP/1.1 request (`Connection: close`) and return the
+/// status code and the body.
+fn http(addr: SocketAddr, head: &str, body: &[u8]) -> (u16, String) {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let mut req = head.as_bytes().to_vec();
+    req.extend_from_slice(body);
+    s.write_all(&req).unwrap();
+    let mut resp = Vec::new();
+    let _ = s.read_to_end(&mut resp);
+    let resp = String::from_utf8_lossy(&resp).into_owned();
+    let code = resp
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_else(|| panic!("no status line: {resp:?}"));
+    let body = resp
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_owned())
+        .unwrap_or_default();
+    (code, body)
+}
+
+/// POST `body` to the webhook, signed with `secret` when given.
+fn post_webhook(addr: SocketAddr, body: &Value, secret: Option<&str>) -> u16 {
+    let raw = serde_json::to_vec(body).unwrap();
+    let mut head = format!(
+        "POST /webhook HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        raw.len()
+    );
+    if let Some(secret) = secret {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(&raw);
+        let sig = hex::encode(mac.finalize().into_bytes());
+        head.push_str(&format!("X-Hub-Signature-256: sha256={sig}\r\n"));
+    }
+    head.push_str("\r\n");
+    http(addr, &head, &raw).0
+}
+
+/// An owner text, signed with the right secret; must be accepted.
+fn post_owner(d: &mut Daemon, addr: SocketAddr, wamid: &str, text: &str) {
+    let code = post_webhook(
+        addr,
+        &wa_text(wamid, WA_OWNER, text, now_s()),
+        Some(WA_APP_SECRET),
+    );
+    if code != 200 {
+        d.fail(&format!("webhook answered {code}"));
+    }
+}
+
+/// GET the webhook with `query`.
+fn get_webhook(addr: SocketAddr, query: &str) -> (u16, String) {
+    let head =
+        format!("GET /webhook?{query} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    http(addr, &head, &[])
+}
+
+impl Env {
+    /// A mock-provider config with a `[whatsapp]` table pointing at
+    /// `api_base` and listening on an ephemeral loopback port, plus a
+    /// `[telegram]` table pointing at `telegram` if given.
+    fn mock_wa(&self, api_base: &str, script: Value, telegram: Option<&str>) {
+        self.mock_wa_listen(api_base, script, telegram, "127.0.0.1:0");
+    }
+
+    fn mock_wa_listen(&self, api_base: &str, script: Value, telegram: Option<&str>, listen: &str) {
+        let s = self.base.join("script.json");
+        fs::write(&s, serde_json::to_vec(&script).unwrap()).unwrap();
+        let tg = telegram
+            .map(|b| format!("[telegram]\nowner_ids = [{OWNER}]\napi_base = \"{b}\"\n\n"))
+            .unwrap_or_default();
+        self.config_text(&format!(
+            "root = \"{}\"\nprovider = \"mock\"\nscript = \"{}\"\n\n{tg}[whatsapp]\nowner_numbers = [\"{WA_OWNER}\"]\nphone_number_id = \"{PNID}\"\nlisten = \"{listen}\"\napi_base = \"{api_base}\"\n",
+            self.root.display(),
+            s.display()
+        ));
+    }
+}
+
+impl Daemon {
+    /// Wait for a banner that names the WhatsApp listener.
+    fn ready_wa(&mut self) -> SocketAddr {
+        let err = Arc::clone(&self.stderr);
+        let re = regex::Regex::new(r"warden daemon: .*listen=\S+ owners=\d+ root=").unwrap();
+        self.wait_for("the daemon never printed its banner", move || {
+            re.is_match(&err.lock().unwrap())
+        });
+        listen_addr(self)
+    }
+}
+
+/// The bound webhook address, from the banner's `listen=`.
+fn listen_addr(d: &Daemon) -> SocketAddr {
+    let se = d.stderr();
+    let re = regex::Regex::new(r"listen=(\S+) ").unwrap();
+    let c = re
+        .captures(&se)
+        .unwrap_or_else(|| panic!("no listen= in {se}"));
+    c[1].parse().unwrap()
+}
+
+/// Wait for a WhatsApp prompt and return its challenge code.
+fn wait_for_wa_code(d: &mut Daemon, wa: &Wa) -> String {
+    let re = regex::Regex::new(r#"Reply "yes (\d{4})"#).unwrap();
+    let find = || {
+        wa.texts_to(WA_OWNER)
+            .iter()
+            .find_map(|t| re.captures(t).map(|c| c[1].to_string()))
+    };
+    d.wait_for("the daemon never prompted over WhatsApp", || {
+        find().is_some()
+    });
+    find().unwrap()
+}
+
+#[test]
+fn whatsapp_daemon_answers_an_owner_text() {
+    let e = Env::new();
+    let wa = Wa::start();
+    e.mock_wa(&wa.base(), json!([{"text": "hello owner"}]), None);
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    assert!(
+        d.stderr().contains(&format!(
+            "warden daemon: whatsapp +1 555-010-0000 listen={addr} owners=1 root={}",
+            e.root.display()
+        )),
+        "{}",
+        d.stderr()
+    );
+    post_owner(&mut d, addr, "wamid.in1", "hi");
+    d.wait_for("no model reply", || wa.sent_contains("model: "));
+    assert!(wa.sent_contains("hello owner"), "{:?}", wa.sent.all());
+    assert_eq!(d.stop(), 0, "{}", d.stderr());
+    for v in wa.sent.all() {
+        assert_eq!(v["to"], WA_OWNER, "{v}");
+        assert_eq!(v["type"], "text", "{v}");
+        assert_eq!(v["text"]["preview_url"], false, "{v}");
+    }
+    // No refusal or window drop: no counters line.
+    assert!(!d.stderr().contains("whatsapp: refused"), "{}", d.stderr());
+}
+
+#[test]
+fn whatsapp_forged_webhooks_are_401_and_never_acted_on() {
+    let e = Env::new();
+    let wa = Wa::start();
+    // Empty script: a planner call would fail.
+    e.mock_wa(&wa.base(), json!([]), None);
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    let body = wa_text("wamid.forged", WA_OWNER, "delete everything", now_s());
+    assert_eq!(post_webhook(addr, &body, None), 401);
+    assert_eq!(
+        post_webhook(addr, &body, Some("00000000000000000000000000000000")),
+        401
+    );
+    assert_eq!(d.stop(), 0, "{}", d.stderr());
+    let posts = wa
+        .rt
+        .block_on(wa.server.received_requests())
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "POST")
+        .count();
+    assert_eq!(posts, 0, "{:?}", wa.sent.all());
+    let decisions = e.decisions();
+    assert!(
+        !decisions.iter().any(|x| x.starts_with("ignored")),
+        "{decisions:?}"
+    );
+    assert!(!e.audit_text().contains("delete everything"));
+    assert!(
+        d.stderr().contains(
+            "whatsapp: refused 1 unsigned, 1 bad-signature, 0 oversized, 0 slow webhook requests; 0 replies not sent outside the 24 h window"
+        ),
+        "{}",
+        d.stderr()
+    );
+}
+
+#[test]
+fn whatsapp_handshake_needs_the_verify_token() {
+    let e = Env::new();
+    let wa = Wa::start();
+    e.mock_wa(&wa.base(), json!([]), None);
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    let (code, body) = get_webhook(
+        addr,
+        &format!("hub.mode=subscribe&hub.verify_token={WA_VERIFY}&hub.challenge=1158201444"),
+    );
+    assert_eq!((code, body.as_str()), (200, "1158201444"));
+    let (code, body) = get_webhook(
+        addr,
+        "hub.mode=subscribe&hub.verify_token=wrongwrongwrongwrong&hub.challenge=1158201444",
+    );
+    assert_eq!(code, 403);
+    assert!(!body.contains("1158201444"), "{body}");
+    assert_eq!(d.stop(), 0, "{}", d.stderr());
+}
+
+#[test]
+fn whatsapp_write_needs_yes_code() {
+    let e = Env::new();
+    let wa = Wa::start();
+    let a = e.root.join("a.txt");
+    fs::write(&a, "old").unwrap();
+    e.mock_wa(&wa.base(), write_script("a.txt", "new"), None);
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    post_owner(&mut d, addr, "wamid.in1", "update a.txt");
+    let code = wait_for_wa_code(&mut d, &wa);
+    assert_eq!(fs::read_to_string(&a).unwrap(), "old");
+    post_owner(&mut d, addr, "wamid.in2", &format!("yes {code}"));
+    d.wait_for("no done message", || wa.sent_contains("done:"));
+    assert_eq!(fs::read_to_string(&a).unwrap(), "new");
+    assert_eq!(d.stop(), 0, "{}", d.stderr());
+    let decisions = e.decisions();
+    assert!(
+        decisions.iter().any(|x| x.starts_with("executed")),
+        "{decisions:?}"
+    );
+}
+
+#[test]
+fn whatsapp_refuses_pin_tier_without_a_prompt() {
+    const PIN: &str = "4815162342";
+    let e = Env::new();
+    let wa = Wa::start();
+    let a = e.root.join("a.txt");
+    fs::write(&a, "keep me").unwrap();
+    e.mock_wa(
+        &wa.base(),
+        json!([
+            {"text": "deleting", "calls": [
+                {"id": "t1", "name": "delete_file", "args": {"path": "a.txt"}}
+            ]},
+            {"text": "all done"}
+        ]),
+        None,
+    );
+    e.warden().args(["init-pin", PIN]).assert().success();
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    post_owner(&mut d, addr, "wamid.in1", "delete a.txt");
+    d.wait_for("the owner was not told", || {
+        wa.sent_contains("does not accept")
+    });
+    d.wait_for("the message never finished", || {
+        wa.sent_contains("all done")
+    });
+    assert_eq!(d.stop(), 0, "{}", d.stderr());
+    assert!(a.exists());
+    assert!(
+        !wa.texts_to(WA_OWNER)
+            .iter()
+            .any(|t| t.contains("Reply \"yes")),
+        "{:?}",
+        wa.sent.all()
+    );
+    let decisions = e.decisions();
+    assert!(
+        decisions
+            .iter()
+            .any(|x| x == "refused: pin not accepted on this channel"),
+        "{decisions:?}"
+    );
+}
+
+#[test]
+fn whatsapp_pin_like_message_never_reaches_the_planner() {
+    const PIN: &str = "4815162342";
+    let e = Env::new();
+    let wa = Wa::start();
+    // Empty script: a planner call would fail.
+    e.mock_wa(&wa.base(), json!([]), None);
+    e.warden().args(["init-pin", PIN]).assert().success();
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    post_owner(&mut d, addr, "wamid.in1", PIN);
+    d.wait_for("the owner was not told", || {
+        wa.sent_contains("looks like your PIN")
+    });
+    assert_eq!(d.stop(), 0, "{}", d.stderr());
+    let decisions = e.decisions();
+    assert!(
+        decisions.iter().any(|x| x == "ignored: pin-like message"),
+        "{decisions:?}"
+    );
+    assert!(!e.audit_text().contains(PIN));
+}
+
+#[test]
+fn whatsapp_duplicate_delivery_is_acted_on_once() {
+    let e = Env::new();
+    let wa = Wa::start();
+    e.mock_wa(
+        &wa.base(),
+        json!([{"text": "reply one"}, {"text": "reply two"}, {"text": "reply three"}]),
+        None,
+    );
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    post_owner(&mut d, addr, "wamid.dup", "hi");
+    post_owner(&mut d, addr, "wamid.dup", "hi");
+    post_owner(&mut d, addr, "wamid.next", "hi again");
+    d.wait_for("no second model reply", || wa.count("model: ") >= 2);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(d.stop(), 0, "{}", d.stderr());
+    assert_eq!(wa.count("model: "), 2, "{:?}", wa.sent.all());
+    assert!(!wa.sent_contains("reply three"), "{:?}", wa.sent.all());
+}
+
+#[test]
+fn whatsapp_redelivery_after_restart_is_not_replayed() {
+    let e = Env::new();
+    let wa = Wa::start();
+    e.mock_wa(
+        &wa.base(),
+        json!([{"text": "reply one"}, {"text": "reply two"}]),
+        None,
+    );
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    post_owner(&mut d, addr, "wamid.once", "hi");
+    d.wait_for("no model reply", || wa.count("model: ") == 1);
+    assert_eq!(d.stop(), 0, "{}", d.stderr());
+
+    // A new process starts its script over: a replay would be "reply one".
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    post_owner(&mut d, addr, "wamid.once", "hi");
+    post_owner(&mut d, addr, "wamid.fresh", "hi again");
+    d.wait_for("no reply to the fresh message", || wa.count("model: ") >= 2);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(d.stop(), 0, "{}", d.stderr());
+    assert_eq!(wa.count("model: "), 2, "{:?}", wa.sent.all());
+    assert_eq!(wa.count("reply one"), 2, "{:?}", wa.sent.all());
+    assert!(!wa.sent_contains("reply two"), "{:?}", wa.sent.all());
+}
+
+#[test]
+fn whatsapp_drops_messages_older_than_max_age() {
+    let e = Env::new();
+    let wa = Wa::start();
+    // Empty script: a planner call would fail.
+    e.mock_wa(&wa.base(), json!([]), None);
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    let body = wa_text("wamid.old", WA_OWNER, "hi", now_s() - 3600);
+    assert_eq!(post_webhook(addr, &body, Some(WA_APP_SECRET)), 200);
+    d.wait_for("the owner was not told", || {
+        wa.sent_contains("ignored 1 message")
+    });
+    assert_eq!(d.stop(), 0, "{}", d.stderr());
+    assert!(!wa.sent_contains("model: "), "{:?}", wa.sent.all());
+}
+
+#[test]
+fn daemon_serves_telegram_and_whatsapp_together() {
+    let e = Env::new();
+    let tg = Tg::start();
+    let wa = Wa::start();
+    e.mock_wa(
+        &wa.base(),
+        json!([{"text": "reply one"}, {"text": "reply two"}]),
+        Some(&tg.base()),
+    );
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    assert!(
+        d.stderr().contains(&format!(
+            "warden daemon: telegram @warden_test_bot whatsapp +1 555-010-0000 listen={addr} owners=2 root={}",
+            e.root.display()
+        )),
+        "{}",
+        d.stderr()
+    );
+    tg.push(vec![owner_text(1, "hi")]);
+    d.wait_for("no Telegram reply", || sent_contains(&tg, OWNER, "model: "));
+    post_owner(&mut d, addr, "wamid.in1", "hi");
+    d.wait_for("no WhatsApp reply", || wa.sent_contains("model: "));
+    assert_eq!(d.stop(), 0, "{}", d.stderr());
+    // Each reply went out on its own channel only.
+    assert_eq!(
+        tg.texts_to(OWNER)
+            .iter()
+            .filter(|t| t.contains("model: "))
+            .count(),
+        1
+    );
+    assert_eq!(wa.count("model: "), 1, "{:?}", wa.sent.all());
+    assert!(sent_contains(&tg, OWNER, "reply one"));
+    assert!(wa.sent_contains("reply two"));
+}
+
+#[test]
+fn whatsapp_token_rejected_at_startup_exits_1() {
+    let e = Env::new();
+    let wa = Wa::start_with_phone(ResponseTemplate::new(401).set_body_json(json!({
+        "error": {"message": "Invalid OAuth access token.", "type": "OAuthException", "code": 190, "fbtrace_id": "x"}
+    })));
+    e.mock_wa(&wa.base(), json!([]), None);
+    let o = e.daemon_cmd().output().unwrap();
+    let se = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert_eq!(o.status.code(), Some(1), "{se}");
+    assert!(
+        se.contains("error: WhatsApp rejected the access token"),
+        "{se}"
+    );
+    assert!(!se.contains("Invalid OAuth"), "{se}");
+    assert_eq!(home_listing(&e.home), vec!["daemon.lock".to_string()]);
+    assert_token_absent(&e, &String::from_utf8_lossy(&o.stdout), &se);
+
+    // The token cannot see the phone number id: Graph code 100, or a 404.
+    for resp in [
+        ResponseTemplate::new(400)
+            .set_body_json(json!({"error": {"code": 100, "error_subcode": 33}})),
+        ResponseTemplate::new(404),
+    ] {
+        let wa = Wa::start_with_phone(resp);
+        e.mock_wa(&wa.base(), json!([]), None);
+        let o = e.daemon_cmd().output().unwrap();
+        let se = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert_eq!(o.status.code(), Some(1), "{se}");
+        assert!(
+            se.contains(&format!(
+                "error: the access token cannot see phone_number_id {PNID}"
+            )),
+            "{se}"
+        );
+        assert_eq!(home_listing(&e.home), vec!["daemon.lock".to_string()]);
+    }
+
+    // Unreachable: the kind is named.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    e.mock_wa(&format!("http://127.0.0.1:{port}"), json!([]), None);
+    let o = e.daemon_cmd().output().unwrap();
+    let se = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert_eq!(o.status.code(), Some(1), "{se}");
+    assert!(
+        se.contains("error: cannot reach the WhatsApp Cloud API (connect)"),
+        "{se}"
+    );
+    assert_eq!(home_listing(&e.home), vec!["daemon.lock".to_string()]);
+}
+
+#[test]
+fn whatsapp_token_rejected_mid_run_exits_1() {
+    let e = Env::new();
+    let wa = Wa::start();
+    wa.rt.block_on(
+        Mock::given(method("POST"))
+            .and(path(graph_path("/messages")))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {"message": "Error validating access token", "type": "OAuthException", "code": 190}
+            })))
+            .with_priority(1)
+            .mount(&wa.server),
+    );
+    e.mock_wa(&wa.base(), json!([{"text": "hello owner"}]), None);
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    post_owner(&mut d, addr, "wamid.in1", "hi");
+    assert_eq!(d.wait_exit(), 1, "{}", d.stderr());
+    let se = d.stderr();
+    assert!(
+        se.contains("error: WhatsApp rejected the access token"),
+        "{se}"
+    );
+    assert!(!se.contains("Error validating"), "{se}");
+    assert_eq!(
+        e.decisions().last().map(String::as_str),
+        Some("daemon session ended"),
+        "{}",
+        e.audit_text()
+    );
+    assert_token_absent(&e, &d.stdout(), &se);
+}
+
+#[test]
+fn whatsapp_missing_or_equal_secrets_exit_1_without_side_effects() {
+    let e = Env::new();
+    e.mock_wa("http://127.0.0.1:9", json!([]), None);
+    for (var, _) in WA_VARS {
+        let o = e.daemon_cmd().env_remove(var).output().unwrap();
+        let se = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert_eq!(o.status.code(), Some(1), "{var}: {se}");
+        assert!(se.contains(var), "{var}: {se}");
+        assert!(se.contains("is not set or is empty"), "{var}: {se}");
+        assert_eq!(home_listing(&e.home), vec!["daemon.lock".to_string()]);
+        assert_token_absent(&e, &String::from_utf8_lossy(&o.stdout), &se);
+    }
+    // Badly shaped values are refused without being shown.
+    for (var, what) in [
+        ("WARDEN_WHATSAPP_TOKEN", "access token"),
+        ("WARDEN_WHATSAPP_APP_SECRET", "app secret"),
+        ("WARDEN_WHATSAPP_VERIFY_TOKEN", "verify token"),
+    ] {
+        let o = e.daemon_cmd().env(var, "bad value!").output().unwrap();
+        let se = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert_eq!(o.status.code(), Some(1), "{var}: {se}");
+        assert!(
+            se.contains(&format!(
+                "the WhatsApp {what} variable does not hold a valid {}",
+                if what == "access token" {
+                    "token"
+                } else {
+                    what
+                }
+            )),
+            "{var}: {se}"
+        );
+        assert!(!se.contains("bad value!"), "{se}");
+        assert_eq!(home_listing(&e.home), vec!["daemon.lock".to_string()]);
+    }
+    // Two equal secrets, either pair the shapes allow.
+    for (var, value) in [
+        ("WARDEN_WHATSAPP_VERIFY_TOKEN", WA_APP_SECRET),
+        ("WARDEN_WHATSAPP_APP_SECRET", WA_TOKEN),
+    ] {
+        let o = e.daemon_cmd().env(var, value).output().unwrap();
+        let se = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert_eq!(o.status.code(), Some(1), "{var}: {se}");
+        assert!(
+            se.contains(
+                "error: the WhatsApp secrets, the bot token and the API key must all be different values"
+            ),
+            "{var}: {se}"
+        );
+        assert_eq!(home_listing(&e.home), vec!["daemon.lock".to_string()]);
+        assert_token_absent(&e, &String::from_utf8_lossy(&o.stdout), &se);
+    }
+}
+
+#[test]
+fn whatsapp_listen_port_in_use_exits_1() {
+    let e = Env::new();
+    let wa = Wa::start();
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = held.local_addr().unwrap();
+    e.mock_wa_listen(&wa.base(), json!([]), None, &addr.to_string());
+    let o = e.daemon_cmd().output().unwrap();
+    let se = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert_eq!(o.status.code(), Some(1), "{se}");
+    assert!(
+        se.contains(&format!("error: {addr} is already in use")),
+        "{se}"
+    );
+    assert_eq!(home_listing(&e.home), vec!["daemon.lock".to_string()]);
+    drop(held);
+}
+
+#[test]
+fn daemon_never_prints_or_audits_whatsapp_secrets() {
+    let e = Env::new();
+    let wa = Wa::start();
+    e.mock_wa(&wa.base(), json!([{"text": "hello owner"}]), None);
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    let forged = wa_text("wamid.forged", WA_OWNER, "hi", now_s());
+    assert_eq!(post_webhook(addr, &forged, Some(WA_VERIFY)), 401);
+    let (code, _) = get_webhook(
+        addr,
+        &format!("hub.mode=subscribe&hub.verify_token={WA_VERIFY}&hub.challenge=42"),
+    );
+    assert_eq!(code, 200);
+    post_owner(&mut d, addr, "wamid.in1", "hi");
+    d.wait_for("no model reply", || wa.sent_contains("model: "));
+    assert_eq!(d.stop(), 0, "{}", d.stderr());
+    let mut files = Vec::new();
+    files_under(&e.home, &mut files);
+    assert!(
+        files.iter().any(|f| f.ends_with("whatsapp-seen")),
+        "{files:?}"
+    );
+    assert_token_absent(&e, &d.stdout(), &d.stderr());
+    // The access token went in the header only.
+    for r in wa.rt.block_on(wa.server.received_requests()).unwrap() {
+        assert!(!r.url.as_str().contains(WA_TOKEN), "{}", r.url);
+        let auth = r.headers.get("authorization").unwrap().to_str().unwrap();
+        assert_eq!(auth, format!("Bearer {WA_TOKEN}"));
+    }
+}
+
+#[test]
+fn sigterm_stops_the_whatsapp_listener() {
+    let e = Env::new();
+    let wa = Wa::start();
+    e.mock_wa(&wa.base(), json!([]), None);
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    assert!(TcpStream::connect(addr).is_ok());
+    assert_eq!(d.stop(), 0, "{}", d.stderr());
+    assert!(
+        TcpStream::connect(addr).is_err(),
+        "still listening on {addr}"
+    );
+    assert_eq!(
+        e.decisions().last().map(String::as_str),
+        Some("daemon session ended")
+    );
 }

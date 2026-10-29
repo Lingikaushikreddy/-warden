@@ -1,41 +1,60 @@
-//! `warden daemon`: the agent engine on Telegram, unattended, in the
-//! foreground.
+//! `warden daemon`: the agent engine on Telegram and/or WhatsApp,
+//! unattended, in the foreground.
 //!
 //! Startup fails closed, exit 1, in this order:
 //!
 //! 1. the data dir ([`startup::check_home`]);
 //! 2. `<home>/daemon.lock` (0600, `try_lock`, held for the process's
 //!    lifetime): a second daemon on the same home is refused;
-//! 3. the config, which must have a `[telegram]` table; with `--console`,
-//!    `owner` must be `local`;
+//! 3. the config, which must have a `[telegram]` or a `[whatsapp]` table
+//!    (or both); with `--console`, `owner` must be `local`;
 //! 4. the root ([`startup::resolve_root`]);
 //! 5. the planner key;
-//! 6. the bot token from the variable named by `bot_token_env` (named in
-//!    errors only under the [`startup::showable_env_name`] rule);
-//! 7. `getMe` against the configured Bot API base;
-//! 8. [`startup::open_parts`] with owners `tg:<id>` (and `local` with
-//!    `--console`), then the update offset store;
-//! 9. `Engine::try_new`, with shutdown wired to the signal handler.
+//! 6. with `[telegram]`: the bot token from the variable named by
+//!    `bot_token_env`;
+//! 7. with `[whatsapp]`: the access token, app secret and verify token from
+//!    the variables it names, each shape-checked; then every secret held
+//!    (those three, the bot token, the API key) must be a different value,
+//!    since the verify token travels in a URL query that tunnel logs may
+//!    record. Variables are named in errors only under the
+//!    [`startup::showable_env_name`] rule; values never are;
+//! 8. with `[telegram]`: `getMe` against the configured Bot API base;
+//! 9. with `[whatsapp]`: the Graph API phone number lookup, which checks
+//!    the access token and that it can see `phone_number_id`;
+//! 10. with `[whatsapp]`: the loopback webhook listener is bound (not yet
+//!     serving);
+//! 11. [`startup::open_parts`] with owners `tg:<id>`, `wa:<number>` (and
+//!     `local` with `--console`), then the Telegram update offset store and
+//!     the WhatsApp seen-message store;
+//! 12. `Engine::try_new`, with shutdown wired to the signal handler.
 //!
-//! Steps 1-7 leave no files except the data dir and `daemon.lock`.
+//! Steps 1-10 leave no files except the data dir and `daemon.lock`.
 //!
-//! Then: audit `daemon session started`, print a banner to stderr and run
-//! until the channel closes or a signal arrives. The first SIGINT or
-//! SIGTERM asks the engine to stop after the current step (a running tool
-//! always finishes; a pending prompt is refused); later signals only say so
-//! again. A fatal Telegram condition (token rejected, 409 conflict, offset
-//! unwritable) also stops the engine, even with `--console`. Once shutdown
-//! has started, every Telegram request gets at most 5 s and no 429 retry,
-//! so the last messages fit a service manager's 60 s stop timeout.
-//! Afterwards: one best-effort flush of the deletions still owed (replies
-//! that may hold the PIN), bounded to 10 s; messages still queued are
-//! dropped (delivery is at most once); then audit `daemon session ended`
-//! (best effort) and exit 1 if Telegram failed fatally, else 0.
+//! Then: audit `daemon session started`, start serving webhooks (their
+//! batches go to the WhatsApp channel through a queue of
+//! [`WEBHOOK_QUEUE`] batches), print a banner to stderr and run until the
+//! channels close or a signal arrives. The channel is
+//! `Pair(Pair(telegram, whatsapp), console)`, each side optional. The first
+//! SIGINT or SIGTERM asks the engine to stop after the current step (a
+//! running tool always finishes; a pending prompt is refused); later
+//! signals only say so again. A fatal channel condition (a token rejected,
+//! a Telegram 409 conflict, the offset or seen list unwritable, the
+//! listener gone) also stops the engine, even with `--console`. Once
+//! shutdown has started, every Telegram and Graph request gets at most 5 s
+//! and no rate-limit retry, so the last messages fit a service manager's
+//! 60 s stop timeout. Afterwards: the webhook listener stops (its socket
+//! closes at once; it gets at most 5 s in all); one best-effort flush of
+//! the deletions still owed (replies that may hold the PIN), bounded to
+//! 10 s; messages still queued are dropped (delivery is at most once); then
+//! audit `daemon session ended` (best effort), print one line of WhatsApp
+//! counters if any request was refused or any reply was not sent outside
+//! the 24-hour window, and exit 1 if a channel failed fatally, else 0.
 //!
 //! The approver store lock is held for the daemon's lifetime; the audit log
 //! only while a message is handled, so `warden undo` works while it idles.
-//! stderr never carries message text, tokens or keys, and no logger is
-//! installed (reqwest could log the token-bearing URL).
+//! stderr never carries message text, tokens, secrets or keys, nothing is
+//! printed per request, and no logger is installed (reqwest could log the
+//! token-bearing URL).
 //!
 //! `warden daemon print-service` ([`cmd_print_service`]) prints a launchd
 //! plist or a systemd user unit for the daemon. It reads the config only for
@@ -44,24 +63,36 @@
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{watch, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 use warden_agent::channel::{
     sanitize_for_display, ApprovalPrompt, ApprovalReply, Channel, Inbound, Pair, SenderId,
     StdioChannel,
 };
-use warden_agent::config::{Config, Provider, TelegramConfig, DEFAULT_TELEGRAM_API_BASE};
+use warden_agent::config::{
+    Config, Provider, TelegramConfig, WhatsAppConfig, DEFAULT_GRAPH_API_BASE,
+    DEFAULT_TELEGRAM_API_BASE,
+};
 use warden_agent::engine::Engine;
 use warden_agent::planner::Planner;
 use warden_agent::telegram::{
-    sender_id, BotToken, OffsetStore, TelegramApi, TelegramChannel, TelegramError, TelegramFatal,
+    self, BotToken, OffsetStore, TelegramApi, TelegramChannel, TelegramError, TelegramFatal,
     TelegramOptions, OFFSET_FILE,
+};
+use warden_agent::whatsapp::{
+    self, AccessToken, AppSecret, ErrorClass, GraphApi, ListenerConfig, SeenStore, StatsSnapshot,
+    VerifyToken, WebhookListener, WebhookStats, WhatsAppChannel, WhatsAppError, WhatsAppFatal,
+    WhatsAppOptions, SEEN_FILE,
 };
 
 use crate::startup::{
@@ -79,6 +110,14 @@ const PLACEHOLDER: &str = "REPLACE_ME";
 /// Longest the final flush of pending deletions may take after the engine
 /// has stopped.
 const FINAL_FLUSH: Duration = Duration::from_secs(10);
+/// Webhook batches waiting between the listener and the WhatsApp channel;
+/// a full queue answers 503 so Meta retries later.
+const WEBHOOK_QUEUE: usize = 16;
+/// Longest the webhook listener may take to stop once shutdown is set.
+const LISTENER_STOP: Duration = Duration::from_secs(5);
+/// Message for secrets that are not all different.
+const SECRETS_NOT_DISTINCT: &str =
+    "the WhatsApp secrets, the bot token and the API key must all be different values";
 
 pub fn cmd_daemon(
     home: &Path,
@@ -103,10 +142,10 @@ fn start(
     let _lock = lock_home(home)?;
     // 3. Config.
     let (cfg, config_path) = startup::load_config(home, config)?;
-    let Some(tg) = cfg.telegram.clone() else {
-        err!("error: no channel configured: add a [telegram] table");
+    if cfg.telegram.is_none() && cfg.whatsapp.is_none() {
+        err!("error: no channel configured: add a [telegram] or [whatsapp] table");
         return Err(EXIT_ERROR);
-    };
+    }
     if console && cfg.owner != STDIO_OWNER {
         err!("error: --console only supports owner = \"local\"; remove `owner` from the config");
         return Err(EXIT_ERROR);
@@ -118,16 +157,18 @@ fn start(
         config_path,
         root,
     };
-    // 5. Planner (no files touched), then 6-9.
+    // 5. Planner (no files touched), then 6-12. The key is kept only for
+    // step 7's comparison.
     match &prepared.cfg.provider {
         Provider::Anthropic => {
-            let planner = startup::anthropic_planner(&prepared.cfg)?;
-            serve(planner, home, &prepared, &tg, console)
+            let key = startup::api_key(&prepared.cfg)?;
+            let planner = startup::planner_with_key(&prepared.cfg, key.clone())?;
+            serve(planner, Some(key), home, &prepared, console)
         }
         #[cfg(feature = "test-hooks")]
         Provider::Mock { script } => {
             let planner = startup::mock_planner(script)?;
-            serve(planner, home, &prepared, &tg, console)
+            serve(planner, None, home, &prepared, console)
         }
     }
 }
@@ -171,9 +212,10 @@ fn lock_home(home: &Path) -> Result<File, u8> {
     }
 }
 
-/// Step 6: the bot token. A missing or empty variable is named only when
+/// Step 6: the bot token, and its raw value for step 7's comparison. A
+/// missing or empty variable is named only when
 /// [`startup::showable_env_name`] allows it; a value is never shown.
-fn bot_token(tg: &TelegramConfig) -> Result<BotToken, u8> {
+fn bot_token(tg: &TelegramConfig) -> Result<(BotToken, String), u8> {
     let raw = match std::env::var(&tg.bot_token_env) {
         Ok(t) if !t.is_empty() => t,
         _ => {
@@ -188,10 +230,74 @@ fn bot_token(tg: &TelegramConfig) -> Result<BotToken, u8> {
             return Err(EXIT_ERROR);
         }
     };
-    BotToken::new(raw).map_err(|_| {
-        err!("error: the Telegram bot token variable does not hold a valid bot token");
+    match BotToken::new(raw.clone()) {
+        Ok(t) => Ok((t, raw)),
+        Err(_) => {
+            err!("error: the Telegram bot token variable does not hold a valid bot token");
+            Err(EXIT_ERROR)
+        }
+    }
+}
+
+/// One WhatsApp secret variable's raw value. A missing or empty variable is
+/// named only when [`startup::showable_env_name`] allows it.
+fn whatsapp_var(name: &str, what: &str) -> Result<String, u8> {
+    match std::env::var(name) {
+        Ok(v) if !v.is_empty() => Ok(v),
+        _ => {
+            if startup::showable_env_name(name) {
+                err!(
+                    "error: environment variable {name} is not set or is empty; put your WhatsApp {what} in it"
+                );
+            } else {
+                err!("error: the configured WhatsApp {what} environment variable is not set or is empty");
+            }
+            Err(EXIT_ERROR)
+        }
+    }
+}
+
+/// The three WhatsApp secrets, shape-checked.
+struct WhatsAppSecrets {
+    token: AccessToken,
+    app_secret: AppSecret,
+    verify_token: VerifyToken,
+}
+
+/// Step 7, first half: the three variables, present and well shaped, with
+/// their raw values for the comparison.
+fn whatsapp_secrets(wa: &WhatsAppConfig) -> Result<(WhatsAppSecrets, [String; 3]), u8> {
+    let raw = [
+        whatsapp_var(&wa.access_token_env, "access token")?,
+        whatsapp_var(&wa.app_secret_env, "app secret")?,
+        whatsapp_var(&wa.verify_token_env, "verify token")?,
+    ];
+    let bad = |what: &str| {
+        err!("error: the WhatsApp {what} variable does not hold a valid {what}");
         EXIT_ERROR
-    })
+    };
+    let token = AccessToken::new(raw[0].clone()).map_err(|_| {
+        err!("error: the WhatsApp access token variable does not hold a valid token");
+        EXIT_ERROR
+    })?;
+    let app_secret = AppSecret::new(raw[1].clone()).map_err(|_| bad("app secret"))?;
+    let verify_token = VerifyToken::new(raw[2].clone()).map_err(|_| bad("verify token"))?;
+    Ok((
+        WhatsAppSecrets {
+            token,
+            app_secret,
+            verify_token,
+        },
+        raw,
+    ))
+}
+
+/// No two of `values` are equal.
+fn all_different(values: &[&str]) -> bool {
+    values
+        .iter()
+        .enumerate()
+        .all(|(i, a)| values[i + 1..].iter().all(|b| a != b))
 }
 
 /// A fixed word for a failed `getMe`. Never formats anything from reqwest
@@ -206,17 +312,138 @@ fn reach_kind(e: &TelegramError) -> String {
     }
 }
 
-/// Steps 6-9, then run.
+/// A fixed word for a failed phone number lookup. [`WhatsAppError`] holds
+/// no server text; only numbers and fixed words are formatted.
+fn graph_kind(e: &WhatsAppError) -> String {
+    match e {
+        WhatsAppError::Transport(k) => (*k).to_string(),
+        WhatsAppError::Status(c) => format!("status {c}"),
+        WhatsAppError::Graph { status, code, .. } => format!("status {status}, code {code}"),
+        WhatsAppError::Malformed(m) => format!("malformed response: {m}"),
+        WhatsAppError::TooLarge => "response too large".to_string(),
+        WhatsAppError::Config(m) => (*m).to_string(),
+    }
+}
+
+/// Step 9's message for a failed phone number lookup.
+fn phone_lookup_error(e: &WhatsAppError, phone_number_id: &str) -> String {
+    if e.class() == ErrorClass::AuthRejected {
+        return "WhatsApp rejected the access token".to_string();
+    }
+    match e {
+        WhatsAppError::Graph { code: 100, .. } | WhatsAppError::Status(404) => {
+            format!("the access token cannot see phone_number_id {phone_number_id}")
+        }
+        other => format!(
+            "cannot reach the WhatsApp Cloud API ({})",
+            graph_kind(other)
+        ),
+    }
+}
+
+/// Longest server-supplied text shown in the banner, in characters.
+const BANNER_FIELD_MAX: usize = 64;
+
+/// Server-supplied text (Meta's `display_phone_number`) for the one-line
+/// banner: display-sanitized, with the newlines and tabs that
+/// [`sanitize_for_display`] keeps escaped too, so it cannot start a forged
+/// stderr line, and capped at [`BANNER_FIELD_MAX`] characters.
+fn banner_field(s: &str) -> String {
+    let clean = sanitize_for_display(s)
+        .replace('\n', "\\u{a}")
+        .replace('\t', "\\u{9}");
+    if clean.chars().count() <= BANNER_FIELD_MAX {
+        return clean;
+    }
+    let mut cut: String = clean.chars().take(BANNER_FIELD_MAX - 1).collect();
+    cut.push('…');
+    cut
+}
+
+/// The webhook listener's serving future, spawned once the session starts.
+type ListenerTask = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// The WhatsApp counters reported at exit.
+struct Counters {
+    stats: Arc<WebhookStats>,
+    window_drops: Arc<AtomicU64>,
+    statuses: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
+}
+
+/// The channel's counts at exit.
+#[derive(Debug, Clone, Copy, Default)]
+struct ChannelCounts {
+    window_drops: u64,
+    statuses: u64,
+    /// Items dropped because the channel's queue was full.
+    dropped: u64,
+}
+
+/// The exit line for these counts, if any listener counter, the window
+/// counter or the channel's drop counter is non-zero. The first part is
+/// fixed; other non-zero counts (delivery statuses included) follow it.
+/// Delivery statuses alone are normal traffic and print nothing.
+fn counters_line(s: &StatsSnapshot, c: ChannelCounts) -> Option<String> {
+    let ChannelCounts {
+        window_drops,
+        statuses,
+        dropped,
+    } = c;
+    if s.is_zero() && window_drops == 0 && dropped == 0 {
+        return None;
+    }
+    let mut line = format!(
+        "whatsapp: refused {} unsigned, {} bad-signature, {} oversized, {} slow webhook requests; {window_drops} replies not sent outside the 24 h window",
+        s.unsigned, s.bad_signature, s.too_large, s.timed_out
+    );
+    let others: Vec<String> = [
+        (s.malformed, "malformed"),
+        (s.bad_request, "bad-request"),
+        (s.foreign, "foreign"),
+        (s.queue_full, "queue-full"),
+        (s.busy, "busy"),
+        (s.handshake_refused, "handshake-refused"),
+        (dropped, "queue-dropped"),
+        (statuses, "delivery-status"),
+    ]
+    .iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect();
+    if !others.is_empty() {
+        line.push_str("; other: ");
+        line.push_str(&others.join(", "));
+    }
+    Some(line)
+}
+
+/// Steps 6-11, then run.
 fn serve<P: Planner>(
     planner: P,
+    api_key: Option<String>,
     home: &Path,
     prepared: &Prepared,
-    tg: &TelegramConfig,
     console: bool,
 ) -> Result<u8, u8> {
+    let cfg = &prepared.cfg;
     // 6. Bot token.
-    let token = bot_token(tg)?;
-    // 7. Telegram reachable and the token accepted.
+    let bot = cfg.telegram.as_ref().map(bot_token).transpose()?;
+    // 7. WhatsApp secrets, then every secret held must differ.
+    let wa_secrets = cfg.whatsapp.as_ref().map(whatsapp_secrets).transpose()?;
+    if let Some((_, raw)) = &wa_secrets {
+        let mut values: Vec<&str> = raw.iter().map(String::as_str).collect();
+        values.extend(bot.as_ref().map(|(_, r)| r.as_str()));
+        values.extend(api_key.as_deref());
+        if !all_different(&values) {
+            err!("error: {SECRETS_NOT_DISTINCT}");
+            return Err(EXIT_ERROR);
+        }
+    }
+    drop(api_key);
+    let bot = bot.map(|(t, _)| t);
+    let wa_secrets = wa_secrets.map(|(s, _)| s);
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -224,54 +451,157 @@ fn serve<P: Planner>(
             err!("error: cannot start the async runtime: {e}");
             EXIT_ERROR
         })?;
-    let base = tg.api_base.as_deref().unwrap_or(DEFAULT_TELEGRAM_API_BASE);
-    let api = TelegramApi::new(token, base).map_err(|e| {
-        err!("error: cannot set up the Telegram client: {e}");
-        EXIT_ERROR
-    })?;
-    let me = rt.block_on(api.get_me()).map_err(|e| {
-        match e {
-            TelegramError::Api {
-                code: 401 | 404, ..
-            }
-            | TelegramError::Status(401 | 404) => err!("error: Telegram rejected the bot token"),
-            other => err!("error: cannot reach Telegram ({})", reach_kind(&other)),
+    // 8. Telegram reachable and the token accepted.
+    let tg_api = match (&cfg.telegram, bot) {
+        (Some(tg), Some(token)) => {
+            let base = tg.api_base.as_deref().unwrap_or(DEFAULT_TELEGRAM_API_BASE);
+            let api = TelegramApi::new(token, base).map_err(|e| {
+                err!("error: cannot set up the Telegram client: {e}");
+                EXIT_ERROR
+            })?;
+            let me = rt.block_on(api.get_me()).map_err(|e| {
+                match e {
+                    TelegramError::Api {
+                        code: 401 | 404, ..
+                    }
+                    | TelegramError::Status(401 | 404) => {
+                        err!("error: Telegram rejected the bot token")
+                    }
+                    other => err!("error: cannot reach Telegram ({})", reach_kind(&other)),
+                }
+                EXIT_ERROR
+            })?;
+            Some((tg, api, me.username.unwrap_or_default()))
         }
-        EXIT_ERROR
-    })?;
-    // 8. State.
-    let mut owners: Vec<SenderId> = tg.owner_ids.iter().map(|&id| sender_id(id)).collect();
+        _ => None,
+    };
+    // 9-10. WhatsApp: the token sees the number, and the listener is bound.
+    let wa_api = match (&cfg.whatsapp, wa_secrets) {
+        (Some(wa), Some(secrets)) => {
+            let base = wa.api_base.as_deref().unwrap_or(DEFAULT_GRAPH_API_BASE);
+            let api = GraphApi::new(secrets.token, base, &wa.graph_version, &wa.phone_number_id)
+                .map_err(|e| {
+                    err!("error: cannot set up the WhatsApp client: {e}");
+                    EXIT_ERROR
+                })?;
+            let phone = rt.block_on(api.phone_number()).map_err(|e| {
+                err!("error: {}", phone_lookup_error(&e, &wa.phone_number_id));
+                EXIT_ERROR
+            })?;
+            let listener = rt.block_on(WebhookListener::bind(wa.listen)).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AddrInUse {
+                    err!("error: {} is already in use", wa.listen);
+                } else {
+                    err!("error: cannot listen on {} ({})", wa.listen, e.kind());
+                }
+                EXIT_ERROR
+            })?;
+            let addr: SocketAddr = listener.local_addr().map_err(|e| {
+                err!("error: cannot listen on {} ({})", wa.listen, e.kind());
+                EXIT_ERROR
+            })?;
+            let lcfg = ListenerConfig::new(
+                secrets.app_secret,
+                secrets.verify_token,
+                wa.phone_number_id.clone(),
+            );
+            Some((wa, api, phone.display_phone_number, listener, lcfg, addr))
+        }
+        _ => None,
+    };
+
+    // 11. State.
+    let mut owners: Vec<SenderId> = Vec::new();
+    if let Some(tg) = &cfg.telegram {
+        owners.extend(tg.owner_ids.iter().map(|&id| telegram::sender_id(id)));
+    }
+    if let Some(wa) = &cfg.whatsapp {
+        owners.extend(wa.owner_numbers.iter().map(|n| whatsapp::sender_id(n)));
+    }
+    let remote_owners = owners.len();
     if console {
         owners.push(SenderId(STDIO_OWNER.to_string()));
     }
     let parts = open_parts(home, prepared, owners)?;
-    let (offsets, start_offset) = OffsetStore::open(home).map_err(|e| {
-        err!(
-            "error: cannot open the Telegram update offset in {}: {e}; make {OFFSET_FILE} a regular file with mode 0600, or remove it while Warden is stopped (removing {OFFSET_FILE} may replay messages newer than max_message_age_secs)",
-            shown(home)
-        );
-        EXIT_ERROR
-    })?;
-    let opts = TelegramOptions {
-        allow_pin_approvals: tg.allow_pin_approvals,
-        max_message_age: Duration::from_secs(tg.max_message_age_secs),
-        ..TelegramOptions::default()
+    let offsets = if tg_api.is_some() {
+        Some(OffsetStore::open(home).map_err(|e| {
+            err!(
+                "error: cannot open the Telegram update offset in {}: {e}; make {OFFSET_FILE} a regular file with mode 0600, or remove it while Warden is stopped (removing {OFFSET_FILE} may replay messages newer than max_message_age_secs)",
+                shown(home)
+            );
+            EXIT_ERROR
+        })?)
+    } else {
+        None
     };
+    let seen = if wa_api.is_some() {
+        Some(SeenStore::open(home).map_err(|e| {
+            err!(
+                "error: cannot open the WhatsApp seen-message list in {}: {e}; make {SEEN_FILE} a regular file with mode 0600, or remove it while Warden is stopped (removing it may act on a redelivered message newer than max_message_age_secs)",
+                shown(home)
+            );
+            EXIT_ERROR
+        })?)
+    } else {
+        None
+    };
+
     let slot = FatalSlot::default();
     // The sender lives for the whole run: a dropped sender would mean
-    // "never shut down" to the engine and the channel.
+    // "never shut down" to the engine, the channels and the listener.
     let (tx, rx) = watch::channel(false);
-    let telegram = Watched {
-        inner: TelegramChannel::new(api, tg.owner_ids.clone(), offsets, start_offset, opts)
-            .with_shutdown(rx.clone()),
-        slot: slot.clone(),
+    let mut banner = String::from("warden daemon:");
+    let telegram = match (tg_api, offsets) {
+        (Some((tg, api, username)), Some((offsets, start_offset))) => {
+            banner.push_str(&format!(" telegram @{}", sanitize_for_display(&username)));
+            let opts = TelegramOptions {
+                allow_pin_approvals: tg.allow_pin_approvals,
+                max_message_age: Duration::from_secs(tg.max_message_age_secs),
+                ..TelegramOptions::default()
+            };
+            Some(Watched {
+                inner: TelegramChannel::new(api, tg.owner_ids.clone(), offsets, start_offset, opts)
+                    .with_shutdown(rx.clone()),
+                slot: slot.clone(),
+            })
+        }
+        _ => None,
     };
-    let banner = format!(
-        "warden daemon: telegram @{} owners={} root={}",
-        sanitize_for_display(me.username.as_deref().unwrap_or_default()),
-        tg.owner_ids.len(),
+    let (whatsapp, wa_run) = match (wa_api, seen) {
+        (Some((wa, api, display, listener, lcfg, addr)), Some(seen)) => {
+            banner.push_str(&format!(
+                " whatsapp {} listen={addr}",
+                banner_field(&display)
+            ));
+            let (batch_tx, batch_rx) = mpsc::channel(WEBHOOK_QUEUE);
+            let opts = WhatsAppOptions {
+                max_message_age: Duration::from_secs(wa.max_message_age_secs),
+                ..WhatsAppOptions::default()
+            };
+            let channel = WhatsAppChannel::new(api, batch_rx, wa.owner_numbers.clone(), seen, opts)
+                .with_shutdown(rx.clone());
+            let stats = Arc::new(WebhookStats::default());
+            let counters = Counters {
+                stats: Arc::clone(&stats),
+                window_drops: channel.window_drops(),
+                statuses: channel.status_counter(),
+                dropped: channel.dropped_counter(),
+            };
+            let task: ListenerTask = Box::pin(listener.serve(lcfg, batch_tx, stats, rx.clone()));
+            (
+                Some(Watched {
+                    inner: channel,
+                    slot: slot.clone(),
+                }),
+                Some((task, counters)),
+            )
+        }
+        _ => (None, None),
+    };
+    banner.push_str(&format!(
+        " owners={remote_owners} root={}",
         shown(&prepared.root)
-    );
+    ));
     let code = rt.block_on(async {
         let stdio = console.then(|| {
             StdioChannel::new(
@@ -279,8 +609,8 @@ fn serve<P: Planner>(
                 tokio::io::stdout(),
             )
         });
-        let channel = Pair::new(Some(telegram), stdio);
-        run(planner, parts, channel, &slot, (tx, rx), &banner).await
+        let channel = Pair::new(Pair::new(telegram, whatsapp), stdio);
+        run(planner, parts, channel, &slot, (tx, rx), &banner, wa_run).await
     });
     // Every engine task has been awaited. Do not wait on a stdin reader
     // thread (`--console`) that might still be blocked.
@@ -288,9 +618,15 @@ fn serve<P: Planner>(
     Ok(code)
 }
 
-/// Step 9 and the session: run until the channel closes, a signal asks for
-/// shutdown or Telegram fails fatally. `shutdown` is the signal the engine
-/// and the Telegram channel observe.
+/// Step 12 and the session: run until the channels close, a signal asks
+/// for shutdown or a channel fails fatally. `shutdown` is the signal the
+/// engine, the channels and the webhook listener observe; `whatsapp` is the
+/// listener to start once the session has begun, and its counters. A fatal
+/// channel error sets `shutdown` at once, which also closes the webhook
+/// listener, so Meta is not answered 200 for batches nobody will read. The
+/// listener alone holds the batch queue's sender (moved into its serving
+/// future), so its end is what the WhatsApp channel sees as the queue
+/// closing.
 async fn run<P: Planner, C: Channel>(
     planner: P,
     parts: Parts,
@@ -298,6 +634,7 @@ async fn run<P: Planner, C: Channel>(
     slot: &FatalSlot,
     shutdown: (watch::Sender<bool>, watch::Receiver<bool>),
     banner: &str,
+    whatsapp: Option<(ListenerTask, Counters)>,
 ) -> u8 {
     let Parts {
         cfg,
@@ -339,6 +676,10 @@ async fn run<P: Planner, C: Channel>(
         err!("error: cannot append to audit log: {e}");
         return EXIT_ERROR;
     }
+    let (listener, counters) = match whatsapp {
+        Some((task, counters)) => (Some(tokio::spawn(task)), Some(counters)),
+        None => (None, None),
+    };
     err!("{banner}");
 
     {
@@ -370,14 +711,33 @@ async fn run<P: Planner, C: Channel>(
             }
         }
     }
-    // Requests from here on get the short shutdown timeout.
+    // Requests from here on get the short shutdown timeout, and the
+    // listener closes its socket.
     tx.send_replace(true);
+    if let Some(mut h) = listener {
+        if tokio::time::timeout(LISTENER_STOP, &mut h).await.is_err() {
+            h.abort();
+        }
+    }
     // Deletions still owed (replies that may hold the PIN), best effort and
     // bounded. Messages still queued are dropped (delivery is at most once).
     let _ = tokio::time::timeout(FINAL_FLUSH, engine.channel_mut().flush_pending()).await;
 
     if let Err(e) = session_entry(&audit, DAEMON_SESSION, "daemon session ended") {
         err!("warning: could not record the session end in the audit log: {e}");
+    }
+    if let Some(c) = counters {
+        let line = counters_line(
+            &c.stats.snapshot(),
+            ChannelCounts {
+                window_drops: c.window_drops.load(Ordering::Relaxed),
+                statuses: c.statuses.load(Ordering::Relaxed),
+                dropped: c.dropped.load(Ordering::Relaxed),
+            },
+        );
+        if let Some(line) = line {
+            err!("{line}");
+        }
     }
     match slot.get() {
         Some(f) => {
@@ -392,12 +752,14 @@ async fn run<P: Planner, C: Channel>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChannelFatal {
     Telegram(TelegramFatal),
+    WhatsApp(WhatsAppFatal),
 }
 
 impl fmt::Display for ChannelFatal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ChannelFatal::Telegram(t) => t.fmt(f),
+            ChannelFatal::WhatsApp(w) => w.fmt(f),
         }
     }
 }
@@ -411,6 +773,12 @@ trait FatalSource {
 impl FatalSource for TelegramChannel {
     fn fatal(&self) -> Option<ChannelFatal> {
         TelegramChannel::fatal(self).map(ChannelFatal::Telegram)
+    }
+}
+
+impl FatalSource for WhatsAppChannel {
+    fn fatal(&self) -> Option<ChannelFatal> {
+        WhatsAppChannel::fatal(self).map(ChannelFatal::WhatsApp)
     }
 }
 
@@ -682,4 +1050,80 @@ UMask=0077
 WantedBy=default.target
 "#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_fatal_display_is_the_inner_text() {
+        for t in [
+            TelegramFatal::TokenRejected,
+            TelegramFatal::Conflict,
+            TelegramFatal::OffsetUnwritable,
+        ] {
+            assert_eq!(ChannelFatal::Telegram(t).to_string(), t.to_string());
+        }
+        for w in [
+            WhatsAppFatal::TokenRejected,
+            WhatsAppFatal::SeenUnwritable,
+            WhatsAppFatal::ListenerStopped,
+        ] {
+            assert_eq!(ChannelFatal::WhatsApp(w).to_string(), w.to_string());
+        }
+    }
+
+    #[test]
+    fn counters_line_only_when_something_was_refused_or_dropped() {
+        let zero = StatsSnapshot::default();
+        let counts = |window_drops, statuses, dropped| ChannelCounts {
+            window_drops,
+            statuses,
+            dropped,
+        };
+        assert_eq!(counters_line(&zero, counts(0, 0, 0)), None);
+        // Delivery statuses are normal traffic: alone they print nothing.
+        assert_eq!(counters_line(&zero, counts(0, 7, 0)), None);
+        assert_eq!(
+            counters_line(&zero, counts(0, 0, 1)).unwrap(),
+            "whatsapp: refused 0 unsigned, 0 bad-signature, 0 oversized, 0 slow webhook requests; 0 replies not sent outside the 24 h window; other: 1 queue-dropped"
+        );
+        assert_eq!(
+            counters_line(&zero, counts(2, 0, 0)).unwrap(),
+            "whatsapp: refused 0 unsigned, 0 bad-signature, 0 oversized, 0 slow webhook requests; 2 replies not sent outside the 24 h window"
+        );
+        let s = StatsSnapshot {
+            unsigned: 1,
+            bad_signature: 2,
+            too_large: 3,
+            timed_out: 4,
+            busy: 5,
+            ..StatsSnapshot::default()
+        };
+        assert_eq!(
+            counters_line(&s, counts(0, 6, 0)).unwrap(),
+            "whatsapp: refused 1 unsigned, 2 bad-signature, 3 oversized, 4 slow webhook requests; 0 replies not sent outside the 24 h window; other: 5 busy, 6 delivery-status"
+        );
+    }
+
+    #[test]
+    fn banner_field_is_one_capped_line() {
+        assert_eq!(banner_field("+1 555-010-0000"), "+1 555-010-0000");
+        let forged = banner_field("+1\nerror: forged\tline\u{1b}[2J");
+        assert!(!forged.contains('\n') && !forged.contains('\t'), "{forged}");
+        assert!(!forged.contains('\u{1b}'), "{forged}");
+        assert!(forged.contains("\\u{a}"), "{forged}");
+        let long = banner_field(&"9".repeat(500));
+        assert_eq!(long.chars().count(), BANNER_FIELD_MAX);
+        assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn secrets_must_all_differ() {
+        assert!(all_different(&[]));
+        assert!(all_different(&["a", "b", "c"]));
+        assert!(!all_different(&["a", "b", "a"]));
+        assert!(!all_different(&["a", "b", "c", "b"]));
+    }
 }

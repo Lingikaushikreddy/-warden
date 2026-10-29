@@ -276,7 +276,11 @@ pub(crate) fn api_key(cfg: &Config) -> Result<String, u8> {
 
 /// The Anthropic planner for `cfg` ([`api_key`]; no files touched).
 pub(crate) fn anthropic_planner(cfg: &Config) -> Result<AnthropicPlanner, u8> {
-    let key = api_key(cfg)?;
+    planner_with_key(cfg, api_key(cfg)?)
+}
+
+/// The Anthropic planner for `cfg` with a key already read ([`api_key`]).
+pub(crate) fn planner_with_key(cfg: &Config, key: String) -> Result<AnthropicPlanner, u8> {
     let base = cfg
         .base_url
         .clone()
