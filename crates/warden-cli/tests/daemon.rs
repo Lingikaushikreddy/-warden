@@ -263,6 +263,11 @@ impl Env {
 
     /// `warden --home <home>` with a clean environment and the token set.
     fn warden(&self) -> Command {
+        self.warden_at(&self.home)
+    }
+
+    /// [`Env::warden`] with another data dir.
+    fn warden_at(&self, home: &Path) -> Command {
         let mut c = Command::cargo_bin("warden").unwrap();
         c.env_remove(KEY_VAR)
             .env_remove("WARDEN_PIN")
@@ -272,7 +277,7 @@ impl Env {
             .current_dir(&self.root)
             .timeout(TIMEOUT)
             .arg("--home")
-            .arg(&self.home);
+            .arg(home);
         c
     }
 
@@ -978,4 +983,153 @@ fn assert_token_absent(e: &Env, stdout: &str, stderr: &str) {
             assert!(!text.contains(needle), "{} holds the token", f.display());
         }
     }
+}
+
+// --------------------------------------------------------- print-service
+
+/// `warden --home <home> daemon print-service <args> --config <config>`.
+fn print_service(e: &Env, args: &[&str]) -> std::process::Output {
+    let mut c = e.warden();
+    c.arg("daemon").arg("print-service").args(args);
+    c.arg("--config").arg(&e.config);
+    c.output().unwrap()
+}
+
+/// The canonical path of the `warden` binary under test.
+fn warden_exe() -> String {
+    fs::canonicalize(assert_cmd::cargo::cargo_bin("warden"))
+        .unwrap()
+        .display()
+        .to_string()
+}
+
+#[test]
+fn print_service_launchd_has_absolute_paths_and_placeholders() {
+    let e = Env::new();
+    e.mock("http://127.0.0.1:9", json!([]));
+    let o = print_service(&e, &["--launchd"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    let se = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert_eq!(o.status.code(), Some(0), "{se}");
+    for needle in [
+        warden_exe(),
+        e.home.display().to_string(),
+        e.config.display().to_string(),
+        format!("{}/daemon.log", e.home.display()),
+        "<string>--home</string>".to_string(),
+        "<string>daemon</string>".to_string(),
+        "<string>--config</string>".to_string(),
+        "<string>local.warden.daemon</string>".to_string(),
+        "<key>ANTHROPIC_API_KEY</key>".to_string(),
+        "<key>WARDEN_TELEGRAM_TOKEN</key>".to_string(),
+        "<string>REPLACE_ME</string>".to_string(),
+        "<key>SuccessfulExit</key>".to_string(),
+        "chmod 600".to_string(),
+    ] {
+        assert!(out.contains(&needle), "missing {needle}:\n{out}");
+    }
+    assert!(out.starts_with("<?xml"), "{out}");
+    // The token is in the environment (Env::warden) but never printed.
+    assert_token_absent(&e, &out, &se);
+}
+
+#[test]
+fn print_service_systemd_has_execstart_and_environment_file() {
+    let e = Env::new();
+    e.mock("http://127.0.0.1:9", json!([]));
+    let o = print_service(&e, &["--systemd"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    let se = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert_eq!(o.status.code(), Some(0), "{se}");
+    let exec = format!(
+        "ExecStart=\"{}\" --home \"{}\" daemon --config \"{}\"\n",
+        warden_exe(),
+        e.home.display(),
+        e.config.display()
+    );
+    for needle in [
+        exec.as_str(),
+        "EnvironmentFile=%h/.config/warden/daemon.env\n",
+        "Restart=on-failure\n",
+        "RestartSec=60\n",
+        "TimeoutStopSec=60\n",
+        "KillSignal=SIGTERM\n",
+        "NoNewPrivileges=yes\n",
+        "UMask=0077\n",
+        "WantedBy=default.target\n",
+        "ANTHROPIC_API_KEY=REPLACE_ME",
+        "WARDEN_TELEGRAM_TOKEN=REPLACE_ME",
+    ] {
+        assert!(out.contains(needle), "missing {needle}:\n{out}");
+    }
+    assert_token_absent(&e, &out, &se);
+}
+
+#[test]
+fn print_service_requires_exactly_one_format() {
+    let e = Env::new();
+    e.mock("http://127.0.0.1:9", json!([]));
+    for args in [&[][..], &["--launchd", "--systemd"][..]] {
+        let o = print_service(&e, args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert!(o.stdout.is_empty(), "{args:?}");
+    }
+}
+
+#[test]
+fn print_service_refuses_paths_with_quotes_or_percent() {
+    let e = Env::new();
+    e.mock("http://127.0.0.1:9", json!([]));
+    // A data dir with a quote or a percent sign.
+    for bad in ["ho\"me", "ho%me", "ho$me", "ho`me", "ho\nme"] {
+        let o = e
+            .warden_at(&e.base.join(bad))
+            .args(["daemon", "print-service", "--systemd", "--config"])
+            .arg(&e.config)
+            .output()
+            .unwrap();
+        let se = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert_eq!(o.status.code(), Some(1), "{bad:?}: {se}");
+        assert!(se.contains("path not supported in a service file"), "{se}");
+        assert!(o.stdout.is_empty(), "{bad:?}");
+        assert!(!e.base.join(bad).exists(), "{bad:?}");
+    }
+    // A config path with a quote.
+    let quoted = e.base.join("con'fig.toml");
+    fs::copy(&e.config, &quoted).unwrap();
+    fs::set_permissions(&quoted, fs::Permissions::from_mode(0o600)).unwrap();
+    let o = e
+        .warden()
+        .args(["daemon", "print-service", "--launchd", "--config"])
+        .arg(&quoted)
+        .output()
+        .unwrap();
+    let se = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert_eq!(o.status.code(), Some(1), "{se}");
+    assert!(se.contains("path not supported in a service file"), "{se}");
+    assert!(o.stdout.is_empty());
+}
+
+#[test]
+fn print_service_writes_nothing_to_disk() {
+    let e = Env::new();
+    e.mock("http://127.0.0.1:9", json!([]));
+    let before = home_listing(&e.home);
+    let base_before = home_listing(&e.base);
+    for fmt in ["--launchd", "--systemd"] {
+        let o = print_service(&e, &[fmt]);
+        assert_eq!(o.status.code(), Some(0), "{fmt}");
+    }
+    assert_eq!(home_listing(&e.home), before);
+    assert_eq!(home_listing(&e.base), base_before);
+    // A data dir that does not exist yet is not created.
+    let missing = e.base.join("not-yet");
+    let o = e
+        .warden_at(&missing)
+        .args(["daemon", "print-service", "--launchd", "--config"])
+        .arg(&e.config)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0));
+    assert!(!missing.exists());
 }

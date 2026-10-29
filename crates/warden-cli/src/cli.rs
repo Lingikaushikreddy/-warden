@@ -1,6 +1,6 @@
 //! Command-line definitions (clap derive).
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -136,7 +136,10 @@ pub enum Command {
     /// data dir. Any startup problem exits 1 and nothing runs. SIGINT or
     /// SIGTERM stops it after the current step (exit 0); a fatal Telegram
     /// error exits 1.
+    #[command(args_conflicts_with_subcommands = true)]
     Daemon {
+        #[command(subcommand)]
+        command: Option<DaemonCommand>,
         /// Config file. Default: <home>/config.toml
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
@@ -158,6 +161,26 @@ pub enum Command {
         /// (visible in process lists; prefer WARDEN_CURRENT_PIN).
         #[arg(long, value_name = "PIN")]
         current_pin: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DaemonCommand {
+    /// Print a launchd plist or a systemd user unit that runs `warden
+    /// daemon` with absolute paths. Writes nothing; the secrets are
+    /// `REPLACE_ME` placeholders for you to fill in a 0600 file.
+    #[command(group(ArgGroup::new("format").required(true).args(["launchd", "systemd"])))]
+    PrintService {
+        /// A launchd agent plist (macOS).
+        #[arg(long)]
+        launchd: bool,
+        /// A systemd user unit (Linux).
+        #[arg(long)]
+        systemd: bool,
+        /// Config file the service passes to `warden daemon`.
+        /// Default: <home>/config.toml
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
     },
 }
 

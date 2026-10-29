@@ -509,7 +509,12 @@ exists at the time of the check.
 ## Agent engine (overview)
 
 `warden agent` (in `warden-cli`, `crates/warden-cli/src/agent.rs`) runs the
-agent engine on stdin/stdout. The pieces, each with its own section here:
+agent engine on stdin/stdout; `warden daemon`
+(`crates/warden-cli/src/daemon.rs`) runs the same engine on Telegram,
+optionally paired with stdin/stdout (`--console`). Both share their startup
+(`crates/warden-cli/src/startup.rs`). The daemon's own rules are in
+"Telegram channel" and "Daemon" below. The pieces, each with its own
+section here:
 
 - **Config** (`warden_agent::config`): `<home>/config.toml`, `root`
   required (no default), unknown fields refused, refused if group/other
@@ -524,7 +529,8 @@ agent engine on stdin/stdout. The pieces, each with its own section here:
   group/other-writable; config missing or invalid (the config is opened
   `O_NONBLOCK` and checked through the handle, so a FIFO is refused, not
   waited on); `owner` other than `local` (the stdio channel's only
-  sender); `root` missing, not a directory, `/`, or `$HOME` or an ANCESTOR
+  sender; `warden daemon` checks it only with `--console`, and serves the
+  `[telegram] owner_ids` as `tg:<id>`); `root` missing, not a directory, `/`, or `$HOME` or an ANCESTOR
   of it (unless the hidden `--allow-home-root`; an unset or unresolvable
   `HOME` also needs the flag); key variable unset or empty (named only
   when it is the default, or a conventional `UPPER_SNAKE` name of at most
@@ -717,7 +723,8 @@ planner and the executor are wired together.
   discard notice included, goes to that message's sender only, and an
   approval is asked of (and may only be answered by) the requester, never
   another owner. Owners share one PIN, one PIN lockout and one approver
-  store.
+  store. Accepted cost: wrong PINs from one owner lock PIN approvals for
+  every owner (a cross-owner denial of service; every owner is trusted).
 - **Per-channel PIN gate.** Before a `YesPin` prompt, and before the PIN
   lockout check, an action whose requester's channel answers
   `accepts_pin(sender) == false` is refused with no prompt, no challenge
@@ -882,3 +889,230 @@ sender without `true` is not a shutdown request.
   does not recognize PINs.
 - `AuditLog` appends and `ApproverStore` share the engine's lifetime; the
   engine holds both behind mutexes and processes one message at a time.
+
+## Telegram channel
+
+`warden_agent::telegram` (`api.rs`, `update.rs`, `offset.rs`,
+`channel.rs`): the `Channel` trait over the Telegram Bot API, with long
+polling (`getUpdates`) only. Warden opens no inbound port and sets no
+webhook.
+
+**Trust model.**
+
+- **Telegram authenticates the owner.** Owners are the allowlisted numeric
+  user ids in `[telegram] owner_ids` (1-8, each in `1..=2^52`), served as
+  sender `tg:<id>`. Whoever controls one of those Telegram accounts (a
+  stolen phone, a hijacked session) is an owner and can approve `Yes`
+  actions. Telegram's servers see, and could forge, everything: bot chats
+  are cloud chats, not end-to-end encrypted. Every request, reply, prompt
+  and (with `allow_pin_approvals`) PIN is stored there.
+- **Only a person's private chat counts.** `classify_update` accepts only
+  a new text `message` whose `chat.type` is `"private"` and whose `chat.id`
+  equals `from.id`. Refused, in this order: `edited_message` (`edited`);
+  updates with no `message`, such as channel posts or callback queries
+  (`other`); a message with no `from` or with `sender_chat`
+  (`sender-chat`); `from.is_bot` (`bot`); `via_bot` (`via-bot`); any of
+  `forward_origin`, `forward_from`, `forward_from_chat`, `forward_date`,
+  `forward_sender_name`, `is_automatic_forward`, `external_reply`
+  (`forward`); a group, supergroup, channel or any chat whose id is not the
+  sender's (`group`); non-text (`non-text`); a wrong-typed id field
+  (`malformed`). Each refused update reaches the engine as the non-owner
+  sender `tg-<tag>:<id>` with empty text, so the only effect is the
+  rate-limited `ignored: non-owner` audit entry (at most one per 60 s for
+  all non-owners together). A stranger's private message is `tg:<id>`
+  with empty text: the same entry, which is also how an owner finds their
+  own id. Non-owners never get a reply. An owner's non-text message gets
+  `only text messages are supported`; an owner text starting with `/`
+  gets a fixed help line; neither reaches the engine.
+- **Approvals stay in the requester's chat.** `ask_approval` sends the
+  prompt to the requester's chat only, and the reply is the next text
+  polled from THAT chat after the prompt was sent; updates from anyone else
+  are queued for later. A non-text reply, or a Telegram reply to a message
+  other than the prompt, is No. The text is judged by the same
+  `parse_reply` as the terminal, so it must carry the prompt's challenge
+  code (`yes <code>`, or `yes <code> <PIN>`). A prompt is never cut: one
+  over Telegram's 4096 UTF-16 unit limit is not sent (the owner gets
+  `request too long to approve safely; refused`) and is No.
+- **The PIN is off by default.** `allow_pin_approvals = false` makes
+  `accepts_pin` false, so the engine refuses a `YesPin` action requested
+  over Telegram before any prompt (see "Engine", "Per-channel PIN gate");
+  `ask_approval` also answers No to a `YesPin` prompt by itself. With it
+  on, the prompt adds a warning that the PIN passes through Telegram's
+  servers.
+- **Deleting replies that may hold the PIN (best effort).** A prompt reply
+  with 3 or more whitespace tokens is deleted with `deleteMessage` right
+  after it is read. An approval-shaped message (`yes` followed by
+  anything) with 3 or more tokens is also deleted when it is dropped unread: as stale,
+  by `discard_pending_input`, or by queue overflow. The engine retracts
+  PIN-like messages (see "Engine", "Retraction"). Deletion removes the
+  message from the chat; Telegram's servers have still seen it.
+
+**The token.**
+
+- It comes only from the environment variable named by `bot_token_env`
+  (default `WARDEN_TELEGRAM_TOKEN`; it must differ from `api_key_env`, so
+  the planner key can never be put into a Telegram URL). A config field
+  named `bot_token`, `telegram_token` or `telegram_bot_token` is refused
+  like `api_key`. `BotToken` accepts only
+  `^[0-9]{5,16}:[A-Za-z0-9_-]{30,64}$`, is zeroized on drop, has no
+  `Display`, and its `Debug` is `BotToken(<redacted>)`.
+- It sits in the URL path (`{base}/bot{token}/{method}`), so the URL is
+  built per request in a zeroizing buffer and is never shown. Every
+  reqwest error is reduced to a fixed kind word (`timeout`, `connect`,
+  `other`); reqwest's `Display` is never used (it includes the URL), and
+  `without_url()` is not relied on. Telegram's `description` text is never
+  kept: `TelegramError` holds only fixed text, status codes and
+  `retry_after`. The redactor also matches a bot token after the letters
+  `bot` in a Bot API URL, as a second line of defence.
+- **No logger is ever installed.** reqwest can log request URLs at debug
+  level, and the URL holds the token. Neither `warden agent` nor `warden
+  daemon` sets up `log` or `tracing` output.
+- Startup errors name the variable only under the same rule as the API
+  key variable (the default, or a conventional `UPPER_SNAKE` name); a
+  value is never shown. The token stays in the process environment for the
+  daemon's life.
+
+**Transport.** The shared client (`warden_agent::http`): rustls, proxy
+environment variables ignored (`no_proxy()`), redirects not followed (a
+3xx is an error), 10 s connect timeout. `[telegram] api_base` must be
+`https://`, or `http://` to a loopback host only (used by the tests), with
+no credentials, query or fragment. Responses are read in chunks and capped
+at 1 MiB. Each request has a 30 s timeout, except `getUpdates` (the 30 s
+long poll plus 15 s). No request is retried, except one `sendMessage`
+retry after a 429 whose `retry_after` is at most 30 s.
+
+**Outbound.** `send` delivers only to an owner's chat (`tg:<owner id>`;
+anything else is dropped), after `redact` and display sanitizing, cut to
+4096 UTF-16 units with `…`. Prompts have their summary and model note
+redacted, then are rendered and sanitized by the same `render_prompt` as
+the terminal. Every message is plain text (no `parse_mode`, so no Markdown
+or HTML injection), with link previews off (`link_preview_options:
+{is_disabled: true}`: a preview would make Telegram's servers fetch a
+model-chosen URL) and `protect_content: true` (clients disable forwarding
+and saving; a screenshot still works, so it is not a confidentiality
+boundary). Sends are best effort: a failed send is dropped.
+
+**Offset and stale messages.** Delivery is at most once. `getUpdates`
+fetches up to 20 updates from the saved offset; the offset past the whole
+batch is written to `<home>/telegram-offset` (8 bytes, big-endian `i64`,
+0600, no symlinks, atomic replace through a `.telegram-offset.warden-tmp`
+file) BEFORE any update in the batch is acted on. A crash or kill
+mid-batch therefore loses the rest of that batch instead of replaying it;
+a restart never replays a handled message. If the offset cannot be saved,
+the channel stops (fatal, below). An owner text whose Telegram `date` is
+more than `max_message_age_secs` (default 120, 10-3600) before the local
+clock is never acted on: it reaches the engine as `tg-stale:<id>` with
+empty text, and the owner is told `ignored <n> message(s) older than <s> s
+(sent while Warden was not running)`. The age check uses the local wall
+clock, so a clock that is wrong by more than that misjudges it. A batch
+over the 1 MiB cap is fetched again one update at a time, and a single
+update over the cap is skipped by advancing the offset by one.
+
+**Queue bound.** At most 64 items wait for the engine, and at most 64
+notices wait to be sent. When the queue is full, items without content
+(non-owner, refused and stale ones, which the engine only audits) go
+first: an owner message evicts the newest of them, and is itself dropped
+only when none is left. So a stranger flood cannot push owner messages out
+of the queue. Every drop is counted; a dropped owner message that may hold
+a PIN (approval-shaped, 3 or more tokens) is deleted, best effort.
+
+**Errors.** Transient failures (network, 5xx, 429 on `getUpdates`, a
+malformed response) back off from 1 s, doubling to 60 s. Fatal, and final
+for the channel (`recv` returns `None`, a prompt in progress is
+`Closed`): 401 or 404 (the token was rejected or revoked), 409 (something
+else is polling this bot, or a webhook is set), and an offset that cannot
+be saved. `warden daemon` turns any of them into exit 1 (see "Daemon").
+
+## Daemon
+
+`warden daemon` (`crates/warden-cli/src/daemon.rs`) runs the engine on the
+Telegram channel, in the foreground, unattended.
+
+- **Startup fails closed** (exit 1, nothing runs), in this order: the data
+  dir (as for `warden agent`); `<home>/daemon.lock`; the config, which must
+  have a `[telegram]` table (with `--console`, `owner` must be `local`); the
+  root; the planner key; the bot token variable (unset, empty or not
+  token-shaped); `getMe` (a 401 or 404 is `Telegram rejected the bot
+  token`; anything else is `cannot reach Telegram (<kind>)`); then the
+  audit log, approver store, snapshot store and executor (as for `warden
+  agent`), the offset store and `Engine::try_new`. The steps up to `getMe`
+  leave no file but the data dir and `daemon.lock`.
+- **Locks.** `daemon.lock` (0600, `O_NOFOLLOW`, refused unless a private
+  regular file, `try_lock`) is held for the process's life: a second daemon
+  on the same data dir exits 1 at once. The approver store lock is also
+  held for the daemon's life, so `warden agent` cannot run on the same data
+  dir meanwhile. Two daemons on different data dirs with the same bot get
+  409 conflicts.
+- **The audit lease.** The audit log is held only while a message is
+  handled (see "Agent engine (overview)"), INCLUDING while an approval
+  prompt waits for the owner, which can be up to `approval_timeout`
+  (120 s). During that time `warden undo`, `warden run` and the other
+  writing commands fail fast with a lock error; while the daemon is idle
+  they work. An engine append that finds the log held by one of them
+  waits up to 2 s, then the action is refused `audit unavailable`.
+- **Shutdown.** The SIGINT and SIGTERM handlers are installed after
+  `Engine::try_new` and before the `daemon session started` entry. A signal
+  that arrives before then (during startup) kills the process the default
+  way; no message has been fetched or handled at that point. The first
+  signal afterwards asks the engine to stop (see "Engine", "Shutdown never
+  cancels a running tool"): an idle daemon stops at once, a running tool
+  finishes and is audited, a pending prompt is refused (`refused: shutting
+  down`). Later signals only print `still shutting down`. Then `daemon
+  session ended` is audited (best effort) and the exit code is 0.
+- **Fatal Telegram errors** (token rejected, 409 conflict, offset
+  unwritable) stop the engine the same way and exit 1 with the reason on
+  stderr, also with `--console`.
+- **`--console`** pairs the terminal (sender `local`) with Telegram
+  (`Pair`). Each owner is served on their own side; the terminal accepts
+  the PIN, Telegram only with `allow_pin_approvals`. Closing stdin does not
+  stop the daemon: `Pair` keeps reading Telegram.
+- **stderr** carries the banner (`warden daemon: telegram @<bot>
+  owners=<n> root=<dir>`), warnings and errors: never message text, the
+  token or the API key. No logger is installed (see "Telegram channel").
+- **Clock.** The approver store's high-water mark (`<home>/clock-mark`,
+  see "Agent approver store") clamps a clock that went backwards: approvals
+  and tokens then expire relative to the later time, so they can outlive
+  their real-time TTL by up to the gap. Startup warns on stderr and audits
+  `clock behind high-water mark` when the clock is more than 30 s behind.
+- **PIN lockout persists** in `<home>/pin-guard` (see "Engine"): three bad
+  PINs lock PIN approvals for 60 s, doubling with each further lockout to
+  at most 24 h, across restarts and for every owner at once.
+
+**Service files.** `warden daemon print-service --launchd | --systemd
+[--config <path>]` prints a launchd agent plist (label
+`local.warden.daemon`) or a systemd user unit. It loads the config only to
+read the two variable names (`api_key_env`, `bot_token_env`), never their
+values, writes nothing (not even the data dir) and prints to stdout. The
+paths are the canonical binary (`current_exe`), the absolute data dir and
+the canonical config (only when `--config` is given). A path that is not
+UTF-8 or contains a control character, `"`, `\`, `%`, `$`, `'`, `&`, `<`,
+`>` or a backtick is refused (exit 1, `path not supported in a service
+file`), so no XML entity, systemd specifier, variable or shell expansion
+can appear and plain quoting is enough. The secrets are `REPLACE_ME`
+placeholders: in the plist's `EnvironmentVariables` (the file then holds
+secrets; its leading comment says to `chmod 600` it), and for systemd in
+`EnvironmentFile=%h/.config/warden/daemon.env`, which the unit's comments
+say to create with mode 0600. Both restart only after a failed exit
+(launchd `KeepAlive` `{SuccessfulExit: false}` with `ThrottleInterval` 60;
+systemd `Restart=on-failure`, `RestartSec=60`), so a fatal Telegram error
+is retried once a minute and a clean stop stays stopped. Both allow 60 s
+for a graceful stop (`ExitTimeOut`, `TimeoutStopSec`) and stop with
+SIGTERM. The unit also sets `NoNewPrivileges=yes` and `UMask=0077`.
+launchd writes stderr to `<home>/daemon.log`.
+
+**Recovery when an unattended daemon will not start.** Stop anything using
+the data dir first.
+
+- **`spent-nonces` length not a multiple of 24** (`InvalidData` from the
+  approver store). A crash in the middle of an append leaves a torn last
+  record. Truncate the file to its last whole record (the largest multiple
+  of 24 bytes not above its size). This is safe: an approval token is
+  returned only after its record has been appended and synced, so the
+  approval of a torn record was never issued and nothing ran under it. Do
+  not truncate further: whole records are spent nonces.
+- **Stray `.*.warden-tmp` files** (`.pin-guard.warden-tmp`,
+  `.telegram-offset.warden-tmp`) are leftovers of an interrupted atomic
+  write and are never read as state. The next write removes one itself;
+  any can be deleted while Warden is stopped.
+- **`daemon.lock` not a private regular file**: remove it (it holds no
+  data) and start again.

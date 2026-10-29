@@ -4,7 +4,7 @@
 //! Secrets policy: the PIN, its hash and write content never reach the audit
 //! log, stdout or stderr. Audit summaries name the kind and target only.
 
-use crate::cli::{AuditCommand, Cli, Command, Kind};
+use crate::cli::{AuditCommand, Cli, Command, DaemonCommand, Kind};
 use crate::{EXIT_BLOCKED, EXIT_DENIED, EXIT_ERROR, EXIT_OK};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -100,6 +100,23 @@ pub fn dispatch(cli: Cli) -> u8 {
             allow_home_root,
         } => crate::agent::cmd_agent(&home, config, allow_home_root),
         Command::Daemon {
+            command:
+                Some(DaemonCommand::PrintService {
+                    launchd,
+                    systemd: _,
+                    config,
+                }),
+            ..
+        } => {
+            let format = if launchd {
+                crate::daemon::ServiceFormat::Launchd
+            } else {
+                crate::daemon::ServiceFormat::Systemd
+            };
+            crate::daemon::cmd_print_service(&home, config, format)
+        }
+        Command::Daemon {
+            command: None,
             config,
             console,
             allow_home_root,

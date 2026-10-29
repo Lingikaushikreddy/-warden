@@ -32,6 +32,11 @@
 //! only while a message is handled, so `warden undo` works while it idles.
 //! stderr never carries message text, tokens or keys, and no logger is
 //! installed (reqwest could log the token-bearing URL).
+//!
+//! `warden daemon print-service` ([`cmd_print_service`]) prints a launchd
+//! plist or a systemd user unit for the daemon. It reads the config only for
+//! the two environment variable names, writes nothing, and puts
+//! `REPLACE_ME` where the secrets go.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -62,6 +67,10 @@ use crate::{EXIT_ERROR, EXIT_OK};
 
 /// The single-instance lock file under the data dir.
 const LOCK_FILE: &str = "daemon.lock";
+/// The launchd job label.
+const LAUNCHD_LABEL: &str = "local.warden.daemon";
+/// Where a service file's secret values go.
+const PLACEHOLDER: &str = "REPLACE_ME";
 
 pub fn cmd_daemon(
     home: &Path,
@@ -436,4 +445,175 @@ impl Channel for Watched {
     fn serves(&self, who: &SenderId) -> bool {
         self.inner.serves(who)
     }
+}
+
+/// Which service manager [`cmd_print_service`] writes for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceFormat {
+    /// A launchd agent plist (macOS).
+    Launchd,
+    /// A systemd user unit (Linux).
+    Systemd,
+}
+
+/// `warden daemon print-service`: print a service file that runs `warden
+/// --home <home> daemon [--config <path>]` with absolute paths (the
+/// canonical binary, the absolute data dir, the canonical config).
+///
+/// The config is loaded only to read `api_key_env` and `[telegram]
+/// bot_token_env`; their values are never read, and the file holds
+/// `REPLACE_ME` in their place. Nothing is written or created, not even the
+/// data dir. A path containing a control character or any of
+/// `" \ % $ ' & < >` or a backtick is refused (exit 1), so plain quoting is
+/// enough in both formats: no XML entity, systemd specifier, variable or
+/// shell expansion can appear.
+pub fn cmd_print_service(home: &Path, config: Option<PathBuf>, format: ServiceFormat) -> u8 {
+    match service_file(home, config, format) {
+        Ok(text) => {
+            let _ = std::io::stdout().write_all(text.as_bytes());
+            EXIT_OK
+        }
+        Err(code) => code,
+    }
+}
+
+fn service_file(home: &Path, config: Option<PathBuf>, format: ServiceFormat) -> Result<String, u8> {
+    let exe = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|e| {
+            err!("error: cannot find the warden binary: {e}");
+            EXIT_ERROR
+        })?;
+    let exe = service_path("the warden binary", &exe)?;
+    let home_s = service_path("the data dir", home)?;
+    let explicit = config.is_some();
+    let (cfg, config_path) = startup::load_config(home, config)?;
+    let Some(tg) = cfg.telegram else {
+        err!("error: no channel configured: add a [telegram] table");
+        return Err(EXIT_ERROR);
+    };
+    let config_s = if explicit {
+        Some(service_path("the config", &config_path)?)
+    } else {
+        None
+    };
+    let env = [cfg.api_key_env.as_str(), tg.bot_token_env.as_str()];
+    Ok(match format {
+        ServiceFormat::Launchd => launchd_plist(&exe, &home_s, config_s.as_deref(), env),
+        ServiceFormat::Systemd => systemd_unit(&exe, &home_s, config_s.as_deref(), env),
+    })
+}
+
+/// `p` as UTF-8 if it can go into a service file between plain quotes.
+fn service_path(what: &str, p: &Path) -> Result<String, u8> {
+    const REFUSED: &[char] = &['"', '\\', '%', '$', '\'', '&', '<', '>', '`'];
+    match p.to_str() {
+        Some(s) if !s.chars().any(|c| c.is_control() || REFUSED.contains(&c)) => Ok(s.to_string()),
+        _ => {
+            err!(
+                "error: path not supported in a service file: {what} {}; use a path without quotes, backslashes, %, $, &, <, >, backticks or control characters",
+                shown(p)
+            );
+            Err(EXIT_ERROR)
+        }
+    }
+}
+
+/// The launchd agent plist. Paths and names were checked by
+/// [`service_path`] and the config loader, so none needs XML escaping.
+fn launchd_plist(exe: &str, home: &str, config: Option<&str>, env: [&str; 2]) -> String {
+    let mut args = vec![exe, "--home", home, "daemon"];
+    if let Some(c) = config {
+        args.extend(["--config", c]);
+    }
+    let args: String = args
+        .iter()
+        .map(|a| format!("        <string>{a}</string>\n"))
+        .collect();
+    let vars: String = env
+        .iter()
+        .map(|n| format!("        <key>{n}</key>\n        <string>{PLACEHOLDER}</string>\n"))
+        .collect();
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Warden daemon, launchd agent.
+
+  This file will hold secrets: replace each {PLACEHOLDER} below with the API
+  key and the Telegram bot token, then make it readable only by you:
+    chmod 600 ~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist
+  Load it with:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist
+  launchd restarts the daemon only after a failed exit, at most once a minute.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCHD_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+{args}    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+    <key>ExitTimeOut</key>
+    <integer>60</integer>
+    <key>StandardErrorPath</key>
+    <string>{home}/daemon.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+{vars}    </dict>
+</dict>
+</plist>
+"#
+    )
+}
+
+/// The systemd user unit. Paths were checked by [`service_path`], so plain
+/// double quotes are enough.
+fn systemd_unit(exe: &str, home: &str, config: Option<&str>, env: [&str; 2]) -> String {
+    let config = config
+        .map(|c| format!(" --config \"{c}\""))
+        .unwrap_or_default();
+    let [key, token] = env;
+    format!(
+        r#"# Warden daemon, systemd user unit.
+#
+# Save as ~/.config/systemd/user/warden.service. The secrets go in a
+# separate file readable only by you:
+#   mkdir -p ~/.config/warden
+#   install -m 600 /dev/null ~/.config/warden/daemon.env
+# then put these two lines in it, with the real values:
+#   {key}={PLACEHOLDER}
+#   {token}={PLACEHOLDER}
+# Start it with:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now warden.service
+# systemd restarts the daemon only after a failed exit, after 60 s.
+
+[Unit]
+Description=Warden agent daemon (Telegram)
+
+[Service]
+Type=simple
+ExecStart="{exe}" --home "{home}" daemon{config}
+EnvironmentFile=%h/.config/warden/daemon.env
+Restart=on-failure
+RestartSec=60
+TimeoutStopSec=60
+KillSignal=SIGTERM
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target
+"#
+    )
 }
