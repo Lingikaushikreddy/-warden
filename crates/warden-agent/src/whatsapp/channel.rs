@@ -59,8 +59,9 @@ const MAX_NOTICES: usize = 64;
 /// WhatsApp's text body limit (4096 characters), counted in UTF-16 units,
 /// which are never fewer than characters.
 const MAX_TEXT_UTF16: usize = 4096;
-/// Most batches `discard_pending_input` takes off the receiver in one call.
-const MAX_DISCARD_BATCHES: usize = 64;
+/// A reply may be stamped up to this long before the prompt was sent
+/// (WhatsApp timestamps are whole seconds).
+const REPLY_SLACK_MS: u64 = 1_000;
 
 const NOT_TEXT: &str = "only text messages are supported";
 const PROMPT_TOO_LONG: &str = "request too long to approve safely; refused";
@@ -132,7 +133,8 @@ fn stale_inbound(from: &str) -> Inbound {
 #[derive(Clone)]
 struct Origin {
     from: String,
-    timestamp_s: i64,
+    /// WhatsApp's `timestamp` in ms, capped at the local clock on arrival.
+    at_ms: u64,
 }
 
 /// One item waiting for `recv`.
@@ -148,12 +150,17 @@ enum Event {
     /// Fresh text from an owner.
     OwnerText {
         from: String,
-        timestamp_s: i64,
+        /// Capped arrival time (see [`capped_ms`]).
+        at_ms: u64,
         reply_to: Option<String>,
         text: Zeroizing<String>,
     },
     /// A non-text message from an owner: tagged, and the owner is told.
-    OwnerNotText { from: String, inbound: Inbound },
+    OwnerNotText {
+        from: String,
+        at_ms: u64,
+        inbound: Inbound,
+    },
     /// Anything else, passed on as is (non-owner sender, empty text).
     Pass(Inbound),
 }
@@ -217,6 +224,16 @@ async fn shutdown_started(shutdown: Option<watch::Receiver<bool>>) {
         }
     }
     std::future::pending().await
+}
+
+/// WhatsApp's `timestamp` (seconds) as Unix ms, never later than `now`:
+/// a sender clock running ahead must not keep a message fresh, nor extend
+/// the 24-hour window.
+fn capped_ms(timestamp_s: i64, now: u64) -> u64 {
+    u64::try_from(timestamp_s)
+        .unwrap_or(0)
+        .saturating_mul(1000)
+        .min(now)
 }
 
 /// The wamid of an event, if it has one.
@@ -337,11 +354,11 @@ impl WhatsAppChannel {
         self.window_drops.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Is a message sent at `timestamp_s` too old to act on?
-    fn is_stale(&self, timestamp_s: i64) -> bool {
-        let now = i128::from((self.clock)());
-        let max_age = i128::try_from(self.opts.max_message_age.as_millis()).unwrap_or(i128::MAX);
-        i128::from(timestamp_s) * 1000 + max_age < now
+    /// Is a message that arrived at `at_ms` (capped, see [`capped_ms`])
+    /// too old to act on?
+    fn is_stale(&self, at_ms: u64) -> bool {
+        let max_age = u64::try_from(self.opts.max_message_age.as_millis()).unwrap_or(u64::MAX);
+        at_ms.saturating_add(max_age) < (self.clock)()
     }
 
     fn notify(&mut self, to: &str, text: impl Into<String>) {
@@ -380,18 +397,15 @@ impl WhatsAppChannel {
     fn enqueue_event(&mut self, ev: Event) {
         match ev {
             Event::OwnerText {
-                from,
-                timestamp_s,
-                text,
-                ..
+                from, at_ms, text, ..
             } => self.enqueue(Item {
                 inbound: Inbound {
                     sender: sender_id(&from),
                     text: text.as_str().to_owned(),
                 },
-                origin: Some(Origin { from, timestamp_s }),
+                origin: Some(Origin { from, at_ms }),
             }),
-            Event::OwnerNotText { from, inbound } => {
+            Event::OwnerNotText { from, inbound, .. } => {
                 self.notify(&from, NOT_TEXT);
                 self.enqueue(Item {
                     inbound,
@@ -452,7 +466,7 @@ impl WhatsAppChannel {
             if !self.is_owner(from) {
                 continue;
             }
-            let at = u64::try_from(ts).unwrap_or(0).saturating_mul(1000).min(now);
+            let at = capped_ms(ts, now);
             let slot = self.last_inbound.entry(from.to_string()).or_insert(0);
             *slot = (*slot).max(at);
         }
@@ -469,31 +483,43 @@ impl WhatsAppChannel {
                     ..
                 } => {
                     let body = Zeroizing::new(body);
+                    let at_ms = capped_ms(timestamp_s, now);
                     if !self.is_owner(&from) {
                         events.push(Event::Pass(Inbound {
                             sender: sender_id(&from),
                             text: String::new(),
                         }));
-                    } else if self.is_stale(timestamp_s) {
+                    } else if self.is_stale(at_ms) {
                         count_stale(&mut stale, &from);
                         events.push(Event::Pass(stale_inbound(&from)));
                     } else {
                         events.push(Event::OwnerText {
                             from,
-                            timestamp_s,
+                            at_ms,
                             reply_to,
                             text: body,
                         });
                     }
                 }
-                WaEvent::Refused { from, reason, .. } => {
+                WaEvent::Refused {
+                    from,
+                    reason,
+                    timestamp_s,
+                    ..
+                } => {
                     let inbound = Inbound {
                         sender: tagged(reason.tag(), from.as_deref()),
                         text: String::new(),
                     };
                     match from {
                         Some(from) if reason == RefuseReason::NotText && self.is_owner(&from) => {
-                            events.push(Event::OwnerNotText { from, inbound });
+                            // No timestamp: treat it as arriving now.
+                            let at_ms = timestamp_s.map_or(now, |t| capped_ms(t, now));
+                            events.push(Event::OwnerNotText {
+                                from,
+                                at_ms,
+                                inbound,
+                            });
                         }
                         _ => events.push(Event::Pass(inbound)),
                     }
@@ -515,7 +541,7 @@ impl WhatsAppChannel {
         let mut queue = std::mem::take(&mut self.queue);
         for item in &mut queue {
             let Some(o) = &item.origin else { continue };
-            if !self.is_stale(o.timestamp_s) {
+            if !self.is_stale(o.at_ms) {
                 continue;
             }
             count_stale(&mut stale, &o.from);
@@ -627,6 +653,9 @@ impl Channel for WhatsAppChannel {
     /// else is dropped. Redacted, display-sanitized and cut to 4096 UTF-16
     /// code units.
     async fn send(&mut self, to: &SenderId, text: &str) {
+        if self.fatal.is_some() {
+            return;
+        }
         let Some(number) = self.owner_number(to) else {
             return;
         };
@@ -637,8 +666,8 @@ impl Channel for WhatsAppChannel {
         let _ = self.deliver(&number, &text).await;
     }
 
-    /// The reply is the next fresh text from `to` received after the
-    /// prompt was sent; messages from anyone else are queued for `recv`. A
+    /// The reply is the next fresh text from `to` stamped no earlier than
+    /// the prompt was sent (less 1 s); messages from anyone else are queued for `recv`. A
     /// reply quoting a message other than the prompt is `No`, as is a
     /// non-text reply. Cancel-safe: a reply is taken out of a batch and
     /// judged with no await in between.
@@ -648,6 +677,9 @@ impl Channel for WhatsAppChannel {
         };
         if prompt.tier == Tier::YesPin {
             return ApprovalReply::No;
+        }
+        if self.fatal.is_some() {
+            return ApprovalReply::Undelivered;
         }
         if !self.in_window(&number) {
             self.count_window_drop();
@@ -669,6 +701,10 @@ impl Channel for WhatsAppChannel {
             let _ = self.deliver(&number, PROMPT_TOO_LONG).await;
             return ApprovalReply::No;
         };
+        // Only a message stamped at or after this (less the timestamp's
+        // whole-second rounding) can answer; earlier ones were typed before
+        // the prompt existed and are queued for `recv` instead.
+        let not_before = (self.clock)().saturating_sub(REPLY_SLACK_MS);
         let Some(prompt_id) = self.deliver(&number, &text).await else {
             return ApprovalReply::Undelivered;
         };
@@ -687,13 +723,15 @@ impl Channel for WhatsAppChannel {
                 match ev {
                     Event::OwnerText {
                         from,
+                        at_ms,
                         reply_to,
                         text,
-                        ..
-                    } if from == number && reply.is_none() => {
+                    } if from == number && at_ms >= not_before && reply.is_none() => {
                         reply = Some(Some((reply_to, text)));
                     }
-                    Event::OwnerNotText { from, .. } if from == number && reply.is_none() => {
+                    Event::OwnerNotText { from, at_ms, .. }
+                        if from == number && at_ms >= not_before && reply.is_none() =>
+                    {
                         reply = Some(None);
                     }
                     other => self.enqueue_event(other),
@@ -712,8 +750,8 @@ impl Channel for WhatsAppChannel {
         }
     }
 
-    /// Drops `to`'s queued messages, takes whatever batches are already
-    /// waiting (without waiting for more), drops `to`'s new messages and
+    /// Drops `to`'s queued messages, takes every batch already waiting
+    /// (until the receiver is empty, without waiting for more), drops `to`'s new messages and
     /// queues the rest. Returns the bytes dropped (at least 1 per message).
     async fn discard_pending_input(&mut self, to: &SenderId) -> usize {
         let Some(number) = self.owner_number(to) else {
@@ -729,11 +767,8 @@ impl Channel for WhatsAppChannel {
                 _ => self.queue.push_back(item),
             }
         }
-        for _ in 0..MAX_DISCARD_BATCHES {
-            if self.fatal.is_some() {
-                break;
-            }
-            // A closed receiver is left for `recv` to report.
+        // A closed receiver is left for `recv` to report.
+        while self.fatal.is_none() {
             let Ok(batch) = self.inbound.try_recv() else {
                 break;
             };
@@ -765,6 +800,10 @@ impl Channel for WhatsAppChannel {
         let Some(number) = self.owner_number(to) else {
             return;
         };
+        // Outside the window the notice is skipped silently (not counted).
+        if self.fatal.is_some() || !self.in_window(&number) {
+            return;
+        }
         let _ = self.deliver(&number, CANNOT_DELETE).await;
     }
 

@@ -988,3 +988,123 @@ async fn serves_only_wa_senders() {
         assert!(!ch.serves(&SenderId(who.clone())), "{who}");
     }
 }
+
+// ------------------------------------------------------- review round 1
+
+/// Meta's clock runs an hour ahead: the age rule uses the timestamp capped
+/// at the local clock, so a queued owner text still expires.
+#[tokio::test]
+async fn future_timestamp_is_capped_for_queue_age() {
+    let h = Harness::new().await;
+    let now = Arc::new(AtomicU64::new(NOW_MS));
+    let clock = Arc::clone(&now);
+    let (tx, mut ch) = h.channel_with(&[OWNER], Box::new(move || clock.load(Ordering::SeqCst)));
+    tx.send(batch(vec![
+        text_at("wamid.f1", OWNER, "first", NOW_S + 3600),
+        text_at("wamid.f2", OWNER, "delete notes.txt", NOW_S + 3600),
+    ]))
+    .await
+    .unwrap();
+    assert_eq!(ch.recv().await.unwrap().text, "first");
+    // 30 minutes in the queue: far past the 120 s age.
+    now.fetch_add(1_800_000, Ordering::SeqCst);
+    let m = ch.recv().await.unwrap();
+    assert_eq!(m.sender, SenderId(format!("wa-stale:{OWNER}")));
+    assert_eq!(m.text, "");
+    // Also at ingest: a future-stamped text arriving after a long wait
+    // since a far-future one is judged by arrival, not by Meta's clock.
+    now.fetch_add(3_600_000, Ordering::SeqCst);
+    tx.send(batch(vec![text_at(
+        "wamid.f3",
+        OWNER,
+        "later",
+        NOW_S + 10 * 3600,
+    )]))
+    .await
+    .unwrap();
+    assert_eq!(ch.recv().await.unwrap().text, "later");
+}
+
+/// An owner message stamped before the prompt was sent (buffered while the
+/// engine built it) is not the reply; it is queued for `recv`, not lost.
+#[tokio::test]
+async fn message_sent_before_the_prompt_is_queued_not_taken_as_reply() {
+    let h = Harness::new().await;
+    let (tx, mut ch) = h.channel();
+    open_window(&tx, &mut ch).await;
+    tx.send(batch(vec![
+        text_at("wamid.b1", OWNER, "yes 4821", NOW_S - 5),
+        text_at("wamid.b2", OWNER, "also list my files", NOW_S - 2),
+    ]))
+    .await
+    .unwrap();
+    tx.send(batch(vec![text("wamid.r", OWNER, "no")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        ch.ask_approval(&owner(), &prompt(Tier::Yes)).await,
+        ApprovalReply::No
+    );
+    let m = ch.recv().await.unwrap();
+    assert_eq!((m.sender, m.text.as_str()), (owner(), "yes 4821"));
+    assert_eq!(ch.recv().await.unwrap().text, "also list my files");
+    assert!(recv_quiet(&mut ch).await);
+}
+
+#[tokio::test]
+async fn retract_last_outside_window_is_silent_and_not_counted() {
+    let h = Harness::new().await;
+    let (_tx, mut ch) = h.channel();
+    let drops = ch.window_drops();
+    ch.retract_last(&owner()).await;
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+    assert!(h.sent().await.is_empty());
+}
+
+#[tokio::test]
+async fn fatal_channel_makes_no_requests() {
+    let h = Harness::new().await;
+    let (tx, mut ch) = h.channel();
+    open_window(&tx, &mut ch).await;
+    h.script.push(graph_error(401, 190));
+    ch.send(&owner(), "first").await;
+    assert_eq!(ch.fatal(), Some(WhatsAppFatal::TokenRejected));
+    assert_eq!(h.sent().await.len(), 1);
+    ch.send(&owner(), "second").await;
+    assert_eq!(
+        ch.ask_approval(&owner(), &prompt(Tier::Yes)).await,
+        ApprovalReply::Undelivered
+    );
+    ch.retract_last(&owner()).await;
+    assert_eq!(h.sent().await.len(), 1);
+    assert_eq!(ch.window_drops().load(Ordering::Relaxed), 0);
+}
+
+/// Every batch already waiting is drained, however many there are.
+#[tokio::test]
+async fn discard_drains_more_than_64_waiting_batches() {
+    let h = Harness::new().await;
+    let api = GraphApi::new(
+        AccessToken::new(TOKEN.into()).unwrap(),
+        &h.server.uri(),
+        "v26.0",
+        PNID,
+    )
+    .unwrap();
+    let (tx, rx) = mpsc::channel(256);
+    let mut ch = WhatsAppChannel::new(
+        api,
+        rx,
+        vec![OWNER.to_string()],
+        SeenStore::open(h.home.path()).unwrap(),
+        opts(),
+    )
+    .with_clock(Box::new(|| NOW_MS));
+    for i in 0..100 {
+        tx.send(batch(vec![text(&format!("wamid.d{i}"), OWNER, "x")]))
+            .await
+            .unwrap();
+    }
+    assert_eq!(ch.discard_pending_input(&owner()).await, 100);
+    assert!(recv_quiet(&mut ch).await);
+}
