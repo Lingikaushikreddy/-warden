@@ -1197,3 +1197,133 @@ fn print_service_writes_nothing_to_disk() {
     assert_eq!(o.status.code(), Some(0));
     assert!(!missing.exists());
 }
+
+/// A `[whatsapp]` table body with the default env names.
+const WA_TABLE: &str =
+    "[whatsapp]\nowner_numbers = [\"+15551234567\"]\nphone_number_id = \"106540352242922\"\n";
+
+/// The three default WhatsApp secret env names, with fake values.
+const WA_VARS: [(&str, &str); 3] = [
+    (
+        "WARDEN_WHATSAPP_TOKEN",
+        "EAAGfakeAccessTokenDONOTLEAK0123456789",
+    ),
+    (
+        "WARDEN_WHATSAPP_APP_SECRET",
+        "fakeappsecretDONOTLEAK0123456789ab",
+    ),
+    (
+        "WARDEN_WHATSAPP_VERIFY_TOKEN",
+        "fakeverifytokenDONOTLEAK987654321",
+    ),
+];
+
+/// A mock-provider config holding `tables` after the top-level fields.
+fn config_with_tables(e: &Env, tables: &str) {
+    let s = e.base.join("script.json");
+    fs::write(&s, "[]").unwrap();
+    e.config_text(&format!(
+        "root = \"{}\"\nprovider = \"mock\"\nscript = \"{}\"\n\n{tables}",
+        e.root.display(),
+        s.display()
+    ));
+}
+
+/// [`print_service`] with the WhatsApp secrets set to fake values.
+fn print_service_wa(e: &Env, fmt: &str) -> (String, String, Option<i32>) {
+    let mut c = e.warden();
+    for (k, v) in WA_VARS {
+        c.env(k, v);
+    }
+    c.args(["daemon", "print-service", fmt, "--config"])
+        .arg(&e.config);
+    let o = c.output().unwrap();
+    (
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+        o.status.code(),
+    )
+}
+
+#[test]
+fn print_service_lists_whatsapp_env_names() {
+    let e = Env::new();
+    // [whatsapp] only.
+    config_with_tables(&e, WA_TABLE);
+    for fmt in ["--launchd", "--systemd"] {
+        let (out, se, code) = print_service_wa(&e, fmt);
+        assert_eq!(code, Some(0), "{fmt}: {se}");
+        for (name, _) in WA_VARS {
+            assert!(out.contains(name), "{fmt}: missing {name}:\n{out}");
+        }
+        assert!(out.contains("REPLACE_ME"), "{fmt}:\n{out}");
+        assert!(out.contains(KEY_VAR), "{fmt}:\n{out}");
+        assert!(!out.contains(TOKEN_VAR), "{fmt}:\n{out}");
+        for (_, value) in WA_VARS {
+            assert!(!out.contains(value), "{fmt}: value printed:\n{out}");
+            assert!(!se.contains(value), "{fmt}: value in stderr:\n{se}");
+        }
+        assert_token_absent(&e, &out, &se);
+    }
+    let (out, _, _) = print_service_wa(&e, "--systemd");
+    for (name, _) in WA_VARS {
+        assert!(
+            out.contains(&format!("#   {name}=REPLACE_ME\n")),
+            "missing {name} line:\n{out}"
+        );
+    }
+    // Both tables: all five names, in the documented order.
+    config_with_tables(
+        &e,
+        &format!("[telegram]\nowner_ids = [{OWNER}]\n\n{WA_TABLE}"),
+    );
+    for fmt in ["--launchd", "--systemd"] {
+        let (out, se, code) = print_service_wa(&e, fmt);
+        assert_eq!(code, Some(0), "{fmt}: {se}");
+        let names = [
+            KEY_VAR,
+            TOKEN_VAR,
+            "WARDEN_WHATSAPP_TOKEN",
+            "WARDEN_WHATSAPP_APP_SECRET",
+            "WARDEN_WHATSAPP_VERIFY_TOKEN",
+        ];
+        let at: Vec<usize> = names
+            .iter()
+            .map(|n| {
+                let pat = match fmt {
+                    "--launchd" => format!("<key>{n}</key>"),
+                    _ => format!("{n}=REPLACE_ME"),
+                };
+                out.find(&pat)
+                    .unwrap_or_else(|| panic!("{fmt}: missing {pat}:\n{out}"))
+            })
+            .collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{fmt}: order:\n{out}");
+        for (_, value) in WA_VARS {
+            assert!(!out.contains(value), "{fmt}: value printed:\n{out}");
+            assert!(!se.contains(value), "{fmt}: value in stderr:\n{se}");
+        }
+        assert_token_absent(&e, &out, &se);
+    }
+    // Copy changes.
+    let (plist, _, _) = print_service_wa(&e, "--launchd");
+    assert!(plist.contains("API key and the channel secrets"), "{plist}");
+    let (unit, _, _) = print_service_wa(&e, "--systemd");
+    assert!(unit.contains("Description=Warden agent daemon\n"), "{unit}");
+}
+
+#[test]
+fn print_service_without_any_channel_exits_1() {
+    let e = Env::new();
+    config_with_tables(&e, "");
+    for fmt in ["--launchd", "--systemd"] {
+        let o = print_service(&e, &[fmt]);
+        let se = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert_eq!(o.status.code(), Some(1), "{fmt}: {se}");
+        assert!(
+            se.contains("error: no channel configured: add a [telegram] or [whatsapp] table"),
+            "{fmt}: {se}"
+        );
+        assert!(o.stdout.is_empty(), "{fmt}");
+    }
+}

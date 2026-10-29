@@ -39,7 +39,7 @@
 //!
 //! `warden daemon print-service` ([`cmd_print_service`]) prints a launchd
 //! plist or a systemd user unit for the daemon. It reads the config only for
-//! the two environment variable names, writes nothing, and puts
+//! the secret environment variable names, writes nothing, and puts
 //! `REPLACE_ME` where the secrets go.
 
 use std::fs::{File, OpenOptions};
@@ -55,7 +55,7 @@ use warden_agent::channel::{
     sanitize_for_display, ApprovalPrompt, ApprovalReply, Channel, Inbound, Pair, SenderId,
     StdioChannel,
 };
-use warden_agent::config::{Provider, TelegramConfig, DEFAULT_TELEGRAM_API_BASE};
+use warden_agent::config::{Config, Provider, TelegramConfig, DEFAULT_TELEGRAM_API_BASE};
 use warden_agent::engine::Engine;
 use warden_agent::planner::Planner;
 use warden_agent::telegram::{
@@ -481,9 +481,10 @@ pub enum ServiceFormat {
 /// --home <home> daemon [--config <path>]` with absolute paths (the
 /// canonical binary, the absolute data dir, the canonical config).
 ///
-/// The config is loaded only to read `api_key_env` and `[telegram]
-/// bot_token_env`; their values are never read, and the file holds
-/// `REPLACE_ME` in their place. Nothing is written or created, not even the
+/// The config is loaded only to read the secret env names: `api_key_env`,
+/// `[telegram] bot_token_env` and the three `[whatsapp]` `*_env` names
+/// (those of the tables present). Their values are never read, and the file
+/// holds `REPLACE_ME` in their place. Nothing is written or created, not even the
 /// data dir. A path containing a control character or any of
 /// `" \ % $ ' & < >` or a backtick is refused (exit 1), so plain quoting is
 /// enough in both formats: no XML entity, systemd specifier, variable or
@@ -509,20 +510,38 @@ fn service_file(home: &Path, config: Option<PathBuf>, format: ServiceFormat) -> 
     let home_s = service_path("the data dir", home)?;
     let explicit = config.is_some();
     let (cfg, config_path) = startup::load_config(home, config)?;
-    let Some(tg) = cfg.telegram else {
-        err!("error: no channel configured: add a [telegram] table");
+    if cfg.telegram.is_none() && cfg.whatsapp.is_none() {
+        err!("error: no channel configured: add a [telegram] or [whatsapp] table");
         return Err(EXIT_ERROR);
-    };
+    }
     let config_s = if explicit {
         Some(service_path("the config", &config_path)?)
     } else {
         None
     };
-    let env = [cfg.api_key_env.as_str(), tg.bot_token_env.as_str()];
+    let env = service_env_names(&cfg);
     Ok(match format {
-        ServiceFormat::Launchd => launchd_plist(&exe, &home_s, config_s.as_deref(), env),
-        ServiceFormat::Systemd => systemd_unit(&exe, &home_s, config_s.as_deref(), env),
+        ServiceFormat::Launchd => launchd_plist(&exe, &home_s, config_s.as_deref(), &env),
+        ServiceFormat::Systemd => systemd_unit(&exe, &home_s, config_s.as_deref(), &env),
     })
+}
+
+/// The secret env names a service file needs, in order: `api_key_env`, then
+/// `[telegram] bot_token_env`, then the `[whatsapp]` access token, app
+/// secret and verify token names, each table only if present.
+fn service_env_names(cfg: &Config) -> Vec<&str> {
+    let mut env = vec![cfg.api_key_env.as_str()];
+    if let Some(tg) = &cfg.telegram {
+        env.push(tg.bot_token_env.as_str());
+    }
+    if let Some(wa) = &cfg.whatsapp {
+        env.extend([
+            wa.access_token_env.as_str(),
+            wa.app_secret_env.as_str(),
+            wa.verify_token_env.as_str(),
+        ]);
+    }
+    env
 }
 
 /// `p` as UTF-8 if it can go into a service file between plain quotes.
@@ -542,7 +561,7 @@ fn service_path(what: &str, p: &Path) -> Result<String, u8> {
 
 /// The launchd agent plist. Paths and names were checked by
 /// [`service_path`] and the config loader, so none needs XML escaping.
-fn launchd_plist(exe: &str, home: &str, config: Option<&str>, env: [&str; 2]) -> String {
+fn launchd_plist(exe: &str, home: &str, config: Option<&str>, env: &[&str]) -> String {
     let mut args = vec![exe, "--home", home, "daemon"];
     if let Some(c) = config {
         args.extend(["--config", c]);
@@ -560,8 +579,8 @@ fn launchd_plist(exe: &str, home: &str, config: Option<&str>, env: [&str; 2]) ->
 <!--
   Warden daemon, launchd agent.
 
-  This file will hold secrets: replace each {PLACEHOLDER} below with the API
-  key and the Telegram bot token, then make it readable only by you:
+  This file will hold secrets: replace each {PLACEHOLDER} below with the
+  API key and the channel secrets, then make it readable only by you:
     chmod 600 ~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist
   Load it with:
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist
@@ -599,11 +618,14 @@ fn launchd_plist(exe: &str, home: &str, config: Option<&str>, env: [&str; 2]) ->
 
 /// The systemd user unit. Paths were checked by [`service_path`], so plain
 /// double quotes are enough.
-fn systemd_unit(exe: &str, home: &str, config: Option<&str>, env: [&str; 2]) -> String {
+fn systemd_unit(exe: &str, home: &str, config: Option<&str>, env: &[&str]) -> String {
     let config = config
         .map(|c| format!(" --config \"{c}\""))
         .unwrap_or_default();
-    let [key, token] = env;
+    let lines: String = env
+        .iter()
+        .map(|n| format!("#   {n}={PLACEHOLDER}\n"))
+        .collect();
     format!(
         r#"# Warden daemon, systemd user unit.
 #
@@ -611,16 +633,14 @@ fn systemd_unit(exe: &str, home: &str, config: Option<&str>, env: [&str; 2]) -> 
 # separate file readable only by you:
 #   mkdir -p ~/.config/warden
 #   install -m 600 /dev/null ~/.config/warden/daemon.env
-# then put these two lines in it, with the real values:
-#   {key}={PLACEHOLDER}
-#   {token}={PLACEHOLDER}
-# Start it with:
+# then put these lines in it, with the real values:
+{lines}# Start it with:
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now warden.service
 # systemd restarts the daemon only after a failed exit, after 60 s.
 
 [Unit]
-Description=Warden agent daemon (Telegram)
+Description=Warden agent daemon
 
 [Service]
 Type=simple
