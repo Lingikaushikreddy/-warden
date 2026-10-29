@@ -13,10 +13,10 @@
 //! 6. with `[telegram]`: the bot token from the variable named by
 //!    `bot_token_env`;
 //! 7. with `[whatsapp]`: the access token, app secret and verify token from
-//!    the variables it names, each shape-checked; then every secret held
-//!    (those three, the bot token, the API key) must be a different value,
-//!    since the verify token travels in a URL query that tunnel logs may
-//!    record. Variables are named in errors only under the
+//!    the variables it names, each shape-checked; then, with any mix of
+//!    channels, every secret held (those three, the bot token, the API key)
+//!    must be a different value, since the verify token travels in a URL
+//!    query that tunnel logs may record. Variables are named in errors only under the
 //!    [`startup::showable_env_name`] rule; values never are;
 //! 8. with `[telegram]`: `getMe` against the configured Bot API base;
 //! 9. with `[whatsapp]`: the Graph API phone number lookup, which checks
@@ -367,7 +367,6 @@ type ListenerTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 struct Counters {
     stats: Arc<WebhookStats>,
     window_drops: Arc<AtomicU64>,
-    statuses: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
 }
 
@@ -375,19 +374,17 @@ struct Counters {
 #[derive(Debug, Clone, Copy, Default)]
 struct ChannelCounts {
     window_drops: u64,
-    statuses: u64,
     /// Items dropped because the channel's queue was full.
     dropped: u64,
 }
 
 /// The exit line for these counts, if any listener counter, the window
 /// counter or the channel's drop counter is non-zero. The first part is
-/// fixed; other non-zero counts (delivery statuses included) follow it.
-/// Delivery statuses alone are normal traffic and print nothing.
+/// fixed; the other non-zero refusal and drop counts follow it. Delivery
+/// statuses are normal traffic and are not reported.
 fn counters_line(s: &StatsSnapshot, c: ChannelCounts) -> Option<String> {
     let ChannelCounts {
         window_drops,
-        statuses,
         dropped,
     } = c;
     if s.is_zero() && window_drops == 0 && dropped == 0 {
@@ -401,11 +398,11 @@ fn counters_line(s: &StatsSnapshot, c: ChannelCounts) -> Option<String> {
         (s.malformed, "malformed"),
         (s.bad_request, "bad-request"),
         (s.foreign, "foreign"),
+        (s.truncated, "truncated"),
         (s.queue_full, "queue-full"),
         (s.busy, "busy"),
         (s.handshake_refused, "handshake-refused"),
         (dropped, "queue-dropped"),
-        (statuses, "delivery-status"),
     ]
     .iter()
     .filter(|(n, _)| *n > 0)
@@ -429,16 +426,18 @@ fn serve<P: Planner>(
     let cfg = &prepared.cfg;
     // 6. Bot token.
     let bot = cfg.telegram.as_ref().map(bot_token).transpose()?;
-    // 7. WhatsApp secrets, then every secret held must differ.
+    // 7. WhatsApp secrets, then every secret held (with any mix of
+    // channels, so the bot token and the API key too) must differ.
     let wa_secrets = cfg.whatsapp.as_ref().map(whatsapp_secrets).transpose()?;
+    let mut values: Vec<&str> = Vec::new();
     if let Some((_, raw)) = &wa_secrets {
-        let mut values: Vec<&str> = raw.iter().map(String::as_str).collect();
-        values.extend(bot.as_ref().map(|(_, r)| r.as_str()));
-        values.extend(api_key.as_deref());
-        if !all_different(&values) {
-            err!("error: {SECRETS_NOT_DISTINCT}");
-            return Err(EXIT_ERROR);
-        }
+        values.extend(raw.iter().map(String::as_str));
+    }
+    values.extend(bot.as_ref().map(|(_, r)| r.as_str()));
+    values.extend(api_key.as_deref());
+    if !all_different(&values) {
+        err!("error: {SECRETS_NOT_DISTINCT}");
+        return Err(EXIT_ERROR);
     }
     drop(api_key);
     let bot = bot.map(|(t, _)| t);
@@ -584,7 +583,6 @@ fn serve<P: Planner>(
             let counters = Counters {
                 stats: Arc::clone(&stats),
                 window_drops: channel.window_drops(),
-                statuses: channel.status_counter(),
                 dropped: channel.dropped_counter(),
             };
             let task: ListenerTask = Box::pin(listener.serve(lcfg, batch_tx, stats, rx.clone()));
@@ -731,7 +729,6 @@ async fn run<P: Planner, C: Channel>(
             &c.stats.snapshot(),
             ChannelCounts {
                 window_drops: c.window_drops.load(Ordering::Relaxed),
-                statuses: c.statuses.load(Ordering::Relaxed),
                 dropped: c.dropped.load(Ordering::Relaxed),
             },
         );
@@ -1077,20 +1074,17 @@ mod tests {
     #[test]
     fn counters_line_only_when_something_was_refused_or_dropped() {
         let zero = StatsSnapshot::default();
-        let counts = |window_drops, statuses, dropped| ChannelCounts {
+        let counts = |window_drops, dropped| ChannelCounts {
             window_drops,
-            statuses,
             dropped,
         };
-        assert_eq!(counters_line(&zero, counts(0, 0, 0)), None);
-        // Delivery statuses are normal traffic: alone they print nothing.
-        assert_eq!(counters_line(&zero, counts(0, 7, 0)), None);
+        assert_eq!(counters_line(&zero, counts(0, 0)), None);
         assert_eq!(
-            counters_line(&zero, counts(0, 0, 1)).unwrap(),
+            counters_line(&zero, counts(0, 1)).unwrap(),
             "whatsapp: refused 0 unsigned, 0 bad-signature, 0 oversized, 0 slow webhook requests; 0 replies not sent outside the 24 h window; other: 1 queue-dropped"
         );
         assert_eq!(
-            counters_line(&zero, counts(2, 0, 0)).unwrap(),
+            counters_line(&zero, counts(2, 0)).unwrap(),
             "whatsapp: refused 0 unsigned, 0 bad-signature, 0 oversized, 0 slow webhook requests; 2 replies not sent outside the 24 h window"
         );
         let s = StatsSnapshot {
@@ -1099,11 +1093,12 @@ mod tests {
             too_large: 3,
             timed_out: 4,
             busy: 5,
+            truncated: 7,
             ..StatsSnapshot::default()
         };
         assert_eq!(
-            counters_line(&s, counts(0, 6, 0)).unwrap(),
-            "whatsapp: refused 1 unsigned, 2 bad-signature, 3 oversized, 4 slow webhook requests; 0 replies not sent outside the 24 h window; other: 5 busy, 6 delivery-status"
+            counters_line(&s, counts(0, 0)).unwrap(),
+            "whatsapp: refused 1 unsigned, 2 bad-signature, 3 oversized, 4 slow webhook requests; 0 replies not sent outside the 24 h window; other: 7 truncated, 5 busy"
         );
     }
 

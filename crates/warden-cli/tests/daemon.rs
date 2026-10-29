@@ -1474,6 +1474,12 @@ fn http(addr: SocketAddr, head: &str, body: &[u8]) -> (u16, String) {
 
 /// POST `body` to the webhook, signed with `secret` when given.
 fn post_webhook(addr: SocketAddr, body: &Value, secret: Option<&str>) -> u16 {
+    let (head, raw) = webhook_request(addr, body, secret);
+    http(addr, &head, &raw).0
+}
+
+/// The head and body of a webhook POST, signed with `secret` when given.
+fn webhook_request(addr: SocketAddr, body: &Value, secret: Option<&str>) -> (String, Vec<u8>) {
     let raw = serde_json::to_vec(body).unwrap();
     let mut head = format!(
         "POST /webhook HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -1486,7 +1492,54 @@ fn post_webhook(addr: SocketAddr, body: &Value, secret: Option<&str>) -> u16 {
         head.push_str(&format!("X-Hub-Signature-256: sha256={sig}\r\n"));
     }
     head.push_str("\r\n");
-    http(addr, &head, &raw).0
+    (head, raw)
+}
+
+/// Whether a correctly signed owner text is NOT taken: the connection is
+/// refused or reset, or the answer is anything but 200.
+fn webhook_refused(addr: SocketAddr) -> bool {
+    let body = wa_text("wamid.probe", WA_OWNER, "probe", now_s());
+    let (head, raw) = webhook_request(addr, &body, Some(WA_APP_SECRET));
+    let Ok(mut s) = TcpStream::connect(addr) else {
+        return true;
+    };
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut req = head.into_bytes();
+    req.extend_from_slice(&raw);
+    if s.write_all(&req).is_err() {
+        return true;
+    }
+    let mut resp = Vec::new();
+    let _ = s.read_to_end(&mut resp);
+    String::from_utf8_lossy(&resp).split_whitespace().nth(1) != Some("200")
+}
+
+/// The listener refuses a signed webhook while the daemon process is
+/// still running, so the kernel closing the socket at exit cannot be what
+/// refused it. At most 10 probes, far below the 16-batch queue, so a full
+/// queue's 503 cannot pass for a stopped listener either.
+fn assert_listener_stops_while_alive(d: &mut Daemon, addr: SocketAddr) {
+    for _ in 0..10 {
+        let refused = webhook_refused(addr);
+        if d.child.try_wait().unwrap().is_some() {
+            d.fail("the daemon exited before its listener was seen refusing webhooks");
+        }
+        if refused {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    d.fail("the webhook listener still takes webhooks after shutdown started");
+}
+
+/// Requests the fake Graph API received on `path`.
+fn graph_hits(wa: &Wa, suffix: &str) -> usize {
+    wa.rt
+        .block_on(wa.server.received_requests())
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == graph_path(suffix))
+        .count()
 }
 
 /// An owner text, signed with the right secret; must be accepted.
@@ -2044,17 +2097,161 @@ fn daemon_never_prints_or_audits_whatsapp_secrets() {
 fn sigterm_stops_the_whatsapp_listener() {
     let e = Env::new();
     let wa = Wa::start();
-    e.mock_wa(&wa.base(), json!([]), None);
+    // The first reply hangs: the step is still sending when SIGTERM
+    // arrives, and the daemon lives on for up to 5 s finishing it.
+    wa.rt.block_on(
+        Mock::given(method("POST"))
+            .and(path(graph_path("/messages")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"messages": [{"id": "wamid.slow"}]}))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&wa.server),
+    );
+    e.mock_wa(&wa.base(), json!([{"text": "hello owner"}]), None);
     let mut d = e.spawn();
     let addr = d.ready_wa();
-    assert!(TcpStream::connect(addr).is_ok());
-    assert_eq!(d.stop(), 0, "{}", d.stderr());
-    assert!(
-        TcpStream::connect(addr).is_err(),
-        "still listening on {addr}"
-    );
+    post_owner(&mut d, addr, "wamid.in1", "hi");
+    d.wait_for("the reply was never sent", || {
+        graph_hits(&wa, "/messages") > 0
+    });
+    d.term();
+    let err = Arc::clone(&d.stderr);
+    d.wait_for("the daemon never started shutting down", move || {
+        err.lock()
+            .unwrap()
+            .contains("shutting down after the current step")
+    });
+    assert_listener_stops_while_alive(&mut d, addr);
+    assert_eq!(d.wait_exit(), 0, "{}", d.stderr());
     assert_eq!(
         e.decisions().last().map(String::as_str),
         Some("daemon session ended")
     );
+}
+
+#[test]
+fn whatsapp_fatal_stops_the_listener_while_the_daemon_runs() {
+    let e = Env::new();
+    let tg = Tg::start();
+    let wa = Wa::start();
+    // Telegram deletions hang, so the final flush keeps the daemon alive
+    // for up to 5 s after shutdown has started.
+    tg._rt.block_on(
+        Mock::given(method("POST"))
+            .and(path(bot_path("deleteMessage")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"ok": true, "result": true}))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .with_priority(1)
+            .mount(&tg.server),
+    );
+    // Every Graph send is a rejected token: the WhatsApp channel's fatal.
+    wa.rt.block_on(
+        Mock::given(method("POST"))
+            .and(path(graph_path("/messages")))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {"type": "OAuthException", "code": 190}
+            })))
+            .with_priority(1)
+            .mount(&wa.server),
+    );
+    e.mock_wa(&wa.base(), json!([]), Some(&tg.base()));
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    // A stale, PIN-like Telegram message: dropped, and its deletion owed.
+    tg.push(vec![private_text(1, OWNER, "4815162342", now_s() - 3600)]);
+    let deleting = || {
+        tg._rt
+            .block_on(tg.server.received_requests())
+            .unwrap()
+            .iter()
+            .any(|r| r.url.path() == bot_path("deleteMessage"))
+    };
+    d.wait_for("the deletion was never attempted", deleting);
+    // A stale WhatsApp text: its notice meets the rejected token.
+    let old = wa_text("wamid.old", WA_OWNER, "hi", now_s() - 3600);
+    assert_eq!(post_webhook(addr, &old, Some(WA_APP_SECRET)), 200);
+    d.wait_for("the notice was never sent", || {
+        graph_hits(&wa, "/messages") > 0
+    });
+    assert_listener_stops_while_alive(&mut d, addr);
+    assert_eq!(d.wait_exit(), 1, "{}", d.stderr());
+    let se = d.stderr();
+    assert!(
+        se.contains("error: WhatsApp rejected the access token"),
+        "{se}"
+    );
+    assert_eq!(
+        e.decisions().last().map(String::as_str),
+        Some("daemon session ended"),
+        "{}",
+        e.audit_text()
+    );
+    assert_token_absent(&e, &d.stdout(), &se);
+}
+
+/// A config for the real (Anthropic) planner, which no test reaches: every
+/// one of them stops at startup.
+fn anthropic_config(e: &Env, tables: &str) {
+    e.config_text(&format!("root = \"{}\"\n\n{tables}", e.root.display()));
+}
+
+#[test]
+fn api_key_equal_to_a_whatsapp_secret_exits_1_before_any_network_call() {
+    let e = Env::new();
+    let wa = Wa::start();
+    anthropic_config(
+        &e,
+        &format!(
+            "[whatsapp]\nowner_numbers = [\"{WA_OWNER}\"]\nphone_number_id = \"{PNID}\"\nlisten = \"127.0.0.1:0\"\napi_base = \"{}\"\n",
+            wa.base()
+        ),
+    );
+    for (_, value) in WA_VARS {
+        let o = e.daemon_cmd().env(KEY_VAR, value).output().unwrap();
+        let se = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert_eq!(o.status.code(), Some(1), "{se}");
+        assert!(
+            se.contains(
+                "error: the WhatsApp secrets, the bot token and the API key must all be different values"
+            ),
+            "{se}"
+        );
+        assert_eq!(home_listing(&e.home), vec!["daemon.lock".to_string()]);
+        assert_token_absent(&e, &String::from_utf8_lossy(&o.stdout), &se);
+    }
+    let hits = wa.rt.block_on(wa.server.received_requests()).unwrap();
+    assert!(hits.is_empty(), "{hits:?}");
+}
+
+#[test]
+fn api_key_equal_to_the_bot_token_exits_1_on_telegram_only() {
+    let e = Env::new();
+    let tg = Tg::start();
+    anthropic_config(
+        &e,
+        &format!(
+            "[telegram]\nowner_ids = [{OWNER}]\napi_base = \"{}\"\n",
+            tg.base()
+        ),
+    );
+    let o = e.daemon_cmd().env(KEY_VAR, TOKEN).output().unwrap();
+    let se = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert_eq!(o.status.code(), Some(1), "{se}");
+    assert!(
+        se.contains(
+            "error: the WhatsApp secrets, the bot token and the API key must all be different values"
+        ),
+        "{se}"
+    );
+    assert_eq!(home_listing(&e.home), vec!["daemon.lock".to_string()]);
+    assert_token_absent(&e, &String::from_utf8_lossy(&o.stdout), &se);
+    let hits = tg._rt.block_on(tg.server.received_requests()).unwrap();
+    assert!(hits.is_empty(), "{hits:?}");
 }
