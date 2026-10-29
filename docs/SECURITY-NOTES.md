@@ -513,6 +513,7 @@ exists at the time of the check.
 `warden agent` (in `warden-cli`, `crates/warden-cli/src/agent.rs`) runs the
 agent engine on stdin/stdout; `warden daemon`
 (`crates/warden-cli/src/daemon.rs`) runs the same engine on Telegram,
+<!-- T8: and/or WhatsApp; align with daemon.rs. -->
 optionally paired with stdin/stdout (`--console`). Both share their startup
 (`crates/warden-cli/src/startup.rs`). The daemon's own rules are in
 "Telegram channel" and "Daemon" below. The pieces, each with its own
@@ -1049,10 +1050,283 @@ for the channel (`recv` returns `None`, a prompt in progress is
 else is polling this bot, or a webhook is set), and an offset that cannot
 be saved. `warden daemon` turns any of them into exit 1 (see "Daemon").
 
+## WhatsApp channel
+
+`warden_agent::whatsapp` (`api.rs`, `webhook.rs`, `listener.rs`,
+`seen.rs`, `channel.rs`): the `Channel` trait over Meta's WhatsApp Cloud
+API. Inbound messages arrive only by webhook, on a loopback listener the
+owner exposes with their own tunnel; outbound text goes to the Graph API.
+There is no polling (the Cloud API has none), no message template and no
+media.
+
+**Trust model.**
+
+- **Meta authenticates the owner, and sees everything.** Owners are the
+  numbers in `[whatsapp] owner_numbers` (1-8, each an optional `+` then
+  7-15 digits; spaces and dashes are refused), served as sender
+  `wa:<digits>`. Whoever controls one of those WhatsApp accounts is an
+  owner and can approve `Yes` actions. Business-number chats are not
+  end-to-end encrypted to Warden: the Cloud API decrypts at Meta, which
+  sees, and could forge, every request, reply and prompt. Meta signs each
+  webhook with the app secret; nothing else authenticates a request.
+- **Only a fresh, non-forwarded text from an owner is acted on.**
+  `parse_notification` reads only changes with `field == "messages"`
+  whose `value.metadata.phone_number_id` equals `[whatsapp]
+  phone_number_id` (others, and a missing one, are counted as `foreign`
+  and skipped), and at most 256 items per notification (the rest are
+  dropped uncounted). A message becomes text only when its `type` is
+  `"text"` with a `text.body`, its `id`, `from` (1-20 digits) and
+  `timestamp` are valid, it carries no `errors`, and neither
+  `context.forwarded` nor `context.frequently_forwarded` is set (a flag of
+  any value but `false` or `null` counts as set). Refused, with their
+  tags: forwarded (`forward`), carrying `errors` or `type: "unsupported"`
+  (`unsupported`), `reaction`, `system`, any other type such as media,
+  location, contacts, interactive or button (`non-text`), and a missing or
+  invalid `id`, `from` or `timestamp` (`malformed`). Each refused message
+  reaches the engine as the non-owner sender `wa-<tag>:<number or 0>` with
+  empty text, so its only effect is the rate-limited `ignored: non-owner`
+  audit entry (at most one per 60 s for all non-owners together). A
+  stranger's text is `wa:<number>` with empty text: the same entry, which
+  is also how an owner finds their own number. Non-owners never get a
+  reply. An owner's `non-text` message also gets `only text messages are
+  supported`.
+- **Statuses are counted and dropped.** Delivery statuses (sent,
+  delivered, read, failed) for messages Warden sent are counted
+  (`WhatsAppChannel::status_count`) and never reach the engine or the
+  audit log: each reply produces several, and they would crowd the single
+  non-owner audit slot.
+- **Approvals stay with the requesting number.** `ask_approval` sends the
+  prompt to the requester's number only. The reply is the next text from
+  THAT number; messages from anyone else, other owners included, are
+  queued for later. A text that is `yes <code>` for this prompt is
+  accepted whatever its timestamp (the code is drawn fresh per prompt, so
+  it cannot predate it, and clock skew between Meta and the local clock
+  must not lock the owner out). Any other text, and any non-text message,
+  counts as the reply only if it is stamped no earlier than 5 s before the
+  prompt was sent; earlier ones were typed before the prompt existed and
+  are queued for `recv`. A non-text reply is No, and so is a reply whose
+  `context.id` quotes a message other than the prompt. The text is judged
+  by the same `parse_reply` as the terminal. A prompt is never cut: one
+  over 4096 UTF-16 units is not sent (the owner gets `request too long to
+  approve safely; refused`) and is No. A prompt that cannot be sent
+  (outside the window, a failed send) is `Undelivered`, audited `refused:
+  prompt not delivered`.
+
+**The listener** (`WebhookListener`).
+
+- **Loopback only, refused twice.** `[whatsapp] listen` (default
+  `127.0.0.1:8097`) must parse as an IP and port whose IP is loopback
+  (`127.0.0.0/8` or `::1`); `0.0.0.0`, `[::]`, a LAN address,
+  `::ffff:127.0.0.1` and any host name are refused at config load, and
+  `WebhookListener::bind` refuses a non-loopback address again before it
+  opens a socket. Warden never opens a public port; the owner chooses the
+  tunnel.
+- **Limits.** HTTP/1.1 only, one request per connection (keep-alive off,
+  every response `connection: close`), at most 16 connections at once (a
+  socket accepted beyond that is closed at once and counted `busy`), the
+  request head within 10 s and at most 16 KiB of buffer, the body within
+  10 s, at most 1 MiB of body (a larger declared `Content-Length` is
+  refused before reading; a streamed body is cut at the cap), and every
+  connection ends after 25 s (the two timeouts plus 5 s) whatever it is
+  doing.
+- **One path.** Only `/webhook` is served. Every response is `text/plain`
+  with a fixed short ASCII body, or the digits of a valid handshake
+  challenge; nothing from a request is echoed otherwise.
+
+| Request | Response | Counter |
+|---|---|---|
+| any path but `/webhook` | 404 | none |
+| a method other than GET or POST | 405 | none |
+| GET, valid handshake | 200, the challenge | none |
+| GET, anything else | 403 | `handshake_refused` |
+| POST, declared body over 1 MiB | 413 | `too_large` |
+| POST, no `X-Hub-Signature-256` | 401, body not read | `unsigned` |
+| POST, body over 1 MiB while streaming | 413 | `too_large` |
+| POST, body not complete within 10 s | 408 | `timed_out` |
+| POST, body broken off or badly framed | 400 | `bad_request` |
+| POST, signature malformed, wrong, or sent twice | 401, never parsed | `bad_signature` |
+| POST, signed but not a WhatsApp notification | 200, dropped | `malformed` |
+| POST, signed, changes for another `phone_number_id` | 200, those changes dropped | `foreign` (per change) |
+| POST, signed, channel queue full or closed | 503 (Meta retries) | `queue_full` |
+| POST, signed, otherwise | 200, batch queued | none |
+| connection over the slot limit | closed at once | `busy` |
+| request head or connection over its time limit | connection closed | `timed_out` |
+
+Signed but unusable bodies get 200 so Meta does not retry them forever.
+hyper's own replies to a request head it cannot parse or that overflows
+the buffer are not counted. The counters (`WebhookStats`, read as a
+`StatsSnapshot`) are the only record: nothing is printed per request and
+no logger is installed (see "Telegram channel", "The token").
+
+- **Signature before parse.** A POST with no `X-Hub-Signature-256` header
+  is refused before its body is read. Otherwise the body is read raw, and
+  the header must be exactly `sha256=` plus 64 hex digits (either case):
+  two signature headers, or one with comma-joined values, are refused,
+  not resolved. The HMAC-SHA256 of the raw bytes with the app secret is
+  compared with `hmac::Mac::verify_slice`, in constant time. Only a body
+  whose signature matches reaches `serde_json`; unauthenticated bytes from
+  the tunnel are never parsed.
+- **Handshake.** Meta's subscription check is a GET. It gets 200 with the
+  challenge as the body only when `hub.mode`, `hub.verify_token` and
+  `hub.challenge` each appear exactly once, `hub.mode` is `subscribe`,
+  the token matches, and the challenge is 1-64 ASCII digits. The token is
+  compared as the SHA-256 of each value with `subtle::ConstantTimeEq`, so
+  neither its content nor its length is leaked by timing. Every other GET
+  gets 403.
+- **Reply fast.** After a valid signature the listener parses, puts the
+  batch on the channel's queue with `try_send` and answers without waiting
+  for the engine. <!-- T8: the queue's capacity, set by daemon.rs. -->
+- **Shutdown.** Once asked to stop, the listener closes its listening
+  socket at once and gives connections in progress at most 2 s more.
+
+**Secrets.**
+
+- All three come only from the environment, from the variables named by
+  `access_token_env` (default `WARDEN_WHATSAPP_TOKEN`), `app_secret_env`
+  (default `WARDEN_WHATSAPP_APP_SECRET`) and `verify_token_env` (default
+  `WARDEN_WHATSAPP_VERIFY_TOKEN`). The names must differ from each other,
+  from `api_key_env` and from `[telegram] bot_token_env`. A config field
+  named `access_token`, `app_secret`, `verify_token` or `whatsapp_token`
+  (at any depth) is refused like `api_key`.
+  <!-- T8: the daemon's check that no two secret VALUES are equal (three
+  WhatsApp secrets, bot token, API key) and its exact error. -->
+  Distinct values matter because the verify token travels in a URL query
+  (Meta's handshake GET), and tunnel request logs can record it.
+- Shapes: the access token is 32-2048 characters of `[A-Za-z0-9._-]`, the
+  app secret 16-128 ASCII letters and digits, the verify token 16-128
+  characters of `[A-Za-z0-9._~-]`. Each is zeroized on drop, has no
+  `Display`, and its `Debug` is `AccessToken(<redacted>)`,
+  `AppSecret(<redacted>)` or `VerifyToken(<redacted>)`.
+- The access token travels only in an `Authorization: Bearer` header,
+  built per request in a zeroizing buffer and marked sensitive (the
+  `HeaderValue`'s own copy, which reqwest owns until the request is sent,
+  is not zeroized). It never goes in a URL. `GraphApi`'s `Debug` shows only
+  the base URL, the Graph version and the phone number id.
+- **Redaction.** The redactor gains a Meta access token pattern: `EAA`
+  followed by 40 or more letters and digits, with a left boundary (start of
+  text or a character that is not a letter or digit; see `redact.rs`). It may over-redact a long identifier that happens
+  to start with `EAA`. There is no pattern for the app secret: 32 hex
+  digits look like ordinary hashes, and redacting every hash would make
+  file contents useless to the model. The verify token is chosen by the
+  owner and has no fixed shape either.
+
+**Deduplication: at most once.** Meta retries webhooks, so the same message
+can arrive twice. `<home>/whatsapp-seen` holds the SHA-256 of each of the
+last 1024 message ids (`wamid`s), 32 bytes each, oldest dropped first;
+never the ids themselves. It follows the private state file rules (0600,
+no symlinks, atomic replace through `.whatsapp-seen.warden-tmp`). When a
+batch arrives, ids already recorded or repeated in the batch are dropped,
+and the remaining ids are recorded BEFORE any message in the batch is
+queued; the in-memory set changes only after the write succeeds. A failed
+write is fatal and the batch is dropped. A crash between the listener's
+200 and that write loses the batch instead of replaying it. The set is
+bounded because the stale rule below drops anything older than
+`max_message_age_secs` (at most an hour) anyway. A message with no valid
+`wamid` (a `malformed` one) cannot be deduplicated, but it is only ever
+audited.
+
+**Stale messages.** An owner text whose WhatsApp `timestamp` is more than
+`max_message_age_secs` (default 120, 10-3600) before the local clock is
+never acted on: it reaches the engine as `wa-stale:<number>` with empty
+text, and the owner is told `ignored <n> message(s) older than <s> s
+(Warden was not running or was busy)` once per batch. The age is checked
+when a batch arrives and again when a queued owner text is handed to the
+engine. Meta's timestamps are capped at the local clock, so a sender clock
+running ahead cannot keep a message fresh (or extend the window below).
+The check uses the local wall clock, so a clock that is wrong by more than
+the limit misjudges it.
+
+**The 24-hour window.** Meta accepts free-form messages to a user only
+within 24 hours of that user's last message. The channel keeps, per owner
+number, the latest inbound `timestamp` (from any verified message from
+that number, capped at the local clock) and sends only while `now + 5 min
+< last inbound + 24 h`. Anything else is not sent and is counted in
+`window_drops`; an approval prompt returns `Undelivered`. A Graph error
+131047 (outside the window) on a send counts the same way. The map is in
+memory only: after a restart Warden cannot message an owner until that
+owner writes. Meta may instead report 131047 only later, in a `failed`
+status webhook; statuses are dropped, so such a prompt counts as
+delivered, the approval waits for the engine's timeout and ends as a
+refusal (fail-closed), and `window_drops` undercounts.
+
+**No PIN, and no deletion.** `accepts_pin` is always `false`, with no
+config option, so the engine refuses a `YesPin` action requested over
+WhatsApp before any prompt and tells the owner to do it at the computer
+(see "Engine", "Per-channel PIN gate"); `ask_approval` also answers No to
+a `YesPin` prompt without sending anything. Why: the Cloud API cannot
+delete a user's message, so a PIN typed into WhatsApp would stay in the
+chat and at Meta. The engine's PIN-like check still applies to every owner
+message (it is sender-agnostic): a message that looks like the PIN is never
+sent to the planner. `retract_last` cannot delete it; instead it sends the
+owner `Warden cannot delete WhatsApp messages; delete that message
+yourself.` (best effort, and only inside the window; outside it the notice
+is skipped and not counted).
+
+**Outbound.** `send` delivers only to an owner (`wa:<owner number>`;
+anything else is dropped), after `redact` and display sanitizing, cut to
+4096 UTF-16 units ending in `…` (UTF-16 units are never fewer than
+characters, so this stays within WhatsApp's 4096-character body limit).
+Prompts have their summary and model note redacted, then are rendered by
+the same `render_prompt` as the terminal. Each message is `POST
+{api_base}/{graph_version}/{phone_number_id}/messages` with exactly
+`{"messaging_product":"whatsapp","recipient_type":"individual","to":<digits>,"type":"text","text":{"preview_url":false,"body":<text>}}`:
+plain text, and `preview_url: false` so Meta does not fetch a
+model-chosen URL. Sends are best effort. At most 64 of Warden's own
+notices wait to be sent; more are dropped.
+
+**Transport.** The shared client (see "Telegram channel", "Transport"):
+rustls, proxy variables ignored, redirects not followed (a 3xx is an
+error). `api_base` (default `https://graph.facebook.com`) must be
+`https://`, or `http://` to a loopback host (used by the tests), with no
+credentials, query or fragment. `graph_version` (default `v26.0`, checked
+2026-10-29; it must be raised as Meta retires versions) must look like
+`v<1-3 digits>.<1-2 digits>` and `phone_number_id` must be 1-32 digits,
+since both go into the URL path. Each request has a 30 s timeout, and
+responses are read in chunks capped at 64 KiB. Of a Graph error only the
+HTTP status, `code` and `error_subcode` are kept; `message`,
+`error_user_msg` and `fbtrace_id` are dropped, and every reqwest error is
+reduced to a kind word (`timeout`, `connect`, `other`).
+
+**Errors.** Graph errors are classified, in this order: HTTP 401 or code
+190 is an auth failure; HTTP 429 or code 4, 80007, 130429, 131048 or
+131056 is a rate limit; code 131047 is outside the window; anything else
+is other. A rate-limited send is retried once after 2 s, unless shutdown
+has started. Fatal, and final for the channel (`recv` returns `None`, a
+prompt in progress is `Closed`): the access token rejected on any send
+(`WhatsApp rejected the access token`), `whatsapp-seen` that cannot be
+written (`cannot save the WhatsApp seen-message list`), and the listener
+going away while not shutting down (`the WhatsApp webhook listener
+stopped`). Once fatal, the channel makes no more requests. Other failed
+sends are dropped.
+
+**Queue bound.** At most 64 items wait for the engine. When the queue is
+full, items without content (non-owner, refused and stale ones) go first,
+as in "Telegram channel", "Queue bound", so a stranger flood cannot push
+owner messages out. `discard_pending_input` drops the owner's queued
+messages and takes only the batches already waiting when it is called.
+
+**Shutdown bounds.** Once shutdown has started (`with_shutdown`, wired by
+the daemon), a rate-limit wait in progress ends at once with no retry,
+and each request, one already in flight included, gets at most 5 s more.
+Notices still waiting are not sent. The listener stops as above.
+
 ## Daemon
 
 `warden daemon` (`crates/warden-cli/src/daemon.rs`) runs the engine on the
 Telegram channel, in the foreground, unattended.
+
+<!-- T8: update this section for WhatsApp once daemon.rs lands:
+- the 12-step startup order (including the Graph phone number lookup
+  before any state is opened, the equal-secret-values check, the seen
+  store and the listener bind), with the exact error strings;
+- the two fatal sources (Telegram, WhatsApp: ChannelFatal / FatalSource /
+  Watched<C>) and that either stops the daemon with exit 1;
+- the banner text with the display phone number and listen address;
+- the listener's shutdown wiring (shutdown signal -> listener stop, 2 s
+  drain) and the order relative to the engine stop;
+- the exit counters line (non-zero listener StatsSnapshot fields, window
+  drops, statuses) on stderr: exact format;
+- --console with WhatsApp. -->
 
 - **Startup fails closed** (exit 1, nothing runs), in this order: the data
   dir (as for `warden agent`); `<home>/daemon.lock`; the config, which must
@@ -1146,9 +1420,10 @@ the data dir first.
   approval of a torn record was never issued and nothing ran under it. Do
   not truncate further: whole records are spent nonces.
 - **Stray `.*.warden-tmp` files** (`.pin-guard.warden-tmp`,
-  `.telegram-offset.warden-tmp`) are leftovers of an interrupted atomic
-  write and are never read as state. The next write removes one itself;
-  any can be deleted while Warden is stopped.
+  `.telegram-offset.warden-tmp`, `.whatsapp-seen.warden-tmp`) are
+  leftovers of an interrupted atomic write and are never read as state.
+  The next write removes one itself; any can be deleted while Warden is
+  stopped.
 - **`daemon.lock` not a private regular file**: remove it (it holds no
   data) and start again.
 - **`pin-guard` malformed or insecure** (`cannot load the PIN lockout
@@ -1164,6 +1439,13 @@ the data dir first.
   update offset`): fix its mode to 0600, or remove it while Warden is
   stopped. Removing it restarts polling from Telegram's oldest unconfirmed
   update, so messages newer than `max_message_age_secs` may be replayed
+  (older ones are still dropped as stale).
+- **`whatsapp-seen` malformed or insecure** (its length is not a multiple
+  of 32 or is over 32 KiB, it is a symlink or not a regular file, or group
+  or others have access) <!-- T8: the exact startup error string -->: fix
+  its mode to 0600, or remove it while Warden is stopped. Removing it
+  forgets which messages were already taken, so a message Meta delivers
+  again may be acted on again if it is newer than `max_message_age_secs`
   (older ones are still dropped as stale).
 
 Each of these startup errors repeats the short form of this advice.

@@ -33,6 +33,11 @@ anything that matters.
 - **`warden daemon`**, the same engine on Telegram, unattended: you message
   your own bot, and approvals come back as `yes <code>` in the same chat.
   See [Telegram daemon](#telegram-daemon).
+- **The WhatsApp channel** for `warden daemon`, over Meta's official
+  WhatsApp Cloud API: you message a WhatsApp business number from your own
+  phone, and approvals come back as `yes <code>` in the same chat. Inbound
+  messages arrive by webhook on a loopback-only listener that you expose
+  with your own tunnel. See [WhatsApp](#whatsapp).
 
 ## The safety model, in plain words
 
@@ -45,7 +50,7 @@ anything that matters.
 - **Owner only.** Only messages from the configured owner are acted on. On
   stdio, whoever controls the process's stdin is the owner. On Telegram,
   the owners are the numeric user ids you list, each in a private chat
-  with the bot.
+  with the bot. On WhatsApp, the owners are the phone numbers you list.
 - **A fresh code per prompt.** Every approval prompt shows a new random
   4-digit code; only `yes <code>` (or `yes <code> <PIN>`) typed after the
   prompt appears approves it. Anything else, including a bare `yes`, is a
@@ -189,6 +194,8 @@ fails closed with exit 1 for the same reasons as `warden agent`, and also
 when the `[telegram]` table is missing, the token variable is unset or not
 token-shaped, Telegram rejects the token, or another `warden daemon` is
 using the same data dir.
+<!-- T8: "the [telegram] table is missing" changes once a [whatsapp]-only
+config can run; align with daemon.rs's error text. -->
 
 **Using it.** Message the bot in a private chat. Group messages, edited
 messages, forwards, messages from other bots and messages older than
@@ -233,6 +240,124 @@ The systemd unit reads the secrets from `~/.config/warden/daemon.env`
 daemon only after a failed exit, at most once a minute, and stop it with
 SIGTERM. Paths containing quotes, backslashes, `%`, `$`, `&`, `<`, `>`,
 backticks or control characters are refused.
+
+## WhatsApp
+
+The WhatsApp channel uses Meta's WhatsApp Cloud API (the official API, not
+WhatsApp Web linking). Meta delivers your messages to a webhook, so unlike
+Telegram it needs an inbound HTTP endpoint. Warden listens on a loopback
+address only (`127.0.0.1:8097` by default) and never opens a public port;
+you put your own tunnel in front of it. Read the WhatsApp entries in
+[Honest limits](#honest-limits) first: Meta sees every message, and the
+tunnel is a public endpoint.
+
+**1. Set up Meta.** At a high level:
+
+- create a Meta developer app and add the WhatsApp product to it;
+- use the test number Meta gives you, or register a business number;
+- note the number's **phone number id** (a string of digits shown in the
+  app's WhatsApp API setup; it is not the phone number itself);
+- note the **app secret** (App settings, Basic). Meta signs every webhook
+  with it, and Warden refuses any request whose signature does not match;
+- create an **access token**. The 24-hour test token is for trying it
+  only; for real use, create a permanent token for a system user in your
+  business settings.
+
+**2. Expose the listener with a tunnel.** For example, with Cloudflare's
+quick tunnel:
+
+```sh
+cloudflared tunnel --url http://127.0.0.1:8097
+```
+
+It prints a public `https://` host name. In the app's WhatsApp webhook
+settings, set the callback URL to `https://<tunnel host>/webhook` (Warden
+serves that one path only), set the verify token to a value you choose
+(16-128 characters of letters, digits, `.`, `_`, `~` or `-`), and
+subscribe to the `messages` field. Meta checks the callback by calling it,
+so start the daemon (step 5) before you save the settings. A quick tunnel
+gets a new host name each time it starts, so the callback URL must then be
+updated.
+
+**3. Configure.** Add a `[whatsapp]` table to the config:
+
+```toml
+root = "/Users/you/warden-folder"
+
+[whatsapp]
+owner_numbers = ["+15551234567"]   # required: 1-8 numbers, E.164 (`+` optional, no spaces or dashes)
+phone_number_id = "106540352242922" # required: the phone number id, as a string of digits
+# access_token_env = "WARDEN_WHATSAPP_TOKEN"          # the NAMES of the variables
+# app_secret_env = "WARDEN_WHATSAPP_APP_SECRET"
+# verify_token_env = "WARDEN_WHATSAPP_VERIFY_TOKEN"
+# listen = "127.0.0.1:8097"        # loopback only: 127.0.0.0/8 or [::1], IP and port
+# max_message_age_secs = 120       # older messages are never acted on (10-3600)
+# graph_version = "v26.0"          # Graph API version
+# api_base = "https://graph.facebook.com"
+```
+
+No secret goes in the file: an `access_token`, `app_secret`,
+`verify_token` or `whatsapp_token` field is refused like `api_key`, and
+the variable names must all differ from each other, from `api_key_env`
+and from `[telegram] bot_token_env`. A `listen` address that is not
+loopback (`0.0.0.0`, `[::]`, a LAN address, a host name) is refused.
+`graph_version` defaults to `v26.0` (verified current on 2026-10-29);
+Meta retires old versions, so it must be raised when Meta does.
+
+<!-- T8: state whether [whatsapp] can run alone and alongside [telegram]
+(one daemon, any mix), once daemon.rs lands. -->
+
+**4. Find your number.** Your number is the one you message from, in
+E.164 form (country code first). If you are not sure how WhatsApp reports
+it, start with any placeholder (say `owner_numbers = ["+10000000"]`), send
+the business number one text, stop the daemon, and look in the audit log:
+the message was refused and recorded as `ignored: non-owner` with the
+summary `wa:<digits>` (`grep non-owner ~/.warden/audit.jsonl`). As with
+Telegram, non-owner entries are written at most once a minute, so check
+the entry's time. Put the number in `owner_numbers` and start again.
+
+**5. Run.**
+
+```sh
+export ANTHROPIC_API_KEY=...
+export WARDEN_WHATSAPP_TOKEN=...          # the access token
+export WARDEN_WHATSAPP_APP_SECRET=...     # the app secret
+export WARDEN_WHATSAPP_VERIFY_TOKEN=...   # the verify token you chose
+./target/release/warden daemon            # or: warden daemon --config <path>
+```
+
+<!-- T8: the startup banner text (with the display phone number and the
+listen address), the WhatsApp-specific startup failures (token rejected,
+phone number lookup, secrets that share a value, listener bind), and
+whether --console applies, exactly as daemon.rs prints them. -->
+
+**Using it.** Message the business number from an owner number. Only text
+is acted on: media, reactions, interactive and button replies, forwarded
+messages and messages older than `max_message_age_secs` are never acted on
+(they are audited as ignored), and an owner's media or other non-text
+message (not a reaction or a forward) gets `only text messages are
+supported`. When an action needs consent you get the
+same prompt as the terminal; reply `yes <code>` from the same number
+(anything else is a no, and so is a reply that quotes a different
+message).
+
+- **PIN actions happen at the computer.** An action that needs the PIN (a
+  delete) is always refused over WhatsApp without a prompt, and you are
+  told to do it at the computer. There is no option to change this: Warden
+  cannot delete a WhatsApp message, so a PIN typed there would stay in the
+  chat and at Meta. If you send a message that looks like your PIN, it is
+  not sent to the model, and Warden answers `Warden cannot delete WhatsApp
+  messages; delete that message yourself.`
+- **Replies only within 24 hours of your last message.** Meta allows a
+  business to send free-form messages only inside a 24-hour window that
+  opens each time you write. Warden sends nothing when less than 5 minutes
+  of your window is left: a reply is dropped and a prompt is refused
+  (audited `refused: prompt not delivered`). Write to it again to reopen
+  the window.
+- **Nothing is sent after a restart until you write.** Warden keeps the
+  window in memory only, so after a restart it cannot message you until
+  you send it something.
+- **Undo is local**, as with Telegram.
 
 ## Honest limits
 
@@ -289,9 +414,35 @@ which has the details.
 - **At-most-once delivery.** The daemon records that it has seen a batch
   of messages before acting on it, so a crash or kill mid-message loses
   that message rather than replaying it. Messages fetched but not yet
-  handled when it stops (SIGTERM included) are dropped too.
+  handled when it stops (SIGTERM included) are dropped too. On WhatsApp,
+  a crash after Warden has answered Meta's webhook but before it has
+  recorded the messages loses them as well.
+- **WhatsApp Business chats are not end-to-end encrypted to Warden.** The
+  Cloud API decrypts messages at Meta, so Meta sees every request, every
+  reply and every approval prompt.
+- **A PIN typed into WhatsApp stays there.** Warden never asks for the PIN
+  over WhatsApp, but if you type it anyway, Warden cannot delete it: it
+  stays in the chat and at Meta. Warden can only ask you to delete it from
+  the chat yourself.
+- **The tunnel is a public endpoint.** Anyone who finds its host name can
+  send requests to it. They are refused unless they carry a valid HMAC
+  signature made with the app secret (and the subscription check needs the
+  verify token), but that signature is the only protection. The tunnel's
+  provider (for example Cloudflare, whose quick tunnels end TLS at
+  Cloudflare) sees every webhook body, and its request logs may record the
+  verify token, which Meta sends in the URL.
+- **Whoever controls an owner's WhatsApp account is the owner.** A stolen
+  phone or a hijacked account can send requests and approve `Yes`
+  actions.
+- **The 24-hour window.** Warden cannot message you more than 24 hours
+  (less 5 minutes) after your last message, and it keeps that window in
+  memory only, so after a restart it cannot message you until you write.
+  Meta can also report "outside the window" only later, in a delivery
+  status; Warden does not read statuses, so such a prompt counts as
+  delivered and the approval simply times out (a no).
 - **Service files hold secrets** once you fill them in. Keep them `chmod
-  600`. The token and API key also live in the daemon's environment.
+  600`. The tokens, the WhatsApp app secret and verify token, and the API
+  key also live in the daemon's environment.
 - **Large writes.** The model's output is capped at 4096 tokens per step,
   so `write_file` content larger than about 16 KB cannot be produced in one
   call (a cut-off call is refused, never offered for approval). A write
@@ -313,9 +464,10 @@ injection) is compiled only with the `test-hooks` Cargo feature, which
 
 ## Not built
 
-WhatsApp, Signal or Matrix channels, a tray app, remote undo (undo over
-Telegram), WASM skills, MCP, a mesh or relay between devices, a website,
-and a local routing model. None of these exist in this repository.
+Signal or Matrix channels, WhatsApp message templates (so Warden cannot
+message you outside the 24-hour window) and WhatsApp media, a tray app,
+remote undo (undo over Telegram or WhatsApp), WASM skills, MCP, a mesh or
+relay between devices, a website, and a local routing model. None of these exist in this repository.
 
 ## Docs
 
