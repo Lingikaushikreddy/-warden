@@ -512,11 +512,10 @@ exists at the time of the check.
 
 `warden agent` (in `warden-cli`, `crates/warden-cli/src/agent.rs`) runs the
 agent engine on stdin/stdout; `warden daemon`
-(`crates/warden-cli/src/daemon.rs`) runs the same engine on Telegram,
-<!-- T8: and/or WhatsApp; align with daemon.rs. -->
-optionally paired with stdin/stdout (`--console`). Both share their startup
+(`crates/warden-cli/src/daemon.rs`) runs the same engine on Telegram
+and/or WhatsApp, optionally paired with stdin/stdout (`--console`). Both share their startup
 (`crates/warden-cli/src/startup.rs`). The daemon's own rules are in
-"Telegram channel" and "Daemon" below. The pieces, each with its own
+"Telegram channel", "WhatsApp channel" and "Daemon" below. The pieces, each with its own
 section here:
 
 - **Config** (`warden_agent::config`): `<home>/config.toml`, `root`
@@ -1063,8 +1062,11 @@ media.
 
 - **Meta authenticates the owner, and sees everything.** Owners are the
   numbers in `[whatsapp] owner_numbers` (1-8, each an optional `+` then
-  7-15 digits; spaces and dashes are refused), served as sender
-  `wa:<digits>`. Whoever controls one of those WhatsApp accounts is an
+  7-15 digits, the first not 0; spaces and dashes are refused), served as
+  sender `wa:<digits>`. The digits must be Meta's WhatsApp id for the
+  account, which for some countries (for example Mexico, `521…`, or
+  Brazil's ninth digit) differs from the dialled number; the owner copies
+  it from the `ignored: non-owner` audit entry (`wa:<digits>`). Whoever controls one of those WhatsApp accounts is an
   owner and can approve `Yes` actions. Business-number chats are not
   end-to-end encrypted to Warden: the Cloud API decrypts at Meta, which
   sees, and could forge, every request, reply and prompt. Meta signs each
@@ -1073,8 +1075,9 @@ media.
   `parse_notification` reads only changes with `field == "messages"`
   whose `value.metadata.phone_number_id` equals `[whatsapp]
   phone_number_id` (others, and a missing one, are counted as `foreign`
-  and skipped), and at most 256 items per notification (the rest are
-  dropped uncounted). A message becomes text only when its `type` is
+  and skipped), and at most 256 items per notification: the messages of
+  every change first, then the statuses, so statuses never push a message
+  out; items past the cap are dropped and counted (`truncated`). A message becomes text only when its `type` is
   `"text"` with a `text.body`, its `id`, `from` (1-20 digits) and
   `timestamp` are valid, it carries no `errors`, and neither
   `context.forwarded` nor `context.frequently_forwarded` is set (a flag of
@@ -1146,9 +1149,11 @@ media.
 | POST, body broken off or badly framed | 400 | `bad_request` |
 | POST, signature malformed, wrong, or sent twice | 401, never parsed | `bad_signature` |
 | POST, signed but not a WhatsApp notification | 200, dropped | `malformed` |
+| POST, signed, items past the 256 cap | 200, those items dropped | `truncated` (per item) |
 | POST, signed, changes for another `phone_number_id` | 200, those changes dropped | `foreign` (per change) |
 | POST, signed, channel queue full or closed | 503 (Meta retries) | `queue_full` |
 | POST, signed, otherwise | 200, batch queued | none |
+| POST, once shutdown has started (checked before the body is read and again after the signature check) | 503 (Meta redelivers after the restart) | none |
 | connection over the slot limit | closed at once | `busy` |
 | request head or connection over its time limit | connection closed | `timed_out` |
 
@@ -1175,9 +1180,13 @@ no logger is installed (see "Telegram channel", "The token").
   gets 403.
 - **Reply fast.** After a valid signature the listener parses, puts the
   batch on the channel's queue with `try_send` and answers without waiting
-  for the engine. <!-- T8: the queue's capacity, set by daemon.rs. -->
+  for the engine. The daemon's queue holds 16 batches (`WEBHOOK_QUEUE`);
+  when it is full the answer is 503 and Meta retries later.
 - **Shutdown.** Once asked to stop, the listener closes its listening
-  socket at once and gives connections in progress at most 2 s more.
+  socket at once and gives connections in progress at most 2 s more. From
+  the moment shutdown starts, every POST gets 503 (not counted), so Meta
+  redelivers it after the restart instead of it being answered 200 and
+  then lost; the seen store drops what was already taken.
 
 **Secrets.**
 
@@ -1187,10 +1196,12 @@ no logger is installed (see "Telegram channel", "The token").
   `WARDEN_WHATSAPP_VERIFY_TOKEN`). The names must differ from each other,
   from `api_key_env` and from `[telegram] bot_token_env`. A config field
   named `access_token`, `app_secret`, `verify_token` or `whatsapp_token`
-  (at any depth) is refused like `api_key`.
-  <!-- T8: the daemon's check that no two secret VALUES are equal (three
-  WhatsApp secrets, bot token, API key) and its exact error. -->
-  Distinct values matter because the verify token travels in a URL query
+  (at any depth) is refused like `api_key`. At startup `warden daemon`
+  also refuses (exit 1, `the WhatsApp secrets, the bot token and the API
+  key must all be different values`) when any two of the secret values it
+  holds are equal: the three WhatsApp secrets, the bot token and the API
+  key, with any mix of channels (so a Telegram-only config whose bot token
+  equals the API key is refused too). Distinct values matter because the verify token travels in a URL query
   (Meta's handshake GET), and tunnel request logs can record it.
 - Shapes: the access token is 32-2048 characters of `[A-Za-z0-9._-]`, the
   app secret 16-128 ASCII letters and digits, the verify token 16-128
@@ -1205,25 +1216,36 @@ no logger is installed (see "Telegram channel", "The token").
 - **Redaction.** The redactor gains a Meta access token pattern: `EAA`
   followed by 40 or more letters and digits, with a left boundary (start of
   text or a character that is not a letter or digit; see `redact.rs`). It may over-redact a long identifier that happens
-  to start with `EAA`. There is no pattern for the app secret: 32 hex
+  to start with `EAA`. A Meta or Telegram token right after a percent
+  escape (`access_token%3DEAA…`, as in a URL-encoded query) is redacted
+  too; the escape is kept. There is no pattern for the app secret: 32 hex
   digits look like ordinary hashes, and redacting every hash would make
   file contents useless to the model. The verify token is chosen by the
   owner and has no fixed shape either.
 
 **Deduplication: at most once.** Meta retries webhooks, so the same message
-can arrive twice. `<home>/whatsapp-seen` holds the SHA-256 of each of the
-last 1024 message ids (`wamid`s), 32 bytes each, oldest dropped first;
-never the ids themselves. It follows the private state file rules (0600,
-no symlinks, atomic replace through `.whatsapp-seen.warden-tmp`). When a
-batch arrives, ids already recorded or repeated in the batch are dropped,
-and the remaining ids are recorded BEFORE any message in the batch is
+can arrive twice. `<home>/whatsapp-seen` records the message ids
+(`wamid`s) of OWNER numbers only: the 8-byte magic `WDNSEEN2`, then one
+40-byte entry per id (its SHA-256 and the message's time in Unix ms,
+capped at the local clock, big-endian), oldest first; never the ids
+themselves. It follows the private state file rules (0600, no symlinks,
+atomic replace through `.whatsapp-seen.warden-tmp`). When a batch arrives,
+ids already recorded or repeated in the batch are dropped, and the
+remaining owner ids are recorded BEFORE any message in the batch is
 queued; the in-memory set changes only after the write succeeds. A failed
 write is fatal and the batch is dropped. A crash between the listener's
-200 and that write loses the batch instead of replaying it. The set is
-bounded because the stale rule below drops anything older than
-`max_message_age_secs` (at most an hour) anyway. A message with no valid
-`wamid` (a `malformed` one) cannot be deduplicated, but it is only ever
-audited.
+200 and that write loses the batch instead of replaying it.
+
+Eviction is by age. Past 1024 entries, only entries older than
+`max_message_age_secs` are dropped (oldest first): a redelivery of those
+would be stale and never acted on anyway. Younger entries are kept up to
+a hard cap of 4096; past that the oldest go whatever their age, so more
+than 4096 owner messages within `max_message_age_secs` could let an old
+one be acted on twice. Strangers' ids are not recorded, so a stranger
+flood cannot push an owner's id out; a redelivered stranger message only
+reaches the engine again as a non-owner with empty text (an audit entry
+at most). A message with no valid `wamid` (a `malformed` one) cannot be
+deduplicated, but it is only ever audited.
 
 **Stale messages.** An owner text whose WhatsApp `timestamp` is more than
 `max_message_age_secs` (default 120, 10-3600) before the local clock is
@@ -1259,8 +1281,14 @@ chat and at Meta. The engine's PIN-like check still applies to every owner
 message (it is sender-agnostic): a message that looks like the PIN is never
 sent to the planner. `retract_last` cannot delete it; instead it sends the
 owner `Warden cannot delete WhatsApp messages; delete that message
-yourself.` (best effort, and only inside the window; outside it the notice
-is skipped and not counted).
+yourself.` The channel sends the same notice for owner text it consumes
+itself and that may hold the PIN: a text dropped as stale (at arrival or
+in the queue) or by `discard_pending_input` that is approval-shaped with 2
+or more tokens, or has at most 8 tokens and a run of 4 or more digits; and
+any approval reply that did not approve, except a bare `no` (so `yes
+<code> <PIN>`, but also a wrong code or any other text). At most one notice per owner per batch
+handled; best effort, and only inside the window (outside it the notice is
+skipped and not counted).
 
 **Outbound.** `send` delivers only to an owner (`wa:<owner number>`;
 anything else is dropped), after `redact` and display sanitizing, cut to
@@ -1308,35 +1336,52 @@ messages and takes only the batches already waiting when it is called.
 **Shutdown bounds.** Once shutdown has started (`with_shutdown`, wired by
 the daemon), a rate-limit wait in progress ends at once with no retry,
 and each request, one already in flight included, gets at most 5 s more.
-Notices still waiting are not sent. The listener stops as above.
+After the engine stops, `flush_pending` sends the notices still waiting
+(stale, non-text, delete-it-yourself), inside the window only, within 5 s
+in all; whatever is left then is dropped. The listener stops as above.
 
 ## Daemon
 
-`warden daemon` (`crates/warden-cli/src/daemon.rs`) runs the engine on the
-Telegram channel, in the foreground, unattended.
+`warden daemon` (`crates/warden-cli/src/daemon.rs`) runs the engine on
+Telegram and/or WhatsApp, in the foreground, unattended. The channel is
+`Pair(Pair(telegram, whatsapp), console)`, each side present only when
+configured (with `--console` for the console).
 
-<!-- T8: update this section for WhatsApp once daemon.rs lands:
-- the 12-step startup order (including the Graph phone number lookup
-  before any state is opened, the equal-secret-values check, the seen
-  store and the listener bind), with the exact error strings;
-- the two fatal sources (Telegram, WhatsApp: ChannelFatal / FatalSource /
-  Watched<C>) and that either stops the daemon with exit 1;
-- the banner text with the display phone number and listen address;
-- the listener's shutdown wiring (shutdown signal -> listener stop, 2 s
-  drain) and the order relative to the engine stop;
-- the exit counters line (non-zero listener StatsSnapshot fields, window
-  drops, statuses) on stderr: exact format;
-- --console with WhatsApp. -->
+- **Startup fails closed** (exit 1, nothing runs), in this order:
+  1. the data dir (as for `warden agent`);
+  2. `<home>/daemon.lock`;
+  3. the config, which must have a `[telegram]` or a `[whatsapp]` table,
+     or both (`no channel configured: add a [telegram] or [whatsapp]
+     table`); with `--console`, `owner` must be `local`;
+  4. the root;
+  5. the planner key;
+  6. with `[telegram]`: the bot token variable (unset, empty or not
+     token-shaped);
+  7. with `[whatsapp]`: the access token, app secret and verify token
+     variables (unset, empty or not the right shape); then, with any mix
+     of channels, every secret value held (those three, the bot token, the
+     API key) must differ (`the WhatsApp secrets, the bot token and the
+     API key must all be different values`);
+  8. with `[telegram]`: `getMe` (a 401 or 404 is `Telegram rejected the
+     bot token`; anything else is `cannot reach Telegram (<kind>)`);
+  9. with `[whatsapp]`: the Graph phone number lookup (`GET
+     /{graph_version}/{phone_number_id}?fields=display_phone_number,verified_name`):
+     HTTP 401 or code 190 is `WhatsApp rejected the access token`; code 100
+     or HTTP 404 is `the access token cannot see phone_number_id <id>`;
+     anything else is `cannot reach the WhatsApp Cloud API (<kind>)`, where
+     the kind holds only fixed words and numbers;
+  10. with `[whatsapp]`: the webhook listener is bound (not yet serving):
+      `<address> is already in use`, or `cannot listen on <address>
+      (<kind>)`;
+  11. the audit log, approver store, snapshot store and executor (as for
+      `warden agent`), with owners `tg:<id>`, `wa:<number>` (and `local`
+      with `--console`), then the Telegram offset store and the WhatsApp
+      seen store;
+  12. `Engine::try_new`.
 
-- **Startup fails closed** (exit 1, nothing runs), in this order: the data
-  dir (as for `warden agent`); `<home>/daemon.lock`; the config, which must
-  have a `[telegram]` table (with `--console`, `owner` must be `local`); the
-  root; the planner key; the bot token variable (unset, empty or not
-  token-shaped); `getMe` (a 401 or 404 is `Telegram rejected the bot
-  token`; anything else is `cannot reach Telegram (<kind>)`); then the
-  audit log, approver store, snapshot store and executor (as for `warden
-  agent`), the offset store and `Engine::try_new`. The steps up to `getMe`
-  leave no file but the data dir and `daemon.lock`.
+  Steps 1-10 leave no file but the data dir and `daemon.lock`. Variables
+  are named in errors only under the API key variable's rule; values
+  never are.
 - **Locks.** `daemon.lock` (0600, `O_NOFOLLOW`, refused unless a private
   regular file, `try_lock`) is held for the process's life: a second daemon
   on the same data dir exits 1 at once. The approver store lock is also
@@ -1351,30 +1396,58 @@ Telegram channel, in the foreground, unattended.
   they work. An engine append that finds the log held by one of them
   waits up to 2 s, then the action is refused `audit unavailable`.
 - **Shutdown.** The SIGINT and SIGTERM handlers are installed after
-  `Engine::try_new` and before the `daemon session started` entry. A signal
+  `Engine::try_new` and before the `daemon session started` entry. The
+  webhook listener starts serving after that entry and before the
+  banner. A signal
   that arrives before then (during startup) kills the process the default
   way; no message has been fetched or handled at that point. The first
   signal afterwards asks the engine to stop (see "Engine", "Shutdown never
   cancels a running tool"): an idle daemon stops at once, a running tool
   finishes and is audited, a pending prompt is refused (`refused: shutting
   down`). Later signals only print `still shutting down`. From the first
-  signal on, Telegram requests are bounded (see "Telegram channel",
-  "Transport"). After the engine stops, the daemon performs once more any
-  deletion still owed (a reply that may hold the PIN whose `deleteMessage`
-  was cut off), best effort and bounded to 10 s in total. Messages already
+  signal on, Telegram and Graph requests are bounded (see "Telegram
+  channel", "Transport", and "WhatsApp channel", "Shutdown bounds"), and
+  the webhook listener closes its listening socket and answers 503 to
+  any POST still in progress (connections get at most 2 s more). After
+  the engine stops, the daemon waits at most 5 s for the listener to
+  finish, then aborts it. Then the daemon performs once more any deletion
+  still owed (a reply that may hold the PIN whose `deleteMessage` was cut
+  off) and sends the WhatsApp notices still waiting, best effort and
+  bounded to 10 s in total. Messages already
   fetched but not yet handled are dropped, not replayed on the next start
   (delivery is at most once). Then `daemon session ended` is audited (best
   effort) and the exit code is 0.
-- **Fatal Telegram errors** (token rejected, 409 conflict, offset
-  unwritable) stop the engine the same way and exit 1 with the reason on
-  stderr, also with `--console`.
-- **`--console`** pairs the terminal (sender `local`) with Telegram
-  (`Pair`). Each owner is served on their own side; the terminal accepts
-  the PIN, Telegram only with `allow_pin_approvals`. Closing stdin does not
-  stop the daemon: `Pair` keeps reading Telegram.
-- **stderr** carries the banner (`warden daemon: telegram @<bot>
-  owners=<n> root=<dir>`), warnings and errors: never message text, the
-  token or the API key. No logger is installed (see "Telegram channel").
+- **Fatal channel errors** come from two sources, Telegram (token
+  rejected, 409 conflict, offset unwritable) and WhatsApp (`WhatsApp
+  rejected the access token`, `cannot save the WhatsApp seen-message
+  list`, `the WhatsApp webhook listener stopped`). Each channel is wrapped
+  so that its first fatal condition is recorded and wakes the run loop,
+  even inside a `Pair`. That sets the shutdown signal at once, which also
+  closes the webhook listener (so Meta is not answered 200 for batches
+  nobody will read), stops the engine the same way as a signal, and exits
+  1 with the reason on stderr (`error: <reason>`), also with `--console`.
+- **`--console`** pairs the terminal (sender `local`) with the configured
+  remote channels (`Pair`). Each owner is served on their own side; the
+  terminal accepts the PIN, Telegram only with `allow_pin_approvals`,
+  WhatsApp never. Closing stdin does not stop the daemon: `Pair` keeps
+  reading the other side.
+- **stderr** carries the banner, warnings and errors: never message text,
+  tokens, secrets or the API key. The banner is `warden daemon:`, then
+  `telegram @<bot>` with Telegram, then `whatsapp <display number>
+  listen=<address>` with WhatsApp, then `owners=<n> root=<dir>` (`n`
+  counts the remote owners). The display number comes from Meta, so it is
+  display-sanitized (newlines and tabs escaped too) and cut to 64
+  characters. Nothing is printed per request, and no logger is installed
+  (see "Telegram channel").
+- **Exit counters.** With WhatsApp, after `daemon session ended`, one
+  stderr line is printed when any listener counter, the window counter or
+  the channel's queue-drop counter is non-zero: `whatsapp: refused <n>
+  unsigned, <n> bad-signature, <n> oversized, <n> slow webhook requests;
+  <n> replies not sent outside the 24 h window`, followed by `; other: `
+  and the non-zero ones of `malformed`, `bad-request`, `foreign`,
+  `truncated`, `queue-full`, `busy`, `handshake-refused` and
+  `queue-dropped` (`<n> <name>`, comma-separated). Delivery statuses are
+  normal traffic and are not reported.
 - **Clock.** The approver store's high-water mark (`<home>/clock-mark`,
   see "Agent approver store") clamps a clock that went backwards: approvals
   and tokens then expire relative to the later time, so they can outlive
@@ -1440,12 +1513,15 @@ the data dir first.
   stopped. Removing it restarts polling from Telegram's oldest unconfirmed
   update, so messages newer than `max_message_age_secs` may be replayed
   (older ones are still dropped as stale).
-- **`whatsapp-seen` malformed or insecure** (its length is not a multiple
-  of 32 or is over 32 KiB, it is a symlink or not a regular file, or group
-  or others have access) <!-- T8: the exact startup error string -->: fix
-  its mode to 0600, or remove it while Warden is stopped. Removing it
-  forgets which messages were already taken, so a message Meta delivers
-  again may be acted on again if it is newer than `max_message_age_secs`
-  (older ones are still dropped as stale).
+- **`whatsapp-seen` malformed or insecure** (`cannot open the WhatsApp
+  seen-message list`: it does not start with the `WDNSEEN2` magic, as a
+  file in an older format does not; its entries are not whole 40-byte
+  records; it holds more than 4096 entries; it is a symlink or not a
+  regular file; or group or others have access): if it only has the wrong
+  mode, `chmod 600` it. Otherwise remove it while Warden is stopped
+  (an older-format file is never migrated). Removing it forgets which
+  messages were already taken, so a message Meta delivers again may be
+  acted on again if it is newer than `max_message_age_secs` (older ones
+  are still dropped as stale).
 
 Each of these startup errors repeats the short form of this advice.

@@ -30,9 +30,9 @@ anything that matters.
   a model (Anthropic's Messages API is the only provider) proposes tool
   calls (`list_dir`, `read_file`, `write_file`, `delete_file`), and Warden
   gates every call. One line of input is one message.
-- **`warden daemon`**, the same engine on Telegram, unattended: you message
-  your own bot, and approvals come back as `yes <code>` in the same chat.
-  See [Telegram daemon](#telegram-daemon).
+- **`warden daemon`**, the same engine on Telegram and/or WhatsApp,
+  unattended: you message your own bot, and approvals come back as
+  `yes <code>` in the same chat. See [Telegram daemon](#telegram-daemon).
 - **The WhatsApp channel** for `warden daemon`, over Meta's official
   WhatsApp Cloud API: you message a WhatsApp business number from your own
   phone, and approvals come back as `yes <code>` in the same chat. Inbound
@@ -151,7 +151,8 @@ action it was about to take is refused (`audit unavailable`).
 ## Telegram daemon
 
 `warden daemon` runs the engine on Telegram in the foreground. It uses long
-polling (`getUpdates`), so it opens no inbound port.
+polling (`getUpdates`), so Telegram needs no inbound port (for WhatsApp,
+see [WhatsApp](#whatsapp)).
 
 **1. Create a bot.** In Telegram, message `@BotFather`, send `/newbot` and
 follow the steps. It gives you a bot token (`123456:ABC...`). Keep it
@@ -191,11 +192,11 @@ export WARDEN_TELEGRAM_TOKEN=...   # never put the token in the config file
 It prints `warden daemon: telegram @<bot> owners=<n> root=<dir>` on
 stderr. Ctrl-C or SIGTERM stops it after the current step (exit 0). Startup
 fails closed with exit 1 for the same reasons as `warden agent`, and also
-when the `[telegram]` table is missing, the token variable is unset or not
-token-shaped, Telegram rejects the token, or another `warden daemon` is
-using the same data dir.
-<!-- T8: "the [telegram] table is missing" changes once a [whatsapp]-only
-config can run; align with daemon.rs's error text. -->
+when the config has neither a `[telegram]` nor a `[whatsapp]` table, the
+token variable is unset or not token-shaped, Telegram rejects the token,
+any two of the secrets it holds (the bot token, the API key and, with
+WhatsApp, its three secrets) are the same value, or another `warden
+daemon` is using the same data dir.
 
 **Using it.** Message the bot in a private chat. Group messages, edited
 messages, forwards, messages from other bots and messages older than
@@ -285,7 +286,7 @@ updated.
 root = "/Users/you/warden-folder"
 
 [whatsapp]
-owner_numbers = ["+15551234567"]   # required: 1-8 numbers, E.164 (`+` optional, no spaces or dashes)
+owner_numbers = ["+15551234567"]   # required: 1-8 numbers, E.164 (`+` optional, 7-15 digits, first not 0)
 phone_number_id = "106540352242922" # required: the phone number id, as a string of digits
 # access_token_env = "WARDEN_WHATSAPP_TOKEN"          # the NAMES of the variables
 # app_secret_env = "WARDEN_WHATSAPP_APP_SECRET"
@@ -304,17 +305,19 @@ loopback (`0.0.0.0`, `[::]`, a LAN address, a host name) is refused.
 `graph_version` defaults to `v26.0` (verified current on 2026-10-29);
 Meta retires old versions, so it must be raised when Meta does.
 
-<!-- T8: state whether [whatsapp] can run alone and alongside [telegram]
-(one daemon, any mix), once daemon.rs lands. -->
+A config may have a `[whatsapp]` table alone, or with a `[telegram]`
+table: one daemon then serves both, each owner on their own channel.
 
-**4. Find your number.** Your number is the one you message from, in
-E.164 form (country code first). If you are not sure how WhatsApp reports
-it, start with any placeholder (say `owner_numbers = ["+10000000"]`), send
-the business number one text, stop the daemon, and look in the audit log:
-the message was refused and recorded as `ignored: non-owner` with the
-summary `wa:<digits>` (`grep non-owner ~/.warden/audit.jsonl`). As with
-Telegram, non-owner entries are written at most once a minute, so check
-the entry's time. Put the number in `owner_numbers` and start again.
+**4. Find your number.** Use the number exactly as Meta reports it, which
+is not always the number you dial: for some countries (for example Mexico,
+`521…`, or Brazil, with or without the ninth digit) Meta's WhatsApp id
+differs from the dialled number. So start with any placeholder (say
+`owner_numbers = ["+10000000"]`), send the business number one text, stop
+the daemon, and look in the audit log: the message was refused and
+recorded as `ignored: non-owner` with the summary `wa:<digits>` (`grep
+non-owner ~/.warden/audit.jsonl`). As with Telegram, non-owner entries are
+written at most once a minute, so check the entry's time. Copy those
+digits into `owner_numbers` and start again.
 
 **5. Run.**
 
@@ -326,10 +329,25 @@ export WARDEN_WHATSAPP_VERIFY_TOKEN=...   # the verify token you chose
 ./target/release/warden daemon            # or: warden daemon --config <path>
 ```
 
-<!-- T8: the startup banner text (with the display phone number and the
-listen address), the WhatsApp-specific startup failures (token rejected,
-phone number lookup, secrets that share a value, listener bind), and
-whether --console applies, exactly as daemon.rs prints them. -->
+It prints `warden daemon: whatsapp <business number> listen=<address>
+owners=<n> root=<dir>` on stderr (with Telegram too, `telegram @<bot>`
+comes first). Start the tunnel and save the webhook settings once this
+line appears. Besides the reasons above, startup fails closed with exit 1
+when a WhatsApp variable is unset, empty or badly shaped; when any two
+secrets are the same value (`the WhatsApp secrets, the bot token and the
+API key must all be different values`: the verify token travels in a URL
+that tunnel logs may record, so it must not equal a real key); when Meta
+rejects the token (`WhatsApp rejected the access token`) or the token
+cannot see the number (`the access token cannot see phone_number_id
+<id>`); and when the listen address is taken (`<address> is already in
+use`). `--console` works as with Telegram.
+
+When it stops, it prints one line of counters if the listener refused
+anything or a reply could not be sent, for example `whatsapp: refused 1
+unsigned, 1 bad-signature, 0 oversized, 0 slow webhook requests; 0
+replies not sent outside the 24 h window`. Refused unsigned or
+badly-signed requests usually mean someone other than Meta found the
+tunnel, or the app secret is wrong.
 
 **Using it.** Message the business number from an owner number. Only text
 is acted on: media, reactions, interactive and button replies, forwarded
@@ -345,9 +363,10 @@ message).
   delete) is always refused over WhatsApp without a prompt, and you are
   told to do it at the computer. There is no option to change this: Warden
   cannot delete a WhatsApp message, so a PIN typed there would stay in the
-  chat and at Meta. If you send a message that looks like your PIN, it is
-  not sent to the model, and Warden answers `Warden cannot delete WhatsApp
-  messages; delete that message yourself.`
+  chat and at Meta. If you send a message that looks like your PIN (or
+  may hold it, such as `yes <code> <PIN>`), it is not sent to the model,
+  and Warden answers `Warden cannot delete WhatsApp messages; delete that
+  message yourself.` (only while your window is open).
 - **Replies only within 24 hours of your last message.** Meta allows a
   business to send free-form messages only inside a 24-hour window that
   opens each time you write. Warden sends nothing when less than 5 minutes
@@ -416,7 +435,10 @@ which has the details.
   that message rather than replaying it. Messages fetched but not yet
   handled when it stops (SIGTERM included) are dropped too. On WhatsApp,
   a crash after Warden has answered Meta's webhook but before it has
-  recorded the messages loses them as well.
+  recorded the messages loses them as well. While it is stopping, the
+  listener answers 503, so Meta delivers those webhooks again after the
+  restart (and messages older than `max_message_age_secs` by then are
+  dropped as stale).
 - **WhatsApp Business chats are not end-to-end encrypted to Warden.** The
   Cloud API decrypts messages at Meta, so Meta sees every request, every
   reply and every approval prompt.
