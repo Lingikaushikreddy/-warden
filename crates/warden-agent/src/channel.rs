@@ -297,6 +297,63 @@ impl<A: Channel + Send, B: Channel + Send> Channel for Pair<A, B> {
     }
 }
 
+/// An optional channel (the daemon's channels that may not be configured).
+///
+/// `Some` delegates every call, including the defaulted ones. `None` is a
+/// closed channel that serves nobody, so it fails closed: `recv` is `None`,
+/// `send`, `retract_last` and `flush_pending` do nothing, `ask_approval` is
+/// `No`, `discard_pending_input` is 0, and `accepts_pin` and `serves` are
+/// `false`. Inside a [`Pair`], a `None` side therefore closes at once and
+/// every call goes to the other side.
+impl<C: Channel + Send> Channel for Option<C> {
+    async fn recv(&mut self) -> Option<Inbound> {
+        match self {
+            Some(c) => c.recv().await,
+            None => None,
+        }
+    }
+
+    async fn send(&mut self, to: &SenderId, text: &str) {
+        if let Some(c) = self {
+            c.send(to, text).await;
+        }
+    }
+
+    async fn ask_approval(&mut self, to: &SenderId, prompt: &ApprovalPrompt) -> ApprovalReply {
+        match self {
+            Some(c) => c.ask_approval(to, prompt).await,
+            None => ApprovalReply::No,
+        }
+    }
+
+    async fn discard_pending_input(&mut self, to: &SenderId) -> usize {
+        match self {
+            Some(c) => c.discard_pending_input(to).await,
+            None => 0,
+        }
+    }
+
+    fn accepts_pin(&self, to: &SenderId) -> bool {
+        self.as_ref().is_some_and(|c| c.accepts_pin(to))
+    }
+
+    async fn retract_last(&mut self, to: &SenderId) {
+        if let Some(c) = self {
+            c.retract_last(to).await;
+        }
+    }
+
+    async fn flush_pending(&mut self) {
+        if let Some(c) = self {
+            c.flush_pending().await;
+        }
+    }
+
+    fn serves(&self, who: &SenderId) -> bool {
+        self.as_ref().is_some_and(|c| c.serves(who))
+    }
+}
+
 /// A challenge code the channel will show: 1-16 ASCII alphanumerics.
 fn valid_challenge(c: &str) -> bool {
     (1..=16).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_alphanumeric())

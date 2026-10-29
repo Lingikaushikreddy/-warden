@@ -42,6 +42,7 @@
 //! the secret environment variable names, writes nothing, and puts
 //! `REPLACE_ME` where the secrets go.
 
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -272,16 +273,14 @@ fn serve<P: Planner>(
         shown(&prepared.root)
     );
     let code = rt.block_on(async {
-        if console {
-            let stdio = StdioChannel::new(
+        let stdio = console.then(|| {
+            StdioChannel::new(
                 tokio::io::BufReader::new(tokio::io::stdin()),
                 tokio::io::stdout(),
-            );
-            let channel = Pair::new(telegram, stdio);
-            run(planner, parts, channel, &slot, (tx, rx), &banner).await
-        } else {
-            run(planner, parts, telegram, &slot, (tx, rx), &banner).await
-        }
+            )
+        });
+        let channel = Pair::new(Some(telegram), stdio);
+        run(planner, parts, channel, &slot, (tx, rx), &banner).await
     });
     // Every engine task has been awaited. Do not wait on a stdin reader
     // thread (`--console`) that might still be blocked.
@@ -363,7 +362,7 @@ async fn run<P: Planner, C: Channel>(
                 Some(()) = sigint.recv() => on_signal(&mut signalled),
                 Some(()) = sigterm.recv() => on_signal(&mut signalled),
                 () = slot.notify.notified() => {
-                    // A fatal Telegram error: stop, and treat any later
+                    // A fatal channel error: stop, and treat any later
                     // signal as a repeat.
                     signalled = true;
                     tx.send_replace(true);
@@ -389,30 +388,56 @@ async fn run<P: Planner, C: Channel>(
     }
 }
 
-/// Where the Telegram channel reports a fatal condition, even when it sits
-/// inside a [`Pair`] (which has no accessor for its sides).
+/// A condition that ends one of the daemon's channels, and the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelFatal {
+    Telegram(TelegramFatal),
+}
+
+impl fmt::Display for ChannelFatal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChannelFatal::Telegram(t) => t.fmt(f),
+        }
+    }
+}
+
+/// A channel that can fail fatally, as [`Watched`] observes it.
+trait FatalSource {
+    /// Why the channel stopped, if it did.
+    fn fatal(&self) -> Option<ChannelFatal>;
+}
+
+impl FatalSource for TelegramChannel {
+    fn fatal(&self) -> Option<ChannelFatal> {
+        TelegramChannel::fatal(self).map(ChannelFatal::Telegram)
+    }
+}
+
+/// Where a channel reports a fatal condition, even when it sits inside a
+/// [`Pair`] (which has no accessor for its sides). The first one wins.
 #[derive(Clone, Default)]
 struct FatalSlot {
-    fatal: Arc<Mutex<Option<TelegramFatal>>>,
+    fatal: Arc<Mutex<Option<ChannelFatal>>>,
     notify: Arc<Notify>,
 }
 
 impl FatalSlot {
-    fn get(&self) -> Option<TelegramFatal> {
+    fn get(&self) -> Option<ChannelFatal> {
         self.fatal.lock().ok().and_then(|g| *g)
     }
 }
 
-/// [`TelegramChannel`] that copies [`TelegramChannel::fatal`] into a
-/// [`FatalSlot`] after every call, and wakes the run loop the first time.
-/// Every method delegates; `recv` stays cancel-safe because the copy runs
-/// only after the inner call has finished.
-struct Watched {
-    inner: TelegramChannel,
+/// A channel that copies its [`FatalSource::fatal`] into a [`FatalSlot`]
+/// after every call, and wakes the run loop the first time. Every method
+/// delegates; `recv` stays cancel-safe because the copy runs only after the
+/// inner call has finished.
+struct Watched<C> {
+    inner: C,
     slot: FatalSlot,
 }
 
-impl Watched {
+impl<C: FatalSource> Watched<C> {
     fn note(&self) {
         let Some(f) = self.inner.fatal() else {
             return;
@@ -426,7 +451,7 @@ impl Watched {
     }
 }
 
-impl Channel for Watched {
+impl<C: Channel + FatalSource + Send> Channel for Watched<C> {
     async fn recv(&mut self) -> Option<Inbound> {
         let m = self.inner.recv().await;
         self.note();
