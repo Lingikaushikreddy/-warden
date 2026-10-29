@@ -729,3 +729,99 @@ async fn updates_below_the_offset_are_ignored() {
     assert!(recv_quiet(&mut ch).await);
     assert_eq!(ch.fatal(), None);
 }
+
+#[tokio::test]
+async fn overflow_evicts_strangers_before_owner_text() {
+    let h = Harness::new().await;
+    let mut batch: Vec<Value> = (0..64)
+        .map(|i| private_text(i + 1, 1000 + i, "spam", NOW_S))
+        .collect();
+    batch.push(owner_text(65, "real"));
+    h.script.batch(batch);
+    let mut ch = h.channel();
+    let mut strangers = 0;
+    loop {
+        let m = ch.recv().await.unwrap();
+        if m.sender == owner() {
+            assert_eq!(m.text, "real");
+            break;
+        }
+        strangers += 1;
+    }
+    assert_eq!(strangers, 63);
+    assert_eq!(ch.dropped_count(), 1);
+    assert!(recv_quiet(&mut ch).await);
+}
+
+#[tokio::test]
+async fn overflow_drop_of_owner_pin_reply_deletes_it() {
+    let h = Harness::new().await;
+    let mut batch: Vec<Value> = (0..64)
+        .map(|i| owner_text(i + 1, &format!("msg {i}")))
+        .collect();
+    batch.push(owner_text(65, "yes 4821 1234"));
+    h.script.batch(batch);
+    let mut ch = h.channel();
+    assert_eq!(ch.recv().await.unwrap().text, "msg 0");
+    assert_eq!(ch.dropped_count(), 1);
+    let deleted = h.bodies("deleteMessage").await;
+    assert_eq!(deleted.len(), 1, "{deleted:?}");
+    assert_eq!(deleted[0]["chat_id"], OWNER);
+    assert_eq!(deleted[0]["message_id"], 165);
+}
+
+#[tokio::test]
+async fn cancelled_flush_still_deletes_pin_reply() {
+    let h = Harness::new().await;
+    // The first deleteMessage hangs long enough to be cancelled.
+    Mock::given(method("POST"))
+        .and(path(method_path("deleteMessage")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": true, "result": true}))
+                .set_delay(Duration::from_millis(2000)),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.server)
+        .await;
+    h.script.batch(vec![owner_text(7, "yes 4821 1234")]);
+    let mut ch = h.channel_with(
+        vec![OWNER],
+        TelegramOptions {
+            allow_pin_approvals: true,
+            ..opts()
+        },
+    );
+    let r = tokio::time::timeout(
+        Duration::from_millis(500),
+        ch.ask_approval(&owner(), &prompt(Tier::YesPin)),
+    )
+    .await;
+    assert!(r.is_err(), "the delete should still be in flight");
+    assert_eq!(h.bodies("deleteMessage").await.len(), 1);
+    // The next call performs the deletion again.
+    assert!(recv_quiet(&mut ch).await);
+    let deleted = h.bodies("deleteMessage").await;
+    assert_eq!(deleted.len(), 2, "{deleted:?}");
+    assert_eq!(deleted[1]["chat_id"], OWNER);
+    assert_eq!(deleted[1]["message_id"], 107);
+}
+
+#[tokio::test]
+async fn cancelled_prompt_old_code_in_new_prompt_is_no() {
+    let h = Harness::new().await;
+    let mut ch = h.channel();
+    let a = ApprovalPrompt {
+        challenge: "1111".into(),
+        ..prompt(Tier::Yes)
+    };
+    let r = tokio::time::timeout(Duration::from_millis(50), ch.ask_approval(&owner(), &a)).await;
+    assert!(r.is_err());
+    let b = ApprovalPrompt {
+        challenge: "2222".into(),
+        ..prompt(Tier::Yes)
+    };
+    h.script.batch(vec![owner_text(1, "yes 1111")]);
+    assert_eq!(ch.ask_approval(&owner(), &b).await, ApprovalReply::No);
+}

@@ -255,11 +255,28 @@ impl TelegramChannel {
         self.owners.contains(&id)
     }
 
+    /// Queue an item for `recv`. When the queue is full, items without
+    /// content (non-owner, refused, stale: the engine only audits them) go
+    /// first: an owner item evicts the newest of them, and is itself
+    /// dropped only when none is left. A dropped owner message that may
+    /// hold a PIN is deleted (best effort). Every drop is counted.
     fn enqueue(&mut self, item: Item) {
         if self.queue.len() < MAX_QUEUE {
             self.queue.push_back(item);
-        } else {
-            self.dropped = self.dropped.saturating_add(1);
+            return;
+        }
+        self.dropped = self.dropped.saturating_add(1);
+        let Some((chat, id)) = item.origin else {
+            return;
+        };
+        match self.queue.iter().rposition(|i| i.origin.is_none()) {
+            Some(pos) => {
+                self.queue.remove(pos);
+                self.queue.push_back(item);
+            }
+            None => {
+                let _ = self.drop_text(chat, id, &item.inbound.text);
+            }
         }
     }
 
@@ -314,15 +331,18 @@ impl TelegramChannel {
         }
     }
 
-    /// Send queued notices and perform queued deletions, best effort. Each
-    /// is removed before its request, so a cancelled flush skips it rather
-    /// than repeating it.
+    /// Send queued notices and perform queued deletions, best effort. A
+    /// notice is removed before its request, so a cancelled flush skips it
+    /// rather than repeating it. A deletion (idempotent, and possibly of a
+    /// PIN) is removed only once its request has finished, so a cancelled
+    /// flush performs it on the next call.
     async fn flush(&mut self) {
         while let Some((chat, text)) = self.notices.pop_front() {
             let _ = self.deliver(chat, &text).await;
         }
-        while let Some((chat, id)) = self.deletes.pop() {
+        while let Some(&(chat, id)) = self.deletes.last() {
             let _ = self.api.delete_message(chat, id).await;
+            self.deletes.pop();
         }
     }
 
