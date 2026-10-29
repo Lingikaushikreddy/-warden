@@ -862,3 +862,81 @@ async fn pair_recv_is_cancel_safe() {
         assert_eq!(got[1].text, format!("remote {i}"));
     }
 }
+
+// ---------------------------------------------------------------- Option
+
+/// The recording channel used by the `Option<C>` tests.
+type TestChannel = Remote;
+
+#[tokio::test]
+async fn option_none_is_a_closed_channel_that_serves_nobody() {
+    let mut c: Option<TestChannel> = None;
+    let pr = prompt("do it", Tier::Yes, None);
+    for who in [local(), remote(), SenderId("stranger".into())] {
+        assert!(!c.serves(&who));
+        assert!(!c.accepts_pin(&who));
+        c.send(&who, "hello").await;
+        assert_eq!(c.ask_approval(&who, &pr).await, ApprovalReply::No);
+        assert_eq!(c.discard_pending_input(&who).await, 0);
+        c.retract_last(&who).await;
+    }
+    c.flush_pending().await;
+    assert!(c.recv().await.is_none());
+    assert!(c.recv().await.is_none(), "stays closed");
+}
+
+#[tokio::test]
+async fn option_some_delegates_every_call() {
+    let (r, tx, log) = remote_chan();
+    let mut c: Option<TestChannel> = Some(r);
+    tx.send("hi".into()).unwrap();
+    let m = c.recv().await.expect("delegated recv");
+    assert_eq!((m.sender, m.text.as_str()), (remote(), "hi"));
+    assert!(c.serves(&remote()));
+    assert!(!c.serves(&local()));
+    // `Remote` refuses PINs while the trait default accepts them: `false`
+    // proves the call reached the inner channel.
+    assert!(!c.accepts_pin(&remote()));
+    c.send(&remote(), "out").await;
+    let pr = prompt("do it", Tier::Yes, None);
+    assert_eq!(c.ask_approval(&remote(), &pr).await, ApprovalReply::Yes);
+    assert_eq!(c.discard_pending_input(&remote()).await, 3);
+    c.retract_last(&remote()).await;
+    c.flush_pending().await;
+    drop(tx);
+    assert!(c.recv().await.is_none(), "inner channel closed");
+    assert_eq!(
+        *log.sent.lock().unwrap(),
+        vec![(remote(), "out".to_string())]
+    );
+    assert_eq!(*log.asked.lock().unwrap(), vec![remote()]);
+    assert_eq!(*log.discarded.lock().unwrap(), vec![remote()]);
+    assert_eq!(*log.retracted.lock().unwrap(), vec![remote()]);
+    assert_eq!(log.flushed.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn pair_with_a_none_side_behaves_like_the_other_side() {
+    let mut out = Vec::new();
+    {
+        let mut p = Pair::new(
+            None::<TestChannel>,
+            Some(chan(b"first\nyes 4821\n", &mut out)),
+        );
+        assert!(p.serves(&local()));
+        assert!(!p.serves(&remote()));
+        assert!(p.accepts_pin(&local()));
+        let m = p.recv().await.expect("stdio line");
+        assert_eq!((m.sender, m.text.as_str()), (local(), "first"));
+        p.send(&local(), "to local").await;
+        let pr = prompt("do it", Tier::Yes, None);
+        assert_eq!(p.ask_approval(&local(), &pr).await, ApprovalReply::Yes);
+        // Nobody serves `remote`: fail closed.
+        p.send(&remote(), "to remote").await;
+        assert_eq!(p.ask_approval(&remote(), &pr).await, ApprovalReply::No);
+        assert!(p.recv().await.is_none(), "both sides closed");
+    }
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.starts_with("to local\n"), "{out:?}");
+    assert!(!out.contains("to remote"));
+}
