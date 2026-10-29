@@ -676,7 +676,7 @@ impl Channel for TelegramChannel {
             return ApprovalReply::No;
         };
         let Some(prompt_id) = self.deliver(chat, &text).await else {
-            return ApprovalReply::No;
+            return ApprovalReply::Undelivered;
         };
 
         loop {

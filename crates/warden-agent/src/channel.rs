@@ -48,6 +48,9 @@ pub enum ApprovalReply {
     /// No reply at all: the channel closed (EOF) before a complete reply
     /// line. Treated as a refusal, audited distinctly.
     Closed,
+    /// The prompt could not be shown (a remote channel's send failed), so
+    /// nobody was asked. Treated as a refusal, audited distinctly.
+    Undelivered,
 }
 
 impl fmt::Debug for ApprovalReply {
@@ -57,6 +60,7 @@ impl fmt::Debug for ApprovalReply {
             ApprovalReply::No => f.write_str("No"),
             ApprovalReply::YesPin(_) => f.write_str("YesPin(<redacted>)"),
             ApprovalReply::Closed => f.write_str("Closed"),
+            ApprovalReply::Undelivered => f.write_str("Undelivered"),
         }
     }
 }
@@ -100,7 +104,8 @@ pub trait Channel {
     /// other than `YesPin`, only `yes <code>` (`yes` case-insensitive,
     /// trimmed, exactly one token after it, equal to the code) is `Yes`. For
     /// `YesPin`, `yes <code> <pin>` (pin 1-128 chars) is `YesPin(pin)`.
-    /// Everything else is `No`; EOF before a complete reply is `Closed`. A
+    /// Everything else is `No`; EOF before a complete reply is `Closed`; a
+    /// prompt that could not be shown at all is `Undelivered`. A
     /// prompt whose summary or note would be truncated, or whose challenge
     /// is not 1-16 ASCII alphanumerics, is refused without asking.
     ///

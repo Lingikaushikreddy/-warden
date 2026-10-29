@@ -643,6 +643,8 @@ enum Consent {
     No,
     /// The channel closed before any reply.
     Closed,
+    /// The prompt never reached the owner.
+    Undelivered,
     Pin(Zeroizing<String>),
 }
 
@@ -652,6 +654,7 @@ impl From<ApprovalReply> for Consent {
             ApprovalReply::Yes => Consent::Yes,
             ApprovalReply::No => Consent::No,
             ApprovalReply::Closed => Consent::Closed,
+            ApprovalReply::Undelivered => Consent::Undelivered,
             ApprovalReply::YesPin(p) => Consent::Pin(p),
         }
     }
@@ -1398,6 +1401,16 @@ where
             (_, Consent::No) => {
                 return self
                     .refuse(&action, tier, "refused: owner declined", "owner declined")
+                    .await;
+            }
+            (_, Consent::Undelivered) => {
+                return self
+                    .refuse(
+                        &action,
+                        tier,
+                        "refused: prompt not delivered",
+                        "prompt not delivered",
+                    )
                     .await;
             }
             (_, Consent::Closed) => {

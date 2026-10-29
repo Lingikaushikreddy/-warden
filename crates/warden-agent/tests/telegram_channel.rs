@@ -948,3 +948,21 @@ async fn queued_owner_text_is_rechecked_for_age_when_popped() {
         "ignored 2 message(s) older than 120 s (Warden was not running or was busy)"
     );
 }
+
+#[tokio::test]
+async fn failed_prompt_send_is_undelivered_not_declined() {
+    let h = Harness::new().await;
+    Mock::given(method("POST"))
+        .and(path(method_path("sendMessage")))
+        .respond_with(api_error(500))
+        .with_priority(1)
+        .mount(&h.server)
+        .await;
+    let mut ch = h.channel();
+    assert_eq!(
+        ch.ask_approval(&owner(), &prompt(Tier::Yes)).await,
+        ApprovalReply::Undelivered
+    );
+    // No reply was waited for.
+    assert!(h.bodies("getUpdates").await.is_empty());
+}

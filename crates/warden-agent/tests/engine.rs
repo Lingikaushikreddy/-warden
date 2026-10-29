@@ -526,6 +526,39 @@ async fn injected_delete_declined_changes_nothing() {
 }
 
 #[tokio::test]
+async fn undelivered_prompt_is_audited_as_not_delivered() {
+    let env = env();
+    let x = env.file("a.txt", "old");
+    let mut e = env.engine(
+        vec![
+            reply(
+                None,
+                vec![call(
+                    "t1",
+                    "write_file",
+                    json!({"path": "a.txt", "content": "new"}),
+                )],
+            ),
+            reply(Some("ok"), vec![]),
+        ],
+        Opts {
+            replies: vec![Reply::Is(ApprovalReply::Undelivered)],
+            ..Opts::default()
+        },
+    );
+    e.handle(msg("update a")).await;
+    assert_eq!(fs::read_to_string(&x).unwrap(), "old");
+    assert_eq!(
+        env.decisions(),
+        vec!["requested", "refused: prompt not delivered"]
+    );
+    let reqs = e.planner().requests();
+    let (_, results) = blocks(&reqs[1]);
+    assert_eq!(results.last().unwrap().1, "prompt not delivered");
+    assert!(results.last().unwrap().2);
+}
+
+#[tokio::test]
 async fn secret_in_file_never_reaches_planner_requests() {
     let env = env();
     let content = format!(
