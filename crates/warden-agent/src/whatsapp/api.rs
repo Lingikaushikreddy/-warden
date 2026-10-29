@@ -157,7 +157,7 @@ impl AccessToken {
     }
 }
 
-/// `^v[0-9]{1,3}\.[0-9]{1,3}$`.
+/// `^v[0-9]{1,3}\.[0-9]{1,2}$`, the same rule as `[whatsapp] graph_version`.
 fn valid_version(s: &str) -> bool {
     let Some(rest) = s.strip_prefix('v') else {
         return false;
@@ -165,9 +165,9 @@ fn valid_version(s: &str) -> bool {
     let Some((major, minor)) = rest.split_once('.') else {
         return false;
     };
-    [major, minor]
-        .iter()
-        .all(|p| (1..=3).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()))
+    let digits =
+        |p: &str, max: usize| (1..=max).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit());
+    digits(major, 3) && digits(minor, 2)
 }
 
 /// 1-32 ASCII digits.

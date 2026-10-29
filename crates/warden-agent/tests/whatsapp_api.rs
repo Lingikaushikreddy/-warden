@@ -425,6 +425,7 @@ fn version_and_phone_number_id_are_validated() {
         "v26.0?a",
         "v 26.0",
         "v1234.0",
+        "v26.100",
     ] {
         let e = GraphApi::new(token(), base, bad, PHONE_ID).unwrap_err();
         assert!(matches!(e, WhatsAppError::Config(_)), "{bad:?}: {e:?}");

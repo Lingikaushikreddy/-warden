@@ -596,6 +596,9 @@ fn whatsapp_owner_numbers_rules() {
         "[\"1234567890123456\"]".to_string(),
         "[\"++15551234567\"]".to_string(),
         "[\"\"]".to_string(),
+        // E.164 country codes never start with 0.
+        "[\"05551234567\"]".to_string(),
+        "[\"+05551234567\"]".to_string(),
     ] {
         let e = wa(&format!("owner_numbers = {nums}\n{pid}")).unwrap_err();
         assert!(matches!(e, ConfigError::Invalid(F, _)), "{nums}: {e:?}");
@@ -648,6 +651,8 @@ fn whatsapp_listen_must_be_loopback() {
         "192.168.1.5:8097",
         "localhost:8097",
         "[::ffff:127.0.0.1]:8097",
+        "[::ffff:0.0.0.0]:8097",
+        "[::ffff:7f00:1]:8097",
         "127.0.0.1",
         "",
     ] {

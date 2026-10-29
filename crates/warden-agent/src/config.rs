@@ -588,13 +588,17 @@ fn whatsapp(
         .into_iter()
         .map(|n| {
             let d = n.strip_prefix('+').unwrap_or(n);
-            if (7..=15).contains(&d.len()) && d.bytes().all(|b| b.is_ascii_digit()) {
+            // E.164: no country code starts with 0.
+            if (7..=15).contains(&d.len())
+                && d.bytes().all(|b| b.is_ascii_digit())
+                && !d.starts_with('0')
+            {
                 Ok(d.to_string())
             } else {
                 Err(ConfigError::Invalid(
                     NUMS,
                     "must hold E.164 numbers: an optional `+` then 7-15 digits, \
-                     no spaces or dashes",
+                     the first not 0, no spaces or dashes",
                 ))
             }
         })
