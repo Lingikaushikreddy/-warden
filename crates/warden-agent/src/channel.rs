@@ -148,6 +148,134 @@ pub trait Channel {
         let _ = to;
         async {}
     }
+
+    /// Whether this channel can reach `who` (used by [`Pair`] to route
+    /// outbound calls). Default: `true`.
+    fn serves(&self, who: &SenderId) -> bool {
+        let _ = who;
+        true
+    }
+}
+
+/// Two channels as one (`warden daemon --console`: the terminal and
+/// Telegram). Inbound messages come from either side; every outbound call
+/// goes to `a` if `a` serves the recipient, else to `b` if `b` does, else
+/// nowhere: `send` and `retract_last` do nothing, `ask_approval` is `No`,
+/// `discard_pending_input` is 0 and `accepts_pin` is `false`.
+///
+/// `recv` races both sides, keeps reading the other side after one has
+/// closed, is `None` once both have, and alternates which side is polled
+/// first so a busy side cannot starve the other. It is cancel-safe when both
+/// sides' `recv` are.
+pub struct Pair<A, B> {
+    a: A,
+    b: B,
+    a_closed: bool,
+    b_closed: bool,
+    /// Poll `a` first on the next `recv`.
+    a_first: bool,
+}
+
+impl<A, B> Pair<A, B> {
+    pub fn new(a: A, b: B) -> Self {
+        Self {
+            a,
+            b,
+            a_closed: false,
+            b_closed: false,
+            a_first: true,
+        }
+    }
+}
+
+/// Which side of a [`Pair`] a `recv` result came from.
+enum Side {
+    A(Option<Inbound>),
+    B(Option<Inbound>),
+}
+
+impl<A: Channel + Send, B: Channel + Send> Channel for Pair<A, B> {
+    async fn recv(&mut self) -> Option<Inbound> {
+        loop {
+            if self.a_closed && self.b_closed {
+                return None;
+            }
+            let a_first = self.a_first;
+            self.a_first = !a_first;
+            let (a_open, b_open) = (!self.a_closed, !self.b_closed);
+            // Each branch is a whole `recv` of one side; the loser is
+            // dropped, which loses nothing because each side's `recv` is
+            // cancel-safe. State changes only after a branch completes.
+            let side = if a_first {
+                tokio::select! {
+                    biased;
+                    m = self.a.recv(), if a_open => Side::A(m),
+                    m = self.b.recv(), if b_open => Side::B(m),
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    m = self.b.recv(), if b_open => Side::B(m),
+                    m = self.a.recv(), if a_open => Side::A(m),
+                }
+            };
+            match side {
+                Side::A(None) => self.a_closed = true,
+                Side::B(None) => self.b_closed = true,
+                Side::A(m) | Side::B(m) => return m,
+            }
+        }
+    }
+
+    async fn send(&mut self, to: &SenderId, text: &str) {
+        if self.a.serves(to) {
+            self.a.send(to, text).await;
+        } else if self.b.serves(to) {
+            self.b.send(to, text).await;
+        }
+    }
+
+    async fn ask_approval(&mut self, to: &SenderId, prompt: &ApprovalPrompt) -> ApprovalReply {
+        if self.a.serves(to) {
+            self.a.ask_approval(to, prompt).await
+        } else if self.b.serves(to) {
+            self.b.ask_approval(to, prompt).await
+        } else {
+            ApprovalReply::No
+        }
+    }
+
+    async fn discard_pending_input(&mut self, to: &SenderId) -> usize {
+        if self.a.serves(to) {
+            self.a.discard_pending_input(to).await
+        } else if self.b.serves(to) {
+            self.b.discard_pending_input(to).await
+        } else {
+            0
+        }
+    }
+
+    fn accepts_pin(&self, to: &SenderId) -> bool {
+        if self.a.serves(to) {
+            self.a.accepts_pin(to)
+        } else if self.b.serves(to) {
+            self.b.accepts_pin(to)
+        } else {
+            false
+        }
+    }
+
+    async fn retract_last(&mut self, to: &SenderId) {
+        if self.a.serves(to) {
+            self.a.retract_last(to).await;
+        } else if self.b.serves(to) {
+            self.b.retract_last(to).await;
+        }
+    }
+
+    fn serves(&self, who: &SenderId) -> bool {
+        self.a.serves(who) || self.b.serves(who)
+    }
 }
 
 /// A challenge code the channel will show: 1-16 ASCII alphanumerics.
@@ -507,6 +635,11 @@ where
         }
         self.skip_line = mid_line;
         dropped
+    }
+
+    /// The only sender is `local`.
+    fn serves(&self, who: &SenderId) -> bool {
+        who.0 == "local"
     }
 
     /// `to` is ignored: the only sender is `local`.

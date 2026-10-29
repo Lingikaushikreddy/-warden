@@ -654,3 +654,191 @@ fn ogham_space_is_escaped_for_display() {
     };
     assert!(parse_call(&call, std::path::Path::new("/root")).is_ok());
 }
+
+// ---------------------------------------------------------------- Pair
+
+use std::sync::{Arc, Mutex};
+use warden_agent::channel::{Inbound, Pair};
+
+fn remote() -> SenderId {
+    SenderId("remote".into())
+}
+
+/// What a [`Remote`] channel was asked to do.
+#[derive(Default, Clone)]
+struct RemoteLog {
+    sent: Arc<Mutex<Vec<(SenderId, String)>>>,
+    asked: Arc<Mutex<Vec<SenderId>>>,
+    discarded: Arc<Mutex<Vec<SenderId>>>,
+    retracted: Arc<Mutex<Vec<SenderId>>>,
+}
+
+impl RemoteLog {
+    fn is_empty(&self) -> bool {
+        self.sent.lock().unwrap().is_empty()
+            && self.asked.lock().unwrap().is_empty()
+            && self.discarded.lock().unwrap().is_empty()
+            && self.retracted.lock().unwrap().is_empty()
+    }
+}
+
+/// A channel serving only `remote`, fed through an mpsc queue (whose
+/// `recv` is cancel-safe). It answers every prompt `Yes`, has 3 bytes of
+/// pending input and does not accept PINs.
+struct Remote {
+    rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    log: RemoteLog,
+}
+
+fn remote_chan() -> (
+    Remote,
+    tokio::sync::mpsc::UnboundedSender<String>,
+    RemoteLog,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let log = RemoteLog::default();
+    (
+        Remote {
+            rx,
+            log: log.clone(),
+        },
+        tx,
+        log,
+    )
+}
+
+impl Channel for Remote {
+    async fn recv(&mut self) -> Option<Inbound> {
+        self.rx.recv().await.map(|text| Inbound {
+            sender: remote(),
+            text,
+        })
+    }
+    async fn send(&mut self, to: &SenderId, text: &str) {
+        self.log
+            .sent
+            .lock()
+            .unwrap()
+            .push((to.clone(), text.into()));
+    }
+    async fn ask_approval(&mut self, to: &SenderId, _prompt: &ApprovalPrompt) -> ApprovalReply {
+        self.log.asked.lock().unwrap().push(to.clone());
+        ApprovalReply::Yes
+    }
+    async fn discard_pending_input(&mut self, to: &SenderId) -> usize {
+        self.log.discarded.lock().unwrap().push(to.clone());
+        3
+    }
+    fn accepts_pin(&self, _to: &SenderId) -> bool {
+        false
+    }
+    async fn retract_last(&mut self, to: &SenderId) {
+        self.log.retracted.lock().unwrap().push(to.clone());
+    }
+    fn serves(&self, who: &SenderId) -> bool {
+        *who == remote()
+    }
+}
+
+#[tokio::test]
+async fn pair_routes_by_sender() {
+    let mut out = Vec::new();
+    let (r, _tx, log) = remote_chan();
+    {
+        let mut p = Pair::new(chan(b"pending\n", &mut out), r);
+        assert!(p.serves(&local()) && p.serves(&remote()));
+        assert!(!p.serves(&SenderId("stranger".into())));
+        p.send(&local(), "to local").await;
+        p.send(&remote(), "to remote").await;
+        assert!(p.accepts_pin(&local()));
+        assert!(!p.accepts_pin(&remote()));
+        assert_eq!(p.discard_pending_input(&remote()).await, 3);
+        assert_eq!(p.discard_pending_input(&local()).await, 8, "stdio dropped");
+        let pr = prompt("do it", Tier::Yes, None);
+        assert_eq!(p.ask_approval(&remote(), &pr).await, ApprovalReply::Yes);
+        // The stdio side has no reply left: EOF.
+        assert_eq!(p.ask_approval(&local(), &pr).await, ApprovalReply::Closed);
+        p.retract_last(&remote()).await;
+    }
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.starts_with("to local\n"), "{out:?}");
+    assert!(!out.contains("to remote"));
+    assert!(out.contains(&format!("yes {CODE}")), "local prompt shown");
+    assert_eq!(
+        *log.sent.lock().unwrap(),
+        vec![(remote(), "to remote".to_string())]
+    );
+    assert_eq!(*log.asked.lock().unwrap(), vec![remote()]);
+    assert_eq!(*log.discarded.lock().unwrap(), vec![remote()]);
+    assert_eq!(*log.retracted.lock().unwrap(), vec![remote()]);
+}
+
+#[tokio::test]
+async fn pair_unknown_recipient_gets_no_and_nothing_sent() {
+    let mut out = Vec::new();
+    let (r, _tx, log) = remote_chan();
+    let stranger = SenderId("stranger".into());
+    {
+        let mut p = Pair::new(chan(b"yes 4821\n", &mut out), r);
+        p.send(&stranger, "hello").await;
+        let pr = prompt("do it", Tier::Yes, None);
+        assert_eq!(p.ask_approval(&stranger, &pr).await, ApprovalReply::No);
+        assert_eq!(p.discard_pending_input(&stranger).await, 0);
+        assert!(!p.accepts_pin(&stranger));
+        p.retract_last(&stranger).await;
+        // The stdio input was not touched: its line is still there.
+        assert_eq!(p.recv().await.unwrap().text, "yes 4821");
+    }
+    assert!(out.is_empty(), "{out:?}");
+    assert!(log.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn pair_recv_keeps_going_after_one_side_closes() {
+    use std::time::Duration;
+    let mut out = Vec::new();
+    let (r, tx, _log) = remote_chan();
+    let mut p = Pair::new(chan(b"", &mut out), r);
+    let feed = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        tx.send("one".into()).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        tx.send("two".into()).unwrap();
+        // Dropping `tx` closes the remote side.
+    });
+    for want in ["one", "two"] {
+        let m = p.recv().await.expect("the remote side still delivers");
+        assert_eq!((m.sender, m.text.as_str()), (remote(), want));
+    }
+    assert!(p.recv().await.is_none(), "both sides closed");
+    assert!(p.recv().await.is_none());
+    feed.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn pair_recv_is_cancel_safe() {
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    let (mut client, server) = tokio::io::duplex(1024);
+    let (r, tx, _log) = remote_chan();
+    let mut p = Pair::new(
+        StdioChannel::new(BufReader::new(server), tokio::io::sink()),
+        r,
+    );
+    // Several rounds so both polling orders are cancelled mid-line.
+    for i in 0..4 {
+        client
+            .write_all(format!("line {i} first ha").as_bytes())
+            .await
+            .unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(1), p.recv()).await;
+        assert!(r.is_err(), "nothing complete yet");
+        tx.send(format!("remote {i}")).unwrap();
+        client.write_all(b"lf\n").await.unwrap();
+        let mut got = [p.recv().await.unwrap(), p.recv().await.unwrap()];
+        got.sort_by(|a, b| a.text.cmp(&b.text));
+        assert_eq!(got[0].text, format!("line {i} first half"));
+        assert_eq!(got[0].sender, local());
+        assert_eq!(got[1].text, format!("remote {i}"));
+    }
+}

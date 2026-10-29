@@ -56,6 +56,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde_json::{json, Value};
+use tokio::sync::watch;
 use tokio::time::{timeout, Instant};
 use warden_core::pin::{check_pin, PinCheck};
 use warden_core::{classify, normalize, Action, AuditLog, Capability, PolicyConfig, Tier};
@@ -115,6 +116,8 @@ const REPLY_TRUNCATED: &str = "\n[reply truncated]";
 /// that does not accept PINs.
 const PIN_NOT_ACCEPTED: &str =
     "this needs your PIN, which this channel does not accept; do it at the computer";
+/// Told to the owner when a message ends because the engine is stopping.
+const SHUTTING_DOWN: &str = "Warden is shutting down";
 /// Approval-shaped messages with at least this many whitespace tokens may
 /// carry a PIN (`yes <code> <PIN>`) and are retracted.
 const RETRACT_MIN_TOKENS: usize = 3;
@@ -487,6 +490,31 @@ fn tool_error_reason(e: &ToolError) -> &'static str {
     }
 }
 
+/// Resolves once `rx` holds `true` (at once if it already does). Never
+/// resolves without a receiver, or once every sender is gone without having
+/// asked for shutdown.
+async fn shutdown_requested(rx: Option<watch::Receiver<bool>>) {
+    if let Some(mut rx) = rx {
+        if rx.wait_for(|v| *v).await.is_ok() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+/// What an owner prompt raced against shutdown produced.
+enum Prompted {
+    Reply(ApprovalReply),
+    Timeout,
+    Shutdown,
+}
+
+/// What a planner call raced against shutdown produced.
+enum Planned<T> {
+    Done(T),
+    Shutdown,
+}
+
 /// Time left before `deadline`, or `None` once it has passed.
 fn remaining(deadline: Instant) -> Option<Duration> {
     deadline
@@ -655,6 +683,9 @@ pub struct Engine<P: Planner, C: Channel, A: AuditSink> {
     recent_challenges: VecDeque<String>,
     /// Sender of the message being handled: every outbound call goes here.
     sender: SenderId,
+    /// Shutdown signal ([`Engine::with_shutdown`]); `None` runs until the
+    /// channel closes.
+    shutdown: Option<watch::Receiver<bool>>,
     /// How many `check_pin` calls the PIN-like check has made (test-hooks).
     #[cfg(feature = "test-hooks")]
     pin_like_checks: Arc<std::sync::atomic::AtomicUsize>,
@@ -667,6 +698,8 @@ enum EndReason {
     Timeout,
     /// The input stream closed at an owner prompt.
     InputClosed,
+    /// Shutdown was asked for.
+    Shutdown,
 }
 
 impl<P: Planner, C: Channel, A: AuditSink> fmt::Debug for Engine<P, C, A> {
@@ -756,6 +789,7 @@ where
             end_message: None,
             recent_challenges: VecDeque::new(),
             sender: SenderId(String::new()),
+            shutdown: None,
             #[cfg(feature = "test-hooks")]
             pin_like_checks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
@@ -767,6 +801,23 @@ where
     pub fn with_clock(mut self, clock: Box<dyn Fn() -> u64 + Send + Sync>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Stop on `shutdown` becoming `true`. [`Engine::run`] then returns at
+    /// once when idle. While a message is handled, a planner call or an
+    /// owner prompt in progress loses to it and the message ends
+    /// (`failed: shutdown`; the action at a prompt is `refused: shutting
+    /// down`). A running tool is never interrupted: it finishes and is
+    /// audited, then the message ends. The audit sink is released on every
+    /// path, because `handle` is never cancelled from outside.
+    pub fn with_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
+    }
+
+    /// Has shutdown been asked for?
+    fn shutting_down(&self) -> bool {
+        self.shutdown.as_ref().is_some_and(|rx| *rx.borrow())
     }
 
     pub fn planner(&self) -> &P {
@@ -808,9 +859,18 @@ where
         }
     }
 
-    /// Handle messages until the channel closes.
+    /// Handle messages until the channel closes or shutdown is asked for
+    /// ([`Engine::with_shutdown`]). Waiting for a message is raced against
+    /// shutdown (the channel's `recv` is cancel-safe); handling one is not:
+    /// shutdown is observed inside `handle`, at planner calls and prompts.
     pub async fn run(&mut self) {
-        while let Some(m) = self.channel.recv().await {
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = shutdown_requested(self.shutdown.clone()) => None,
+                m = self.channel.recv() => m,
+            };
+            let Some(m) = next else { return };
             self.handle(m).await;
         }
     }
@@ -949,7 +1009,15 @@ where
                 turns: turns.clone(),
                 tools: tool_specs(),
             };
-            let resp = match timeout(left, self.planner.plan(&req)).await {
+            let planned = tokio::select! {
+                biased;
+                () = shutdown_requested(self.shutdown.clone()) => Planned::Shutdown,
+                r = timeout(left, self.planner.plan(&req)) => Planned::Done(r),
+            };
+            let Planned::Done(planned) = planned else {
+                return self.shut_down(&msg_id).await;
+            };
+            let resp = match planned {
                 Err(_) => return self.timed_out(&msg_id).await,
                 Ok(Err(e)) => return self.planner_failed(&msg_id, planner_kind(&e)).await,
                 Ok(Ok(r)) => r,
@@ -1015,6 +1083,10 @@ where
                     Some(EndReason::Timeout) => return self.timed_out(&msg_id).await,
                     // No owner can answer any more: stop here too.
                     Some(EndReason::InputClosed) => return self.input_closed(&msg_id).await,
+                    Some(EndReason::Shutdown) => return self.shut_down(&msg_id).await,
+                    // A tool that was running when shutdown was asked for
+                    // has finished and been audited: stop now.
+                    None if self.shutting_down() => return self.shut_down(&msg_id).await,
                     None => {}
                 }
                 results.push(self.result_block(id, outcome));
@@ -1121,6 +1193,12 @@ where
     async fn input_closed(&mut self, msg_id: &str) {
         self.say("input closed").await;
         self.audit_or_warn(msg_id, "message", Tier::Auto, "failed: input closed")
+            .await;
+    }
+
+    async fn shut_down(&mut self, msg_id: &str) {
+        self.say(SHUTTING_DOWN).await;
+        self.audit_or_warn(msg_id, "message", Tier::Auto, "failed: shutdown")
             .await;
     }
 
@@ -1285,22 +1363,36 @@ where
         if self.channel.discard_pending_input(&self.sender).await > 0 {
             self.say("earlier unsent input was discarded").await;
         }
-        let reply = timeout(
-            self.cfg.approval_timeout,
-            self.channel.ask_approval(&self.sender, &prompt),
-        )
-        .await
-        .ok();
-        let Some(reply) = reply else {
-            self.end_message = Some(EndReason::Timeout);
-            return self
-                .refuse(
-                    &action,
-                    tier,
-                    "refused: approval timed out",
-                    "owner declined",
-                )
-                .await;
+        // Raced against shutdown: an unanswered prompt must not hold the
+        // engine up. Dropping `ask_approval` is safe (channels make it
+        // cancel-safe, as the prompt timeout already requires).
+        let prompted = tokio::select! {
+            biased;
+            () = shutdown_requested(self.shutdown.clone()) => Prompted::Shutdown,
+            r = timeout(
+                self.cfg.approval_timeout,
+                self.channel.ask_approval(&self.sender, &prompt),
+            ) => r.map_or(Prompted::Timeout, Prompted::Reply),
+        };
+        let reply = match prompted {
+            Prompted::Reply(r) => r,
+            Prompted::Timeout => {
+                self.end_message = Some(EndReason::Timeout);
+                return self
+                    .refuse(
+                        &action,
+                        tier,
+                        "refused: approval timed out",
+                        "owner declined",
+                    )
+                    .await;
+            }
+            Prompted::Shutdown => {
+                self.end_message = Some(EndReason::Shutdown);
+                return self
+                    .refuse(&action, tier, "refused: shutting down", "owner declined")
+                    .await;
+            }
         };
         match (decision, Consent::from(reply)) {
             (_, Consent::No) => {

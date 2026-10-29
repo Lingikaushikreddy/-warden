@@ -94,6 +94,9 @@ struct Seen {
     retracted: Arc<Mutex<Vec<SenderId>>>,
     /// Set to make `accepts_pin` answer `false` from now on.
     pin_off: Arc<std::sync::atomic::AtomicBool>,
+    /// Set to make `recv` wait forever once the inbound queue is empty
+    /// (a channel that is open but idle) instead of closing.
+    idle_open: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Seen {
@@ -124,7 +127,10 @@ struct TestChannel {
 
 impl Channel for TestChannel {
     async fn recv(&mut self) -> Option<Inbound> {
-        self.inbound.pop_front()
+        match self.inbound.pop_front() {
+            None if self.seen.idle_open.load(Ordering::SeqCst) => std::future::pending().await,
+            m => m,
+        }
     }
 
     async fn send(&mut self, to: &SenderId, text: &str) {
@@ -290,6 +296,16 @@ impl Env {
         planner: P,
         o: Opts,
     ) -> Result<Engine<P, TestChannel, RecSink>, warden_agent::engine::EngineConfigError> {
+        self.try_engine_with_sink(planner, o, |s| s)
+    }
+
+    /// As [`Env::try_engine_with`], with the recording sink wrapped by `wrap`.
+    fn try_engine_with_sink<P: Planner, A: AuditSink + Send + 'static>(
+        &self,
+        planner: P,
+        o: Opts,
+        wrap: impl FnOnce(RecSink) -> A,
+    ) -> Result<Engine<P, TestChannel, A>, warden_agent::engine::EngineConfigError> {
         let mut store = ApproverStore::open(&self.home, NOW).unwrap();
         (o.store_hook)(&mut store);
         let snapshots = SnapshotStore::open(&self.snaps).unwrap();
@@ -319,7 +335,7 @@ impl Env {
             cfg,
             planner,
             channel,
-            sink,
+            wrap(sink),
             store,
             exec,
             self.home.clone(),
@@ -3381,4 +3397,187 @@ async fn pin_gate_is_checked_before_the_pin_lock() {
         "refused: pin not accepted on this channel"
     );
     assert_eq!(env.seen.prompts().len(), 3);
+}
+
+// ---------------------------------------------------------------- shutdown
+
+/// A recording sink that also counts [`AuditSink::release`] calls.
+struct CountReleases {
+    inner: RecSink,
+    released: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl AuditSink for CountReleases {
+    fn append(
+        &mut self,
+        action_id: &str,
+        summary: &str,
+        tier: Tier,
+        decision: &str,
+    ) -> io::Result<()> {
+        self.inner.append(action_id, summary, tier, decision)
+    }
+
+    fn release(&mut self) {
+        self.released.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A planner that never answers.
+struct HangPlanner;
+
+impl Planner for HangPlanner {
+    async fn plan(&self, _req: &PlanRequest) -> Result<PlanResponse, PlannerError> {
+        std::future::pending().await
+    }
+}
+
+fn write_a() -> Vec<Result<PlanResponse, PlannerError>> {
+    vec![
+        reply(
+            None,
+            vec![call(
+                "t1",
+                "write_file",
+                json!({"path": "a.txt", "content": "new"}),
+            )],
+        ),
+        reply(Some("never asked"), vec![]),
+    ]
+}
+
+#[tokio::test(start_paused = true)]
+async fn run_returns_when_shutdown_is_set_while_idle() {
+    let env = env();
+    env.seen.idle_open.store(true, Ordering::SeqCst);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let mut e = env.engine(vec![], Opts::default()).with_shutdown(rx);
+    let started = tokio::time::Instant::now();
+    tokio::join!(e.run(), async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        tx.send(true).unwrap();
+    });
+    assert_eq!(started.elapsed(), Duration::from_secs(1), "stopped at once");
+    assert!(e.planner().requests().is_empty());
+    assert!(env.decisions().is_empty());
+    assert!(env.seen.sent().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_during_prompt_refuses_and_ends_the_message() {
+    let env = env();
+    env.seen.idle_open.store(true, Ordering::SeqCst);
+    let f = env.file("a.txt", "old");
+    let released = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let r = Arc::clone(&released);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let mut e = env
+        .try_engine_with_sink(
+            MockPlanner::scripted(write_a()),
+            Opts {
+                inbound: vec![msg("go")],
+                replies: vec![Reply::Hang],
+                ..Opts::default()
+            },
+            move |inner| CountReleases { inner, released: r },
+        )
+        .unwrap()
+        .with_shutdown(rx);
+    let started = tokio::time::Instant::now();
+    tokio::join!(e.run(), async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        tx.send(true).unwrap();
+    });
+    // Neither the 120 s prompt timeout nor the message deadline was waited for.
+    assert_eq!(started.elapsed(), Duration::from_secs(5));
+    assert_eq!(fs::read_to_string(&f).unwrap(), "old");
+    assert_eq!(
+        env.decisions(),
+        vec!["requested", "refused: shutting down", "failed: shutdown"]
+    );
+    assert_eq!(env.seen.prompts().len(), 1);
+    assert_eq!(e.planner().requests().len(), 1, "the message ended");
+    assert_eq!(env.seen.sent().last().unwrap(), "Warden is shutting down");
+    // `handle` was not cancelled from outside: the audit sink was released.
+    assert_eq!(released.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_during_planner_call_fails_the_message() {
+    let env = env();
+    env.seen.idle_open.store(true, Ordering::SeqCst);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let mut e = env
+        .engine_with(
+            HangPlanner,
+            Opts {
+                inbound: vec![msg("go")],
+                ..Opts::default()
+            },
+        )
+        .with_shutdown(rx);
+    let started = tokio::time::Instant::now();
+    tokio::join!(e.run(), async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        tx.send(true).unwrap();
+    });
+    assert_eq!(started.elapsed(), Duration::from_secs(5));
+    assert_eq!(env.decisions(), vec!["failed: shutdown"]);
+    assert_eq!(env.seen.sent(), vec!["Warden is shutting down".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_while_a_tool_runs_lets_it_finish_and_audits_it() {
+    let env = env();
+    env.seen.idle_open.store(true, Ordering::SeqCst);
+    let f = env.file("a.txt", "old");
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let tx = Arc::new(tx);
+    let hook_tx = Arc::clone(&tx);
+    let mut e = env
+        .engine(
+            vec![
+                // A second call in the same response must not run.
+                reply(
+                    None,
+                    vec![
+                        call(
+                            "t1",
+                            "write_file",
+                            json!({"path": "a.txt", "content": "new"}),
+                        ),
+                        call("t2", "read_file", json!({"path": "a.txt"})),
+                    ],
+                ),
+                reply(Some("never asked"), vec![]),
+            ],
+            Opts {
+                inbound: vec![msg("go")],
+                replies: vec![yes()],
+                exec_hook: Box::new(move |x| {
+                    x.before_rename_hook_for_test(Box::new(move |_| {
+                        // Shutdown is asked for while the tool is running.
+                        hook_tx.send(true).unwrap();
+                        std::thread::sleep(Duration::from_millis(200))
+                    }))
+                }),
+                ..Opts::default()
+            },
+        )
+        .with_shutdown(rx);
+    tokio::time::timeout(Duration::from_secs(10), e.run())
+        .await
+        .expect("run returns");
+    assert!(*tx.borrow());
+    assert_eq!(fs::read_to_string(&f).unwrap(), "new");
+    let d = env.decisions();
+    assert_eq!(d.len(), 4, "{d:?}");
+    assert_eq!(d[0], "requested");
+    assert_eq!(d[1], "approved");
+    assert!(d[2].starts_with("executed snapshot="), "{d:?}");
+    assert_eq!(d[3], "failed: shutdown");
+    assert_eq!(e.planner().requests().len(), 1, "no planner call after it");
+    let sent = env.seen.sent();
+    assert!(sent.iter().any(|s| s.starts_with("done: ")), "{sent:?}");
+    assert_eq!(sent.last().unwrap(), "Warden is shutting down");
 }

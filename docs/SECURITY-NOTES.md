@@ -420,6 +420,15 @@ exists at the time of the check.
   channel with one sender (`StdioChannel`, whose only sender is `local`)
   ignores it. `recv` must be cancel-safe (a dropped `recv` future loses
   and splits no message).
+- **Two channels as one (`Pair`).** `Channel::serves(who)` (default
+  `true`; `StdioChannel`: only `local`) says whether a channel can reach a
+  sender. `Pair::new(a, b)` routes every outbound call to `a` if it serves
+  the recipient, else to `b` if it does; a recipient neither serves gets
+  nothing (`send`/`retract_last` do nothing, `ask_approval` is `No`,
+  `discard_pending_input` is 0, `accepts_pin` is `false`). Its `recv`
+  races both sides, alternating which is polled first, keeps reading one
+  side after the other closes, and is cancel-safe because each side's
+  `recv` is.
 - `Channel::ask_approval(to, ...)` must only return a reply that came from
   `to`; the engine does not re-check. With several owners, a reply from a
   different owner does not count either. Any doubt must yield `No`.
@@ -741,11 +750,11 @@ thread.
   arguments), `refused: blocked`, `refused: owner declined`, `refused: bad
   reply`, `refused: approval timed out`, `refused: pin locked`, `refused:
   bad pin`, `refused: pin unavailable`, `refused: outside root`,
-  `refused: prompt too long`, and one aggregated `refused: too
+  `refused: prompt too long`, `refused: shutting down`, and one aggregated `refused: too
   many calls` entry per planner response for calls beyond
   `max_calls_per_message`.
 - Per message: `failed: planner`, `failed: timeout`, `failed: input
-  closed`, `failed: step limit`.
+  closed`, `failed: shutdown`, `failed: step limit`.
 - Summaries are the validated action summaries (kind, quoted path, sizes);
   file content and write content never enter the audit log. A failed
   refusal append is reported to the owner (`warning: audit append failed`).
@@ -814,6 +823,26 @@ appends run on blocking threads and are never wrapped in a timeout: a tool
 that started finishes and its outcome is audited, after which the message
 stops with `timed out`. Limits: `max_steps` planner calls (`step limit
 reached`) and `max_calls_per_message` tool calls per message.
+
+**Shutdown never cancels a running tool either.** `Engine::with_shutdown`
+takes a `tokio::sync::watch::Receiver<bool>`; when it becomes `true`:
+
+- an idle engine stops at once: `run` races the channel's `recv` (which
+  every channel must make cancel-safe) against the signal and returns;
+- a planner call in progress loses the race: the message ends, the owner is
+  told `Warden is shutting down`, audited `failed: shutdown`;
+- an owner prompt in progress loses too: the action is refused (`refused:
+  shutting down`, tool result `owner declined`) and the message ends the
+  same way. The prompt is dropped like a timed-out one, so no reply can
+  approve anything afterwards;
+- `Executor::run` and audit appends are never raced: a started tool
+  finishes and its outcome is audited, then the message ends with
+  `failed: shutdown` before any further call or planner request.
+
+The race happens inside `Engine::handle`, never by cancelling `handle` from
+outside, so the audit sink is released (`AuditSink::release`) on every
+shutdown path. A signal already `true` wins every race at once; a dropped
+sender without `true` is not a shutdown request.
 
 **Residual risks.**
 
