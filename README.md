@@ -192,8 +192,9 @@ using the same data dir.
 
 **Using it.** Message the bot in a private chat. Group messages, edited
 messages, forwards, messages from other bots and messages older than
-`max_message_age_secs` are never acted on; messages sent while the daemon
-was down past that age are reported as ignored when it starts. When an
+`max_message_age_secs` are never acted on (also when they waited that long
+for the daemon to finish an earlier request); they are reported as
+ignored. When an
 action needs consent the bot sends the same prompt as the terminal; reply
 `yes <code>` in the same chat (anything else is a no).
 
@@ -283,10 +284,12 @@ which has the details.
 - **Whoever controls your Telegram account is the owner.** A stolen phone
   or session can send requests and approve `Yes` actions. Every owner
   shares one PIN and one PIN lockout, so wrong PINs from one owner lock
-  all of them.
+  all of them (a compromised account can lock PIN approvals for everyone
+  for up to 24 hours).
 - **At-most-once delivery.** The daemon records that it has seen a batch
   of messages before acting on it, so a crash or kill mid-message loses
-  that message rather than replaying it.
+  that message rather than replaying it. Messages fetched but not yet
+  handled when it stops (SIGTERM included) are dropped too.
 - **Service files hold secrets** once you fill them in. Keep them `chmod
   600`. The token and API key also live in the daemon's environment.
 - **Large writes.** The model's output is capped at 4096 tokens per step,

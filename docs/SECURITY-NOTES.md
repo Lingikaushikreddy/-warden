@@ -220,8 +220,10 @@ be on a local filesystem, because the single-owner guarantee is an advisory
   a yes for `Yes`, a yes plus the PIN for `YesPin`. `Blocked` is always
   refused; `authorize_auto` issues tokens only for `Auto` actions.
 - **Tokens are time-limited, not policy-bound.** `Authorized` carries the
-  action hash, the tier and `expires_at_ms` (`now_ms + ttl_ms`, same TTL rules
-  as `grant`); the executor checks the expiry. A token is not bound to the
+  action hash, the tier and `expires_at_ms`: `max(now_ms, clock mark) +
+  ttl_ms` from `authorize`, `now_ms + ttl_ms` from `authorize_auto` (which
+  uses no store), with the same TTL rules as `grant`; the executor checks
+  the expiry. A token is not bound to the
   `PolicyConfig`: the executor must act under the same policy the caller
   passed to `authorize`.
 - **Files.** `approver.key` (32 bytes, 0600, created atomically via temp file
@@ -620,7 +622,9 @@ planner and the executor are wired together.
   every PIN check, so a restart does not clear a lockout. If the write
   fails, PIN-tier approvals are refused (`refused: pin unavailable`, no
   prompt) until restart and the owner is told `warning: cannot save the PIN
-  lockout; PIN approvals are disabled until restart`. Limits: it limits
+  lockout; PIN approvals are disabled until restart`. If saving keeps
+  failing, the bad PIN that failed to save was counted in memory only, so
+  each restart gives one uncounted guess. Limits: it limits
   online guessing through the engine, not offline guessing of the PIN file
   (see "CLI PIN"); anyone who can write the PIN home can reset it, and the
   lock follows the wall clock, so a clock moved forward ends it early.
@@ -725,6 +729,8 @@ planner and the executor are wired together.
   another owner. Owners share one PIN, one PIN lockout and one approver
   store. Accepted cost: wrong PINs from one owner lock PIN approvals for
   every owner (a cross-owner denial of service; every owner is trusted).
+  So a compromised owner account (a stolen Telegram session, say) can lock
+  PIN approvals for every owner for up to 24 h.
 - **Per-channel PIN gate.** Before a `YesPin` prompt, and before the PIN
   lockout check, an action whose requester's channel answers
   `accepts_pin(sender) == false` is refused with no prompt, no challenge
@@ -775,7 +781,9 @@ thread.
   arguments), `refused: blocked`, `refused: owner declined`, `refused: bad
   reply`, `refused: approval timed out`, `refused: pin locked`, `refused:
   bad pin`, `refused: pin unavailable`, `refused: outside root`,
-  `refused: prompt too long`, `refused: shutting down`, and one aggregated `refused: too
+  `refused: prompt too long`, `refused: shutting down`, `refused: prompt not
+  delivered` (a remote channel could not send the prompt, so nobody was
+  asked), and one aggregated `refused: too
   many calls` entry per planner response for calls beyond
   `max_calls_per_message`.
 - Per message: `failed: planner`, `failed: timeout`, `failed: input
@@ -814,7 +822,7 @@ visible; fixed-length tokens, cards and key prefixes are far shorter than
 the overlap. `list_dir` output is already bounded (500 names) and is
 redacted as a whole.
 Error results use fixed texts (`invalid call: <kind>`, `blocked by policy`,
-`owner declined`, `bad pin`, `pin locked`, `pin unavailable`, `audit
+`owner declined`, `prompt not delivered`, `bad pin`, `pin locked`, `pin unavailable`, `audit
 unavailable`, `approval unavailable`, `too many calls`, `error: <ExecError
 Display>`), never argument values. Tool-call arguments echoed into history
 go through `redact_json`; arguments over 64 KiB are replaced by a fixed
@@ -932,20 +940,29 @@ webhook.
   `parse_reply` as the terminal, so it must carry the prompt's challenge
   code (`yes <code>`, or `yes <code> <PIN>`). A prompt is never cut: one
   over Telegram's 4096 UTF-16 unit limit is not sent (the owner gets
-  `request too long to approve safely; refused`) and is No.
+  `request too long to approve safely; refused`) and is No. A prompt whose
+  `sendMessage` fails is `Undelivered` (audited `refused: prompt not
+  delivered`), never mistaken for the owner declining.
 - **The PIN is off by default.** `allow_pin_approvals = false` makes
   `accepts_pin` false, so the engine refuses a `YesPin` action requested
   over Telegram before any prompt (see "Engine", "Per-channel PIN gate");
   `ask_approval` also answers No to a `YesPin` prompt by itself. With it
   on, the prompt adds a warning that the PIN passes through Telegram's
   servers.
-- **Deleting replies that may hold the PIN (best effort).** A prompt reply
-  with 3 or more whitespace tokens is deleted with `deleteMessage` right
-  after it is read. An approval-shaped message (`yes` followed by
-  anything) with 3 or more tokens is also deleted when it is dropped unread: as stale,
-  by `discard_pending_input`, or by queue overflow. The engine retracts
-  PIN-like messages (see "Engine", "Retraction"). Deletion removes the
-  message from the chat; Telegram's servers have still seen it.
+- **Deleting replies that may hold the PIN (best effort).** The reply is
+  consumed by the channel, so the engine's PIN-like check never sees it;
+  the channel deletes it with `deleteMessage` right after reading it. At a
+  `YesPin` prompt every text reply is deleted, whatever it parsed to (a
+  bare `482193`, `yes 482193` without the code, `<code> <PIN>`). At a
+  `Yes` prompt a reply of 2 or more tokens that did not approve is deleted
+  (it may be `yes <PIN>`); `yes <code>` that approved, or a bare `no`, is
+  not. Owner text dropped unread (as stale, by `discard_pending_input`, or
+  by queue overflow) is deleted when it is approval-shaped with 2 or more
+  tokens, or has at most 8 tokens and contains a run of 4 or more digits
+  (a bare PIN; ordinary text such as `call at 1530` is deleted too). The
+  engine retracts PIN-like messages it is handed (see "Engine",
+  "Retraction"). Deletion removes the message from the chat; Telegram's
+  servers have still seen it.
 
 **The token.**
 
@@ -979,7 +996,11 @@ environment variables ignored (`no_proxy()`), redirects not followed (a
 no credentials, query or fragment. Responses are read in chunks and capped
 at 1 MiB. Each request has a 30 s timeout, except `getUpdates` (the 30 s
 long poll plus 15 s). No request is retried, except one `sendMessage`
-retry after a 429 whose `retry_after` is at most 30 s.
+retry after a 429 whose `retry_after` is at most 30 s. Once shutdown has
+started (`TelegramChannel::with_shutdown`, wired by the daemon), there is
+no retry (a 429 wait in progress ends at once) and each request, one
+already in flight included, gets at most 5 s more, so the last messages
+fit a service manager's 60 s stop timeout.
 
 **Outbound.** `send` delivers only to an owner's chat (`tg:<owner id>`;
 anything else is dropped), after `redact` and display sanitizing, cut to
@@ -1003,7 +1024,11 @@ the channel stops (fatal, below). An owner text whose Telegram `date` is
 more than `max_message_age_secs` (default 120, 10-3600) before the local
 clock is never acted on: it reaches the engine as `tg-stale:<id>` with
 empty text, and the owner is told `ignored <n> message(s) older than <s> s
-(sent while Warden was not running)`. The age check uses the local wall
+(Warden was not running or was busy)`. The age is checked when a batch is
+polled and again when a queued owner text is handed to the engine, so a
+message that waited in the queue (while the engine spent a long time on
+an earlier one) is not acted on late either; the dropped text gets the
+deletion rule above. The age check uses the local wall
 clock, so a clock that is wrong by more than that misjudges it. A batch
 over the 1 MiB cap is fetched again one update at a time, and a single
 update over the cap is skipped by advancing the offset by one.
@@ -1014,7 +1039,8 @@ notices wait to be sent. When the queue is full, items without content
 first: an owner message evicts the newest of them, and is itself dropped
 only when none is left. So a stranger flood cannot push owner messages out
 of the queue. Every drop is counted; a dropped owner message that may hold
-a PIN (approval-shaped, 3 or more tokens) is deleted, best effort.
+a PIN (the rule in "Deleting replies that may hold the PIN") is deleted,
+best effort.
 
 **Errors.** Transient failures (network, 5xx, 429 on `getUpdates`, a
 malformed response) back off from 1 s, doubling to 60 s. Fatal, and final
@@ -1057,8 +1083,14 @@ Telegram channel, in the foreground, unattended.
   signal afterwards asks the engine to stop (see "Engine", "Shutdown never
   cancels a running tool"): an idle daemon stops at once, a running tool
   finishes and is audited, a pending prompt is refused (`refused: shutting
-  down`). Later signals only print `still shutting down`. Then `daemon
-  session ended` is audited (best effort) and the exit code is 0.
+  down`). Later signals only print `still shutting down`. From the first
+  signal on, Telegram requests are bounded (see "Telegram channel",
+  "Transport"). After the engine stops, the daemon performs once more any
+  deletion still owed (a reply that may hold the PIN whose `deleteMessage`
+  was cut off), best effort and bounded to 10 s in total. Messages already
+  fetched but not yet handled are dropped, not replayed on the next start
+  (delivery is at most once). Then `daemon session ended` is audited (best
+  effort) and the exit code is 0.
 - **Fatal Telegram errors** (token rejected, 409 conflict, offset
   unwritable) stop the engine the same way and exit 1 with the reason on
   stderr, also with `--console`.
@@ -1076,7 +1108,8 @@ Telegram channel, in the foreground, unattended.
   `clock behind high-water mark` when the clock is more than 30 s behind.
 - **PIN lockout persists** in `<home>/pin-guard` (see "Engine"): three bad
   PINs lock PIN approvals for 60 s, doubling with each further lockout to
-  at most 24 h, across restarts and for every owner at once.
+  at most 24 h, across restarts and for every owner at once: a compromised
+  owner account can lock PIN approvals for every owner for up to 24 h.
 
 **Service files.** `warden daemon print-service --launchd | --systemd
 [--config <path>]` prints a launchd agent plist (label
@@ -1098,7 +1131,9 @@ systemd `Restart=on-failure`, `RestartSec=60`), so a fatal Telegram error
 is retried once a minute and a clean stop stays stopped. Both allow 60 s
 for a graceful stop (`ExitTimeOut`, `TimeoutStopSec`) and stop with
 SIGTERM. The unit also sets `NoNewPrivileges=yes` and `UMask=0077`.
-launchd writes stderr to `<home>/daemon.log`.
+launchd writes stderr to `<home>/daemon.log`, which it creates with its
+default umask (typically mode 0644, inside the 0700 data dir). It holds no
+secrets: stderr never carries message text, the token or the API key.
 
 **Recovery when an unattended daemon will not start.** Stop anything using
 the data dir first.
@@ -1116,3 +1151,19 @@ the data dir first.
   any can be deleted while Warden is stopped.
 - **`daemon.lock` not a private regular file**: remove it (it holds no
   data) and start again.
+- **`pin-guard` malformed or insecure** (`cannot load the PIN lockout
+  state`): if it only has the wrong mode, `chmod 600` it. Otherwise
+  remove it while Warden is stopped. Removing it resets the PIN lockout
+  (bad-PIN count and escalation level), so do it only if you know why it
+  broke.
+- **`clock-mark` malformed or insecure** (from the approver store): fix its
+  mode to 0600, or remove it while Warden is stopped. Removing it drops the
+  rollback protection until the next run: the mark is recreated at the
+  current clock, so a clock that was set back before then is not detected.
+- **`telegram-offset` malformed or insecure** (`cannot open the Telegram
+  update offset`): fix its mode to 0600, or remove it while Warden is
+  stopped. Removing it restarts polling from Telegram's oldest unconfirmed
+  update, so messages newer than `max_message_age_secs` may be replayed
+  (older ones are still dropped as stale).
+
+Each of these startup errors repeats the short form of this advice.
