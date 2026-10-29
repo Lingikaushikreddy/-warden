@@ -253,7 +253,7 @@ impl fmt::Display for EngineConfigError {
             EngineConfigError::PinGuardState(k) => {
                 write!(
                     f,
-                    "cannot load the PIN lockout state ({PIN_GUARD_FILE}): {k}"
+                    "cannot load the PIN lockout state ({PIN_GUARD_FILE}): {k}; make it a regular file with mode 0600, or remove it while Warden is stopped (removing {PIN_GUARD_FILE} resets the PIN lockout)"
                 )
             }
         }

@@ -60,7 +60,7 @@ use warden_agent::engine::Engine;
 use warden_agent::planner::Planner;
 use warden_agent::telegram::{
     sender_id, BotToken, OffsetStore, TelegramApi, TelegramChannel, TelegramError, TelegramFatal,
-    TelegramOptions,
+    TelegramOptions, OFFSET_FILE,
 };
 
 use crate::startup::{
@@ -246,7 +246,7 @@ fn serve<P: Planner>(
     let parts = open_parts(home, prepared, owners)?;
     let (offsets, start_offset) = OffsetStore::open(home).map_err(|e| {
         err!(
-            "error: cannot open the Telegram update offset in {}: {e}",
+            "error: cannot open the Telegram update offset in {}: {e}; make {OFFSET_FILE} a regular file with mode 0600, or remove it while Warden is stopped (removing {OFFSET_FILE} may replay messages newer than max_message_age_secs)",
             shown(home)
         );
         EXIT_ERROR

@@ -438,7 +438,12 @@ impl ApproverStore {
             }
         };
         // Mark before pruning: a later rollback cannot un-expire a record.
-        let (mark, stored) = load_mark(home, now_ms)?;
+        let (mark, stored) = load_mark(home, now_ms).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("{e}; make {MARK_FILE} a regular file with mode 0600, or remove it while Warden is stopped (removing {MARK_FILE} drops rollback protection until the next run)"),
+            )
+        })?;
         let spent = load_spent(home, mark)?;
         Ok(ApproverStore {
             home: home.to_path_buf(),

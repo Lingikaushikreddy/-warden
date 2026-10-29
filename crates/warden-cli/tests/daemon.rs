@@ -752,6 +752,25 @@ fn sigterm_flushes_a_pending_pin_deletion_before_exit() {
 }
 
 #[test]
+fn insecure_telegram_offset_fails_startup_with_a_recovery_hint() {
+    let e = Env::new();
+    let tg = Tg::start();
+    e.mock(&tg.base(), json!([]));
+    let p = e.home.join("telegram-offset");
+    fs::write(&p, 7i64.to_be_bytes()).unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+    let o = e.daemon_cmd().output().unwrap();
+    let se = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert_eq!(o.status.code(), Some(1), "{se}");
+    assert!(
+        se.contains(
+            "make telegram-offset a regular file with mode 0600, or remove it while Warden is stopped (removing telegram-offset may replay messages newer than max_message_age_secs)"
+        ),
+        "{se}"
+    );
+}
+
+#[test]
 fn daemon_without_telegram_table_exits_1() {
     let e = Env::new();
     let s = e.base.join("script.json");

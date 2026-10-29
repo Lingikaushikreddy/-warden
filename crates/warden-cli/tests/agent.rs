@@ -525,6 +525,42 @@ fn agent_logs_session_start_and_end() {
 }
 
 #[test]
+fn bad_state_files_fail_startup_with_a_recovery_hint() {
+    let cases: [(&str, &[u8], u32, &str); 3] = [
+        (
+            "pin-guard",
+            &[0u8; 16],
+            0o644,
+            "remove it while Warden is stopped (removing pin-guard resets the PIN lockout)",
+        ),
+        (
+            "pin-guard",
+            &[0u8; 5],
+            0o600,
+            "remove it while Warden is stopped (removing pin-guard resets the PIN lockout)",
+        ),
+        (
+            "clock-mark",
+            &[0u8; 7],
+            0o600,
+            "remove it while Warden is stopped (removing clock-mark drops rollback protection until the next run)",
+        ),
+    ];
+    for (name, bytes, mode, hint) in cases {
+        let e = Env::new();
+        e.mock(&e.root, json!([]));
+        let p = e.home.join(name);
+        fs::write(&p, bytes).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
+        let o = e.cmd().write_stdin("").output().unwrap();
+        let (so, se) = out(&o);
+        assert_eq!(o.status.code(), Some(1), "{name}: {so}\n{se}");
+        assert!(se.contains("mode 0600"), "{name}: {se}");
+        assert!(se.contains(hint), "{name}: {se}");
+    }
+}
+
+#[test]
 fn agent_warns_when_the_clock_is_behind_the_mark() {
     let e = Env::new();
     e.mock(&e.root, json!([]));

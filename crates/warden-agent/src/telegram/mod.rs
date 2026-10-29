@@ -13,5 +13,5 @@ pub mod update;
 
 pub use api::{BotInfo, BotToken, TelegramApi, TelegramError};
 pub use channel::{sender_id, TelegramChannel, TelegramFatal, TelegramOptions};
-pub use offset::OffsetStore;
+pub use offset::{OffsetStore, OFFSET_FILE};
 pub use update::{classify_update, RefuseReason, Update, UpdateKind};
