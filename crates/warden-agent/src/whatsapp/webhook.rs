@@ -214,12 +214,15 @@ pub enum WaEvent {
 /// A parsed, signed notification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notification {
-    /// At most [`MAX_EVENTS`], in payload order (per change: messages,
-    /// then statuses).
+    /// At most [`MAX_EVENTS`]: the messages of every change in payload
+    /// order, then the statuses of every change, so statuses never crowd
+    /// out a message.
     pub events: Vec<WaEvent>,
     /// Changes skipped because their `metadata.phone_number_id` was not
-    /// the configured one (or was missing).
+    /// the configured one (or was missing). Counted past the cap too.
     pub foreign: usize,
+    /// Events (messages or statuses) dropped because the cap was reached.
+    pub truncated: usize,
 }
 
 /// Why a signed body could not be used at all.
@@ -247,8 +250,9 @@ fn arr<'a>(v: &'a Value, k: &str) -> &'a [Value] {
 
 /// Parse a signed webhook body. Only changes with `field == "messages"`
 /// whose `value.metadata.phone_number_id` equals `phone_number_id` are
-/// read; other phone number ids are counted in `foreign`. Unknown fields
-/// are ignored.
+/// read; other phone number ids are counted in `foreign`. Events past
+/// [`MAX_EVENTS`] are counted in `truncated` (messages are kept before
+/// statuses). Unknown fields are ignored.
 pub fn parse_notification(
     body: &[u8],
     phone_number_id: &str,
@@ -260,8 +264,10 @@ pub fn parse_notification(
     let mut n = Notification {
         events: Vec::new(),
         foreign: 0,
+        truncated: 0,
     };
-    'entries: for entry in arr(&v, "entry") {
+    let mut ours: Vec<&Value> = Vec::new();
+    for entry in arr(&v, "entry") {
         for change in arr(entry, "changes") {
             if change.get("field").and_then(Value::as_str) != Some("messages") {
                 continue;
@@ -277,16 +283,24 @@ pub fn parse_notification(
                 n.foreign += 1;
                 continue;
             }
-            let items = arr(value, "messages")
-                .iter()
-                .map(classify_message)
-                .chain(arr(value, "statuses").iter().map(|_| WaEvent::Status));
-            for ev in items {
-                if n.events.len() == MAX_EVENTS {
-                    break 'entries;
-                }
-                n.events.push(ev);
-            }
+            ours.push(value);
+        }
+    }
+    // Messages from every change first, then statuses: a status can never
+    // push a message past the cap.
+    let messages = ours
+        .iter()
+        .flat_map(|value| arr(value, "messages"))
+        .map(classify_message);
+    let statuses = ours
+        .iter()
+        .flat_map(|value| arr(value, "statuses"))
+        .map(|_| WaEvent::Status);
+    for ev in messages.chain(statuses) {
+        if n.events.len() == MAX_EVENTS {
+            n.truncated += 1;
+        } else {
+            n.events.push(ev);
         }
     }
     Ok(n)

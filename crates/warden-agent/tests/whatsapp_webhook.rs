@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use warden_agent::whatsapp::{
     check_signature, handshake, parse_notification, AppSecret, NotificationError, RefuseReason,
-    SignatureCheck, VerifyToken, WaEvent,
+    SignatureCheck, VerifyToken, WaEvent, MAX_EVENTS,
 };
 
 const SECRET: &str = "0123456789abcdefABCDEF0123456789";
@@ -554,4 +554,72 @@ fn events_are_capped_at_256() {
         WaEvent::Text { wamid, .. } => assert_eq!(wamid, "wamid.0"),
         e => panic!("{e:?}"),
     }
+}
+
+// ---------- the event cap ----------
+
+fn msg_from(id: &str, from: &str) -> Value {
+    json!({"from": from, "id": id, "timestamp": "1700000000", "type": "text", "text": {"body": "x"}})
+}
+
+fn change(pnid: &str, messages: Vec<Value>, statuses: usize) -> Value {
+    let statuses: Vec<Value> = (0..statuses)
+        .map(|i| json!({"id": format!("wamid.out{i}"), "status": "delivered", "timestamp": "1", "recipient_id": OWNER}))
+        .collect();
+    json!({"field": "messages", "value": {
+        "messaging_product": "whatsapp",
+        "metadata": {"display_phone_number": "15550000000", "phone_number_id": pnid},
+        "messages": messages,
+        "statuses": statuses
+    }})
+}
+
+fn changes(changes: Vec<Value>) -> Vec<u8> {
+    json!({"object": "whatsapp_business_account", "entry": [{"id": "W", "changes": changes}]})
+        .to_string()
+        .into_bytes()
+}
+
+/// Integration finding I4: statuses in an earlier change must not crowd
+/// out a later change's owner text; messages from every change come first.
+#[test]
+fn messages_from_all_changes_come_before_any_status() {
+    let body = changes(vec![
+        change(PNID, vec![], MAX_EVENTS),
+        change(PNID, vec![msg_from("wamid.O", OWNER)], 0),
+    ]);
+    let n = parse_notification(&body, PNID).unwrap();
+    assert_eq!(n.events.len(), MAX_EVENTS);
+    assert!(
+        matches!(&n.events[0], WaEvent::Text { from, .. } if from == OWNER),
+        "{:?}",
+        n.events[0]
+    );
+    assert!(n.events[1..].iter().all(|e| matches!(e, WaEvent::Status)));
+    assert_eq!(n.truncated, 1);
+    assert_eq!(n.foreign, 0);
+}
+
+/// Events past the cap are counted, and foreign changes past the cap are
+/// still counted as foreign.
+#[test]
+fn events_past_the_cap_are_counted_as_truncated() {
+    let flood: Vec<Value> = (0..MAX_EVENTS)
+        .map(|i| msg_from(&format!("wamid.s{i}"), "15550000666"))
+        .collect();
+    let body = changes(vec![
+        change(PNID, flood, 3),
+        change(PNID, vec![msg_from("wamid.O", OWNER)], 0),
+        change("999", vec![msg_from("wamid.F", OWNER)], 0),
+    ]);
+    let n = parse_notification(&body, PNID).unwrap();
+    assert_eq!(n.events.len(), MAX_EVENTS);
+    assert!(n.events.iter().all(|e| matches!(e, WaEvent::Text { .. })));
+    // The owner's text in the second change and the 3 statuses.
+    assert_eq!(n.truncated, 4);
+    assert_eq!(n.foreign, 1);
+
+    // Under the cap nothing is truncated.
+    let small = changes(vec![change(PNID, vec![msg_from("wamid.O", OWNER)], 2)]);
+    assert_eq!(parse_notification(&small, PNID).unwrap().truncated, 0);
 }

@@ -137,6 +137,9 @@ stats! {
     bad_request,
     /// Changes for another `phone_number_id` (dropped).
     foreign,
+    /// Events past the per-notification cap (dropped; the rest is
+    /// forwarded and answered 200).
+    truncated,
     /// Signed batches refused because the queue was full or closed (503).
     queue_full,
     /// Sockets closed at once because every connection slot was taken.
@@ -346,6 +349,9 @@ async fn notification(req: Request<Incoming>, s: &Shared) -> Response<Full<Bytes
     s.stats
         .foreign
         .fetch_add(n.foreign as u64, Ordering::Relaxed);
+    s.stats
+        .truncated
+        .fetch_add(n.truncated as u64, Ordering::Relaxed);
     if n.events.is_empty() {
         return reply(StatusCode::OK, "ok");
     }

@@ -271,6 +271,36 @@ async fn foreign_phone_number_id_is_200_and_not_forwarded() {
     );
 }
 
+/// Integration finding I4: events past the per-notification cap are
+/// counted, not dropped silently behind a 200.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_past_the_cap_are_counted_as_truncated() {
+    let mut h = start().await;
+    let statuses: Vec<Value> = (0..300)
+        .map(|i| json!({"id": format!("wamid.out{i}"), "status": "read", "timestamp": "1", "recipient_id": OWNER}))
+        .collect();
+    let body = json!({
+        "object": "whatsapp_business_account",
+        "entry": [{"id": "WABA_ID", "changes": [{"field": "messages", "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {"display_phone_number": "15550000000", "phone_number_id": PNID},
+            "statuses": statuses
+        }}]}]
+    })
+    .to_string()
+    .into_bytes();
+    let (status, _) = h.signed_post(body).await;
+    assert_eq!(status, 200);
+    assert_eq!(h.rx.try_recv().unwrap().events.len(), 256);
+    assert_eq!(
+        h.snap(),
+        StatsSnapshot {
+            truncated: 44,
+            ..StatsSnapshot::default()
+        }
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_signed_json_is_200_and_not_forwarded() {
     let mut h = start().await;
