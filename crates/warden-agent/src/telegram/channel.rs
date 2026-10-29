@@ -29,8 +29,8 @@ use super::api::{TelegramApi, TelegramError};
 use super::offset::OffsetStore;
 use super::update::{classify_update, RefuseReason, UpdateKind};
 use crate::channel::{
-    parse_reply, render_prompt, sanitize_for_display, ApprovalPrompt, ApprovalReply, Channel,
-    Inbound, SenderId,
+    cap_utf16, parse_reply, render_prompt, sanitize_for_display, ApprovalPrompt, ApprovalReply,
+    Channel, Inbound, SenderId,
 };
 use crate::engine::{is_approval_shaped, MAX_PIN_LIKE_TOKENS};
 use crate::redact::redact;
@@ -226,25 +226,6 @@ fn may_hold_pin(text: &str) -> bool {
 /// The notice for `n` owner messages dropped as older than `secs`.
 fn stale_notice(n: usize, secs: u64) -> String {
     format!("ignored {n} message(s) older than {secs} s (Warden was not running or was busy)")
-}
-
-/// Cut `s` to at most 4096 UTF-16 code units, ending with `…` when cut.
-fn cap_utf16(s: String) -> String {
-    if s.encode_utf16().count() <= MAX_TEXT_UTF16 {
-        return s;
-    }
-    let mut out = String::new();
-    let mut units = 0usize;
-    for c in s.chars() {
-        // Leave one unit for the marker.
-        if units + c.len_utf16() > MAX_TEXT_UTF16 - 1 {
-            break;
-        }
-        units += c.len_utf16();
-        out.push(c);
-    }
-    out.push('…');
-    out
 }
 
 impl TelegramChannel {
@@ -697,7 +678,10 @@ impl Channel for TelegramChannel {
         let Some(chat) = self.owner_chat(to) else {
             return;
         };
-        let text = cap_utf16(sanitize_for_display(redact(text).0.as_str()));
+        let text = cap_utf16(
+            sanitize_for_display(redact(text).0.as_str()),
+            MAX_TEXT_UTF16,
+        );
         let _ = self.deliver(chat, &text).await;
     }
 

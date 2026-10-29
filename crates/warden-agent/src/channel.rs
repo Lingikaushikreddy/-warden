@@ -421,6 +421,27 @@ pub fn sanitize_for_display(s: &str) -> String {
     sanitize_capped(s).0
 }
 
+/// Cut `s` to at most `max_units` UTF-16 code units (at least 1), ending
+/// with `…` when cut. Remote chat services count message length in UTF-16
+/// units, which are never fewer than characters.
+pub(crate) fn cap_utf16(s: String, max_units: usize) -> String {
+    if s.encode_utf16().count() <= max_units {
+        return s;
+    }
+    let mut out = String::new();
+    let mut units = 0usize;
+    for c in s.chars() {
+        // Leave one unit for the marker.
+        if units + c.len_utf16() > max_units.saturating_sub(1) {
+            break;
+        }
+        units += c.len_utf16();
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
 /// Sanitize and prefix every line after the first with `  | ` so multi-line
 /// text cannot start a line that looks like part of the prompt.
 /// Returns `None` when the text was truncated.
