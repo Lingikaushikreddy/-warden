@@ -59,9 +59,9 @@ const MAX_NOTICES: usize = 64;
 /// WhatsApp's text body limit (4096 characters), counted in UTF-16 units,
 /// which are never fewer than characters.
 const MAX_TEXT_UTF16: usize = 4096;
-/// A reply may be stamped up to this long before the prompt was sent
-/// (WhatsApp timestamps are whole seconds).
-const REPLY_SLACK_MS: u64 = 1_000;
+/// A reply that does not carry the prompt's code may be stamped up to this
+/// long before the prompt was sent (whole-second timestamps, clock skew).
+const REPLY_SLACK_MS: u64 = 5_000;
 
 const NOT_TEXT: &str = "only text messages are supported";
 const PROMPT_TOO_LONG: &str = "request too long to approve safely; refused";
@@ -666,8 +666,9 @@ impl Channel for WhatsAppChannel {
         let _ = self.deliver(&number, &text).await;
     }
 
-    /// The reply is the next fresh text from `to` stamped no earlier than
-    /// the prompt was sent (less 1 s); messages from anyone else are queued for `recv`. A
+    /// The reply is the next fresh text from `to` that is `yes <code>` for
+    /// this prompt, or is stamped no earlier than the prompt was sent (less
+    /// 5 s); messages from anyone else are queued for `recv`. A
     /// reply quoting a message other than the prompt is `No`, as is a
     /// non-text reply. Cancel-safe: a reply is taken out of a batch and
     /// judged with no await in between.
@@ -701,9 +702,11 @@ impl Channel for WhatsAppChannel {
             let _ = self.deliver(&number, PROMPT_TOO_LONG).await;
             return ApprovalReply::No;
         };
-        // Only a message stamped at or after this (less the timestamp's
-        // whole-second rounding) can answer; earlier ones were typed before
-        // the prompt existed and are queued for `recv` instead.
+        // A text that is `yes <this prompt's code>` answers whatever its
+        // timestamp: the code is fresh per prompt, so it cannot predate it,
+        // and local/Meta clock skew must not lock the owner out. Any other
+        // candidate must be stamped at or after this; earlier ones were
+        // typed before the prompt existed and are queued for `recv`.
         let not_before = (self.clock)().saturating_sub(REPLY_SLACK_MS);
         let Some(prompt_id) = self.deliver(&number, &text).await else {
             return ApprovalReply::Undelivered;
@@ -726,7 +729,12 @@ impl Channel for WhatsAppChannel {
                         at_ms,
                         reply_to,
                         text,
-                    } if from == number && at_ms >= not_before && reply.is_none() => {
+                    } if from == number
+                        && reply.is_none()
+                        && (at_ms >= not_before
+                            || parse_reply(&text, false, &prompt.challenge)
+                                == ApprovalReply::Yes) =>
+                    {
                         reply = Some(Some((reply_to, text)));
                     }
                     Event::OwnerNotText { from, at_ms, .. }
@@ -750,8 +758,8 @@ impl Channel for WhatsAppChannel {
         }
     }
 
-    /// Drops `to`'s queued messages, takes every batch already waiting
-    /// (until the receiver is empty, without waiting for more), drops `to`'s new messages and
+    /// Drops `to`'s queued messages, takes the batches already waiting on
+    /// entry (never waiting for more), drops `to`'s new messages and
     /// queues the rest. Returns the bytes dropped (at least 1 per message).
     async fn discard_pending_input(&mut self, to: &SenderId) -> usize {
         let Some(number) = self.owner_number(to) else {
@@ -767,8 +775,12 @@ impl Channel for WhatsAppChannel {
                 _ => self.queue.push_back(item),
             }
         }
-        // A closed receiver is left for `recv` to report.
-        while self.fatal.is_none() {
+        // Only what was waiting on entry: batches that keep arriving during
+        // the drain stay for later. A closed receiver is left for `recv`.
+        for _ in 0..self.inbound.len() {
+            if self.fatal.is_some() {
+                break;
+            }
             let Ok(batch) = self.inbound.try_recv() else {
                 break;
             };

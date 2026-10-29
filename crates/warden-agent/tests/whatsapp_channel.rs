@@ -1033,8 +1033,8 @@ async fn message_sent_before_the_prompt_is_queued_not_taken_as_reply() {
     let (tx, mut ch) = h.channel();
     open_window(&tx, &mut ch).await;
     tx.send(batch(vec![
-        text_at("wamid.b1", OWNER, "yes 4821", NOW_S - 5),
-        text_at("wamid.b2", OWNER, "also list my files", NOW_S - 2),
+        text_at("wamid.b1", OWNER, "delete notes.txt", NOW_S - 10),
+        text_at("wamid.b2", OWNER, "also list my files", NOW_S - 6),
     ]))
     .await
     .unwrap();
@@ -1046,7 +1046,7 @@ async fn message_sent_before_the_prompt_is_queued_not_taken_as_reply() {
         ApprovalReply::No
     );
     let m = ch.recv().await.unwrap();
-    assert_eq!((m.sender, m.text.as_str()), (owner(), "yes 4821"));
+    assert_eq!((m.sender, m.text.as_str()), (owner(), "delete notes.txt"));
     assert_eq!(ch.recv().await.unwrap().text, "also list my files");
     assert!(recv_quiet(&mut ch).await);
 }
@@ -1107,4 +1107,94 @@ async fn discard_drains_more_than_64_waiting_batches() {
     }
     assert_eq!(ch.discard_pending_input(&owner()).await, 100);
     assert!(recv_quiet(&mut ch).await);
+}
+
+// ------------------------------------------------------- review round 2
+
+/// The local clock runs 30 s ahead of Meta's: `yes <this prompt's code>`
+/// still answers, because the code cannot predate the prompt.
+#[tokio::test]
+async fn matching_code_reply_is_accepted_despite_clock_skew() {
+    let h = Harness::new().await;
+    let (tx, mut ch) = h.channel_with(&[OWNER], Box::new(|| NOW_MS + 30_000));
+    open_window(&tx, &mut ch).await;
+    tx.send(batch(vec![text("wamid.r", OWNER, "yes 4821")]))
+        .await
+        .unwrap();
+    let r = tokio::time::timeout(
+        Duration::from_secs(2),
+        ch.ask_approval(&owner(), &prompt(Tier::Yes)),
+    )
+    .await
+    .expect("the reply must be taken, not queued");
+    assert_eq!(r, ApprovalReply::Yes);
+}
+
+/// A pre-prompt `yes` with another code is not the reply: it is queued
+/// and later delivered by `recv`.
+#[tokio::test]
+async fn wrong_code_reply_before_prompt_is_still_queued() {
+    let h = Harness::new().await;
+    let (tx, mut ch) = h.channel();
+    open_window(&tx, &mut ch).await;
+    tx.send(batch(vec![
+        text_at("wamid.old", OWNER, "yes 1111", NOW_S - 10),
+        text("wamid.r", OWNER, "no"),
+    ]))
+    .await
+    .unwrap();
+    assert_eq!(
+        ch.ask_approval(&owner(), &prompt(Tier::Yes)).await,
+        ApprovalReply::No
+    );
+    let m = ch.recv().await.unwrap();
+    assert_eq!((m.sender, m.text.as_str()), (owner(), "yes 1111"));
+    assert!(recv_quiet(&mut ch).await);
+}
+
+/// Only the batches waiting when the discard starts are drained; a flood
+/// that keeps arriving cannot keep it busy, and stays for later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discard_is_bounded_by_what_was_waiting() {
+    const CAP: usize = 32;
+    let h = Harness::new().await;
+    let api = GraphApi::new(
+        AccessToken::new(TOKEN.into()).unwrap(),
+        &h.server.uri(),
+        "v26.0",
+        PNID,
+    )
+    .unwrap();
+    let (tx, rx) = mpsc::channel(CAP);
+    let mut ch = WhatsAppChannel::new(
+        api,
+        rx,
+        vec![OWNER.to_string()],
+        SeenStore::open(h.home.path()).unwrap(),
+        opts(),
+    )
+    .with_clock(Box::new(|| NOW_MS));
+    for i in 0..CAP {
+        tx.send(batch(vec![text(&format!("wamid.w{i}"), OWNER, "x")]))
+            .await
+            .unwrap();
+    }
+    // A sender that refills every slot the drain frees, without end.
+    let flood = tokio::spawn(async move {
+        let mut i = 0u64;
+        while tx
+            .send(batch(vec![text(&format!("wamid.f{i}"), OWNER, "later")]))
+            .await
+            .is_ok()
+        {
+            i += 1;
+        }
+    });
+    let dropped = tokio::time::timeout(Duration::from_secs(5), ch.discard_pending_input(&owner()))
+        .await
+        .expect("the drain must end");
+    flood.abort();
+    assert_eq!(dropped, CAP);
+    // What arrived during the drain is still there.
+    assert_eq!(ch.recv().await.unwrap().text, "later");
 }
