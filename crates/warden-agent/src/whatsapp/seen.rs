@@ -8,10 +8,11 @@
 //! flood of them must not push an owner's id out.
 //!
 //! Each entry is the SHA-256 of a `wamid` and the message's time (Unix ms,
-//! capped at the local clock). Eviction is age-aware: beyond [`MAX_SEEN`]
-//! entries, only entries older than the caller's keep time (the channel's
-//! `max_message_age`, after which a redelivery is stale and never acted on
-//! anyway) are dropped, oldest first. Younger entries are kept, up to the
+//! capped at the local clock, and clamped to it again on open). Eviction is
+//! age-aware: beyond [`MAX_SEEN`] entries, only entries older than the
+//! caller's keep time (the channel's `max_message_age`, after which a
+//! redelivery is stale and never acted on anyway) are dropped, oldest
+//! first. Younger entries are kept, up to the
 //! hard cap [`MAX_SEEN_HARD`]; beyond that the oldest by time go.
 //!
 //! File format: the 8-byte magic [`SEEN_MAGIC`], then 40-byte entries (32
@@ -26,6 +27,7 @@ use crate::state;
 use sha2::{Digest, Sha256};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// File name under the Warden home directory.
 pub const SEEN_FILE: &str = "whatsapp-seen";
@@ -65,8 +67,21 @@ impl SeenStore {
     /// `InvalidData` when it does not start with [`SEEN_MAGIC`], its entries
     /// are not whole 40-byte records, it holds more than [`MAX_SEEN_HARD`]
     /// (or it is a symlink or not a regular file); `PermissionDenied` when
-    /// group or others have access.
+    /// group or others have access. Entry times later than the local clock
+    /// are clamped to it (see [`Self::open_at`]).
     pub fn open(home: &Path) -> io::Result<SeenStore> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        SeenStore::open_at(home, now_ms)
+    }
+
+    /// [`Self::open`] with the local clock given (Unix ms). Every entry time
+    /// later than `now_ms` is clamped to it: recorded times are capped at
+    /// the clock, so a later one means a crafted or damaged file, and an
+    /// entry that never ages would let a file of them crowd every real id
+    /// out at the hard cap, which would end deduplication.
+    pub fn open_at(home: &Path, now_ms: u64) -> io::Result<SeenStore> {
         let path = home.join(SEEN_FILE);
         let bytes = state::read_private(&path, SEEN_MAGIC.len() + ENTRY * MAX_SEEN_HARD)?
             .unwrap_or_default();
@@ -91,7 +106,7 @@ impl SeenStore {
                 h.copy_from_slice(&c[..32]);
                 let mut t = [0u8; 8];
                 t.copy_from_slice(&c[32..]);
-                (h, u64::from_be_bytes(t))
+                (h, u64::from_be_bytes(t).min(now_ms))
             })
             .collect();
         seen.sort_by_key(|&(_, t)| t);
@@ -324,6 +339,37 @@ mod tests {
         assert_eq!(&bytes[..8], SEEN_MAGIC);
         assert_eq!(&bytes[8..40], hash(id).as_slice());
         assert_eq!(&bytes[40..], NOW.to_be_bytes().as_slice());
+    }
+
+    /// Final review C3: a file whose entries claim far-future times cannot
+    /// crowd real ids out. On open they are clamped to the clock, so they
+    /// age like any other entry and are evicted before younger real ids.
+    #[test]
+    fn far_future_times_are_clamped_on_open() {
+        let home = tempfile::tempdir().unwrap();
+        let p = home.path().join(SEEN_FILE);
+        let mut bytes = SEEN_MAGIC.to_vec();
+        for i in 0..MAX_SEEN_HARD {
+            bytes.extend_from_slice(&hash(&format!("wamid.crafted{i}")));
+            bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+        }
+        state::write_atomic(&p, &bytes).unwrap();
+        let mut s = SeenStore::open_at(home.path(), NOW).unwrap();
+        assert_eq!(s.len(), MAX_SEEN_HARD);
+        // Later, a real owner id arrives: it is the youngest and is kept.
+        let later = NOW + KEEP + 1;
+        s.record(&[("wamid.real", later)], later, KEEP).unwrap();
+        assert!(s.contains("wamid.real"));
+        assert_eq!(s.len(), MAX_SEEN);
+        // Written back clamped.
+        let saved = fs::read(&p).unwrap();
+        assert!(!saved.windows(8).any(|w| w == u64::MAX.to_be_bytes()));
+        // `open` clamps against the real clock too.
+        state::write_atomic(&p, &bytes).unwrap();
+        let mut s = SeenStore::open(home.path()).unwrap();
+        s.record(&[("wamid.real", u64::MAX - 1)], u64::MAX - 1, KEEP)
+            .unwrap();
+        assert!(s.contains("wamid.real"));
     }
 
     #[test]
