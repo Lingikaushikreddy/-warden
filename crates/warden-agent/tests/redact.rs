@@ -1386,3 +1386,49 @@ fn eaa_prefix_words_are_not_redacted() {
         assert_eq!(out(&line), line, "{line}");
     }
 }
+
+/// Integration finding M1: a percent escape (`%3D`, `%20`, `%22`, ...) is
+/// a left boundary for Meta and Telegram tokens, so URL-encoded and
+/// form-encoded contexts are caught. The escape itself is kept.
+#[test]
+fn tokens_after_percent_escapes_are_redacted() {
+    let tok = "EAAGm0PX4ZCpsBAOZBRZCZCfakefakefakefakefakefakefake1234567890abcd";
+    let tg = "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawQ";
+    for (line, want) in [
+        (
+            format!("https://x/?access_token%3D{tok}"),
+            "https://x/?access_token%3D[REDACTED:api_key]".to_string(),
+        ),
+        (
+            format!("u=https%3A%2F%2Fgraph.facebook.com%2F%3Faccess_token%3D{tok}%26x%3D1"),
+            "u=https%3A%2F%2Fgraph.facebook.com%2F%3Faccess_token%3D[REDACTED:api_key]%26x%3D1"
+                .to_string(),
+        ),
+        (
+            format!("Authorization:%20Bearer%20{tok}"),
+            "Authorization:%20Bearer%20[REDACTED:api_key]".to_string(),
+        ),
+        (
+            format!("q%22{tok}%22"),
+            "q%22[REDACTED:api_key]%22".to_string(),
+        ),
+        (format!("q%2c{tok}"), "q%2c[REDACTED:api_key]".to_string()),
+        (
+            format!("text%3D{tg}%26"),
+            "text%3D[REDACTED:api_key]%26".to_string(),
+        ),
+        (format!("x%20{tg}"), "x%20[REDACTED:api_key]".to_string()),
+    ] {
+        let r = out(&line);
+        assert_eq!(r, want, "{line}");
+        assert!(!r.contains(&tok[3..]), "{line}");
+        // Idempotent.
+        assert_eq!(out(&r), r, "{line}");
+    }
+    // `%` without two hex digits is a plain boundary char, as before.
+    assert_eq!(out(&format!("%{tok}")), "%[REDACTED:api_key]");
+    assert_eq!(out(&format!("%zz{tok}")), format!("%zz{tok}"));
+    // A bare word glued to the token still needs a boundary.
+    assert_eq!(out(&format!("x{tok}")), format!("x{tok}"));
+    assert_eq!(out(&format!("x{tg}")), format!("x{tg}"));
+}

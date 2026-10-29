@@ -15,7 +15,10 @@
 //!   and a badly signed body (or two signature headers) is never parsed
 //!   (401);
 //! - a signed batch goes on the channel queue without waiting for the
-//!   engine (200), or gets 503 when the queue is full so Meta retries.
+//!   engine (200), or gets 503 when the queue is full so Meta retries;
+//! - once shutdown has started, every POST gets 503 (whether it arrived
+//!   before or during the drain), so Meta redelivers it after the restart
+//!   instead of it being lost; the seen store drops what was already taken.
 //!
 //! Every response is `text/plain` with `connection: close` and a fixed
 //! short ASCII body, or the digit challenge of a valid handshake. Nothing
@@ -189,7 +192,12 @@ impl WebhookListener {
         shutdown: watch::Receiver<bool>,
     ) {
         let slots = Arc::new(Semaphore::new(cfg.max_connections));
-        let shared = Arc::new(Shared { cfg, tx, stats });
+        let shared = Arc::new(Shared {
+            cfg,
+            tx,
+            stats,
+            shutdown: shutdown.clone(),
+        });
         let mut conns = JoinSet::new();
         let stop = shutdown_requested(shutdown);
         tokio::pin!(stop);
@@ -232,6 +240,17 @@ struct Shared {
     cfg: ListenerConfig,
     tx: mpsc::Sender<WebhookBatch>,
     stats: Arc<WebhookStats>,
+    shutdown: watch::Receiver<bool>,
+}
+
+impl Shared {
+    fn shutting_down(&self) -> bool {
+        *self.shutdown.borrow()
+    }
+}
+
+fn unavailable() -> Response<Full<Bytes>> {
+    reply(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
 }
 
 /// One connection: one request at most (no keep-alive), under the
@@ -285,6 +304,9 @@ async fn handle(req: Request<Incoming>, s: &Shared) -> Response<Full<Bytes>> {
 }
 
 async fn notification(req: Request<Incoming>, s: &Shared) -> Response<Full<Bytes>> {
+    if s.shutting_down() {
+        return unavailable();
+    }
     let cap = s.cfg.max_body_bytes;
     // A declared Content-Length is the body's exact size hint.
     if req.body().size_hint().lower() > cap as u64 {
@@ -339,6 +361,10 @@ async fn notification(req: Request<Incoming>, s: &Shared) -> Response<Full<Bytes
         }
     }
 
+    // Shutdown may have started while the body was read.
+    if s.shutting_down() {
+        return unavailable();
+    }
     let n = match parse_notification(&raw, &s.cfg.phone_number_id) {
         Ok(n) => n,
         Err(_) => {
@@ -359,7 +385,7 @@ async fn notification(req: Request<Incoming>, s: &Shared) -> Response<Full<Bytes
         Ok(()) => reply(StatusCode::OK, "ok"),
         Err(_) => {
             bump(&s.stats.queue_full);
-            reply(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+            unavailable()
         }
     }
 }

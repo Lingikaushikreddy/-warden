@@ -84,7 +84,9 @@
 //! `xox?-`, `github_pat_`, Telegram bot tokens
 //! `<8-10 digits>:<35 chars>`, and Meta access tokens `EAA` + 40 or more
 //! letters and digits) need a left boundary: start of text or a char
-//! that is not a letter or digit (`_`, `-`, quotes, `=`, `(` all count), so
+//! that is not a letter or digit (`_`, `-`, quotes, `=`, `(` all count; for
+//! Telegram and Meta tokens a percent escape such as `%3D` or `%20` counts
+//! too, and is kept), so
 //! `risk-assessment-for-the-quarter` and `network_test_connectivitycheck`
 //! are left alone. A bounded key glued to an unbounded one
 //! (`AKIA...EXAMPLEsk-...`) is caught on the next pass, after the first
@@ -226,6 +228,7 @@ fn keywords_re() -> String {
 struct Patterns {
     pem: Regex,
     jwt: Regex,
+    pct_key: Regex,
     api_key: Regex,
     url_userinfo: Regex,
     bearer: Regex,
@@ -277,6 +280,11 @@ fn build_patterns() -> Patterns {
         // fixpoint pass, once the placeholder's `]` precedes it.
         // `sk-ant-` is boundary-free only in its real layout
         // (`sk-ant-api03-...`), so `risk-ant-colony-...` is left alone.
+        // A Telegram bot token or Meta access token right after a percent
+        // escape (`access_token%3DEAA...`, `%20Bearer%20EAA...`,
+        // `%22EAA...%22`): the escape's hex digits are letters or digits,
+        // so `lb` would not see a boundary. The escape is kept.
+        pct_key: re(r"%[0-9A-Fa-f]{2}(?:[0-9]{8,10}:[A-Za-z0-9_-]{35}|EAA[A-Za-z0-9]{40,})"),
         api_key: re(concat!(
             r"(?P<lb>^|[^\p{L}\p{N}])(?:",
             r"sk-[A-Za-z0-9_-]{20,}",
@@ -902,6 +910,18 @@ fn redact_pass(input: &str, report: &mut RedactionReport) -> Option<String> {
 
     let s = replace_simple(input, &p.pem, "private_key", report)?;
     let s = replace_simple(&s, &p.jwt, "jwt", report)?;
+    // Before `api_key`, which would otherwise take `%` as the boundary of
+    // a token starting at the escape's hex digits. A match always starts
+    // with `%` and two ASCII hex digits, which are kept.
+    let s = rewrite_found(&s, &p.pct_key, "api_key", report, |m, out| {
+        let Some(escape) = m.get(..3) else {
+            push_placeholder(out, "api_key");
+            return true;
+        };
+        out.push_str(escape);
+        push_placeholder(out, "api_key");
+        true
+    })?;
     // Every key starts with an ASCII letter or digit (a Telegram bot token
     // starts with its bot id) and the boundary char `lb` is never a letter or
     // digit, so a match that starts with anything else carries `lb` first.

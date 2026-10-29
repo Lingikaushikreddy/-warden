@@ -633,3 +633,28 @@ fn listener_config_new_sets_defaults() {
     assert_eq!(c.phone_number_id, PNID);
     assert!(StatsSnapshot::default().is_zero());
 }
+
+/// Integration finding M3: once shutdown has started, a POST still in
+/// progress gets 503, not 200, so Meta redelivers it after the restart
+/// (where the seen store drops anything already taken) instead of the
+/// batch being lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_during_shutdown_is_503_and_not_forwarded() {
+    let mut h = start().await;
+    let body = envelope();
+    let sig = sign(SECRET, &body);
+    let head = format!(
+        "POST {WEBHOOK_PATH} HTTP/1.1\r\nhost: x\r\nx-hub-signature-256: {sig}\r\ncontent-length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut s = TcpStream::connect(h.addr).await.unwrap();
+    s.write_all(head.as_bytes()).await.unwrap();
+    s.write_all(&body[..10]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.shutdown.send(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    s.write_all(&body[10..]).await.unwrap();
+    let resp = read_until_closed(&mut s, Duration::from_secs(3)).await;
+    assert!(resp.starts_with("HTTP/1.1 503"), "{resp}");
+    assert!(h.rx.try_recv().is_err());
+}
