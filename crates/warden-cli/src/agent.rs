@@ -3,8 +3,9 @@
 //! Startup fails closed: every step below that fails prints a message to
 //! stderr and exits 1 before anything is executed. Steps 1-4 have no side
 //! effects beyond creating the data dir, so a bad config, root or missing
-//! key leaves no audit log, approver key or snapshot store behind. Steps
-//! 1-6 live in [`crate::startup`], shared with `warden daemon`.
+//! key leaves no audit log, approver key or snapshot store behind. The
+//! shared pieces live in [`crate::startup`] (also used by `warden daemon`):
+//! the checks of steps 1-4 and the opening of the stores in steps 5-6.
 //!
 //! 1. create the data dir (0700); refuse it if it is a symlink, not owned by
 //!    the current user, or writable by group or others;

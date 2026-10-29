@@ -19,8 +19,6 @@ use zeroize::Zeroizing;
 
 /// Largest response body read, in bytes.
 pub const MAX_RESPONSE_BYTES: usize = 1 << 20;
-/// Default API base URL.
-pub const DEFAULT_API_BASE: &str = "https://api.telegram.org";
 /// Seconds added to the long-poll timeout to get the `getUpdates` HTTP timeout.
 pub const POLL_GRACE_SECS: u64 = 15;
 
@@ -220,7 +218,9 @@ impl TelegramApi {
         drop(url);
         let status = resp.status();
 
-        // Zeroized: an update batch may hold a PIN typed by the owner.
+        // Zeroized, best effort: an update batch may hold a PIN typed by the
+        // owner. Only this raw buffer is; the parsed `Value` and the strings
+        // taken from it are ordinary heap copies.
         let mut buf = Zeroizing::new(Vec::new());
         while let Some(chunk) = resp.chunk().await.map_err(transport)? {
             if buf.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {

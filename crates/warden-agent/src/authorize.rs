@@ -129,8 +129,9 @@ impl Authorized {
         self.tier
     }
 
-    /// Milliseconds since the Unix epoch at which the token stops being valid
-    /// (`now_ms + ttl_ms` at authorization).
+    /// Milliseconds since the Unix epoch at which the token stops being valid:
+    /// `max(now_ms, clock mark) + ttl_ms` from [`ApproverStore::authorize`],
+    /// `now_ms + ttl_ms` from [`ApproverStore::authorize_auto`].
     pub fn expires_at_ms(&self) -> u64 {
         self.expires_at_ms
     }
@@ -545,7 +546,8 @@ impl ApproverStore {
     }
 
     /// A token for an action that needs no approval (`classify == Auto`),
-    /// expiring at `now_ms + ttl_ms` with the same TTL rules as `grant`
+    /// expiring at `now_ms + ttl_ms` (the clock mark is not consulted: no
+    /// store is involved) with the same TTL rules as `grant`
     /// (`BadTtl` for 0, above `MAX_TTL_MS`, or overflow). Needs no store, so
     /// it works even while a store is poisoned.
     pub fn authorize_auto(
