@@ -154,6 +154,14 @@ pub trait Channel {
         async {}
     }
 
+    /// Best-effort completion of work the channel still owes, such as
+    /// deleting messages that may hold the PIN. Called once when the
+    /// engine has stopped; the caller bounds how long it may take.
+    /// Default: nothing pending.
+    fn flush_pending(&mut self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
+
     /// Whether this channel can reach `who` (used by [`Pair`] to route
     /// outbound calls). Default: `true`.
     fn serves(&self, who: &SenderId) -> bool {
@@ -276,6 +284,12 @@ impl<A: Channel + Send, B: Channel + Send> Channel for Pair<A, B> {
         } else if self.b.serves(to) {
             self.b.retract_last(to).await;
         }
+    }
+
+    /// Both sides, `a` first.
+    async fn flush_pending(&mut self) {
+        self.a.flush_pending().await;
+        self.b.flush_pending().await;
     }
 
     fn serves(&self, who: &SenderId) -> bool {

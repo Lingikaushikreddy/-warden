@@ -671,6 +671,7 @@ struct RemoteLog {
     asked: Arc<Mutex<Vec<SenderId>>>,
     discarded: Arc<Mutex<Vec<SenderId>>>,
     retracted: Arc<Mutex<Vec<SenderId>>>,
+    flushed: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RemoteLog {
@@ -735,8 +736,27 @@ impl Channel for Remote {
     async fn retract_last(&mut self, to: &SenderId) {
         self.log.retracted.lock().unwrap().push(to.clone());
     }
+    async fn flush_pending(&mut self) {
+        self.log
+            .flushed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     fn serves(&self, who: &SenderId) -> bool {
         *who == remote()
+    }
+}
+
+#[tokio::test]
+async fn pair_flush_pending_reaches_both_sides() {
+    let mut out = Vec::new();
+    let (r, _tx, log) = remote_chan();
+    let (r2, _tx2, log2) = remote_chan();
+    {
+        let mut p = Pair::new(r, Pair::new(chan(b"", &mut out), r2));
+        p.flush_pending().await;
+    }
+    for l in [log, log2] {
+        assert_eq!(l.flushed.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
 

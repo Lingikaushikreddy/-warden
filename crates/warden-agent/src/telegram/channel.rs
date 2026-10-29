@@ -17,9 +17,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+use tokio::sync::watch;
 use warden_core::Tier;
 use zeroize::Zeroizing;
 
@@ -65,6 +67,9 @@ pub struct TelegramOptions {
     pub poll_timeout_secs: u32,
     /// First delay after a failed poll; doubles up to 60 s (default 1 s).
     pub backoff_base: Duration,
+    /// Once shutdown has started ([`TelegramChannel::with_shutdown`]):
+    /// the longest any one request may still take (default 5 s).
+    pub shutdown_request_timeout: Duration,
 }
 
 impl Default for TelegramOptions {
@@ -74,6 +79,7 @@ impl Default for TelegramOptions {
             max_message_age: Duration::from_secs(120),
             poll_timeout_secs: 30,
             backoff_base: Duration::from_secs(1),
+            shutdown_request_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -175,6 +181,8 @@ pub struct TelegramChannel {
     backoff: Duration,
     /// Oversized single updates skipped in a row.
     skips_in_a_row: u32,
+    /// Shutdown signal ([`Self::with_shutdown`]).
+    shutdown: Option<watch::Receiver<bool>>,
 }
 
 impl fmt::Debug for TelegramChannel {
@@ -265,7 +273,39 @@ impl TelegramChannel {
             fatal: None,
             backoff,
             skips_in_a_row: 0,
+            shutdown: None,
         }
+    }
+
+    /// Observe `shutdown` (the engine's signal): once it is `true`, `send`
+    /// and deletions skip the 429 retry (a wait in progress ends at once)
+    /// and every request gets at most `shutdown_request_timeout`, so the
+    /// last messages cannot hold up a service manager's stop timeout.
+    pub fn with_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
+    }
+
+    fn shutting_down(&self) -> bool {
+        self.shutdown.as_ref().is_some_and(|rx| *rx.borrow())
+    }
+
+    /// Run one request. Once shutdown has been asked for (before or while
+    /// it runs), it gets at most `shutdown_request_timeout` more.
+    async fn bounded<T>(
+        &self,
+        req: impl Future<Output = Result<T, TelegramError>>,
+    ) -> Result<T, TelegramError> {
+        let mut req = std::pin::pin!(req);
+        if !self.shutting_down() {
+            tokio::select! {
+                r = &mut req => return r,
+                () = shutdown_started(self.shutdown.clone()) => {}
+            }
+        }
+        tokio::time::timeout(self.opts.shutdown_request_timeout, req)
+            .await
+            .unwrap_or(Err(TelegramError::Transport("timeout")))
     }
 
     /// Replace the clock (Unix ms) used for message age.
@@ -359,16 +399,20 @@ impl TelegramChannel {
         }
     }
 
-    /// Send with one retry after a 429 whose `retry_after` is at most 30 s.
+    /// Send with one retry after a 429 whose `retry_after` is at most 30 s,
+    /// unless shutdown has started ([`Self::with_shutdown`]).
     async fn deliver(&self, chat: i64, text: &str) -> Option<i64> {
-        match self.api.send_message(chat, text).await {
+        match self.bounded(self.api.send_message(chat, text)).await {
             Ok(id) => Some(id),
             Err(TelegramError::Api {
                 code: 429,
                 retry_after: Some(s),
-            }) if s <= MAX_RETRY_AFTER_SECS => {
-                tokio::time::sleep(Duration::from_secs(s)).await;
-                self.api.send_message(chat, text).await.ok()
+            }) if s <= MAX_RETRY_AFTER_SECS && !self.shutting_down() => {
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(s)) => {}
+                    () = shutdown_started(self.shutdown.clone()) => return None,
+                }
+                self.bounded(self.api.send_message(chat, text)).await.ok()
             }
             Err(_) => None,
         }
@@ -383,8 +427,13 @@ impl TelegramChannel {
         while let Some((chat, text)) = self.notices.pop_front() {
             let _ = self.deliver(chat, &text).await;
         }
+        self.flush_deletes().await;
+    }
+
+    /// The deletion half of [`Self::flush`].
+    async fn flush_deletes(&mut self) {
         while let Some(&(chat, id)) = self.deletes.last() {
-            let _ = self.api.delete_message(chat, id).await;
+            let _ = self.bounded(self.api.delete_message(chat, id)).await;
             self.deletes.pop();
         }
     }
@@ -576,6 +625,17 @@ impl TelegramChannel {
         self.notify_stale(stale);
         expired
     }
+}
+
+/// Resolves once `shutdown` is `true`; never without a signal, or once its
+/// sender is gone (which the engine reads as "never shut down" too).
+async fn shutdown_started(shutdown: Option<watch::Receiver<bool>>) {
+    if let Some(mut rx) = shutdown {
+        if rx.wait_for(|&v| v).await.is_ok() {
+            return;
+        }
+    }
+    std::future::pending().await
 }
 
 /// The non-owner item a stale owner message becomes.
@@ -788,8 +848,14 @@ impl Channel for TelegramChannel {
             return;
         };
         if let Some(id) = self.last_delivered.remove(&chat) {
-            let _ = self.api.delete_message(chat, id).await;
+            let _ = self.bounded(self.api.delete_message(chat, id)).await;
         }
+    }
+
+    /// Performs the deletions still queued (replies that may hold the PIN),
+    /// best effort. Notices still queued are not sent.
+    async fn flush_pending(&mut self) {
+        self.flush_deletes().await;
     }
 
     fn serves(&self, who: &SenderId) -> bool {

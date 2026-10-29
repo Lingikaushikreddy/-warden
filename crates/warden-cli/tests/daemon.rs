@@ -707,6 +707,51 @@ fn sigterm_during_prompt_refuses_the_action() {
 }
 
 #[test]
+fn sigterm_flushes_a_pending_pin_deletion_before_exit() {
+    let e = Env::new();
+    let tg = Tg::start();
+    // The first deleteMessage hangs well past the shutdown.
+    tg._rt.block_on(
+        Mock::given(method("POST"))
+            .and(path(bot_path("deleteMessage")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"ok": true, "result": true}))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&tg.server),
+    );
+    let a = e.root.join("a.txt");
+    fs::write(&a, "old").unwrap();
+    e.mock(&tg.base(), write_script("a.txt", "new"));
+    let mut d = e.spawn();
+    d.ready();
+    tg.push(vec![owner_text(1, "update a.txt")]);
+    let _code = wait_for_code(&mut d, &tg);
+    // A wrong two-token reply: refused, and deleted as it may be `yes <PIN>`.
+    tg.push(vec![owner_text(2, "yes 0000")]);
+    let delete_in_flight = || {
+        tg._rt
+            .block_on(tg.server.received_requests())
+            .unwrap()
+            .iter()
+            .any(|r| r.url.path() == bot_path("deleteMessage"))
+    };
+    d.wait_for("the reply was never deleted", delete_in_flight);
+    let t = Instant::now();
+    assert_eq!(d.stop(), 0, "{}", d.stderr());
+    assert!(t.elapsed() < Duration::from_secs(15), "{:?}", t.elapsed());
+    // The hung request was abandoned; the final flush sent it again.
+    let deleted = tg.deleted.all();
+    assert_eq!(deleted.len(), 1, "{deleted:?}");
+    assert_eq!(deleted[0]["chat_id"], OWNER);
+    assert_eq!(deleted[0]["message_id"], 102);
+    assert_eq!(fs::read_to_string(&a).unwrap(), "old");
+}
+
+#[test]
 fn daemon_without_telegram_table_exits_1() {
     let e = Env::new();
     let s = e.base.join("script.json");

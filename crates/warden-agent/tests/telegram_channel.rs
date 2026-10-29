@@ -70,6 +70,7 @@ fn opts() -> TelegramOptions {
         max_message_age: Duration::from_secs(120),
         poll_timeout_secs: 1,
         backoff_base: Duration::from_millis(10),
+        shutdown_request_timeout: Duration::from_millis(200),
     }
 }
 
@@ -965,4 +966,106 @@ async fn failed_prompt_send_is_undelivered_not_declined() {
     );
     // No reply was waited for.
     assert!(h.bodies("getUpdates").await.is_empty());
+}
+
+#[tokio::test]
+async fn flush_pending_performs_queued_deletions() {
+    let h = Harness::new().await;
+    // The first deleteMessage hangs long enough to be cancelled.
+    Mock::given(method("POST"))
+        .and(path(method_path("deleteMessage")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": true, "result": true}))
+                .set_delay(Duration::from_millis(2000)),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.server)
+        .await;
+    h.script.batch(vec![owner_text(7, "yes 4821 1234")]);
+    let mut ch = h.channel_with(vec![OWNER], pin_opts());
+    let r = tokio::time::timeout(
+        Duration::from_millis(500),
+        ch.ask_approval(&owner(), &prompt(Tier::YesPin)),
+    )
+    .await;
+    assert!(r.is_err(), "the delete should still be in flight");
+    // What the daemon calls once the engine has stopped.
+    ch.flush_pending().await;
+    assert_eq!(deleted_ids(&h).await, vec![107, 107]);
+    // Nothing is left to do.
+    ch.flush_pending().await;
+    assert_eq!(h.bodies("deleteMessage").await.len(), 2);
+}
+
+/// A server whose sendMessage always answers 429 with `retry_after` 30.
+async fn rate_limited() -> (MockServer, tempfile::TempDir) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(method_path("sendMessage")))
+        .respond_with(ResponseTemplate::new(429).set_body_json(
+            json!({"ok": false, "error_code": 429, "parameters": {"retry_after": 30}}),
+        ))
+        .mount(&server)
+        .await;
+    (server, tempfile::tempdir().unwrap())
+}
+
+#[tokio::test]
+async fn after_shutdown_send_skips_the_429_retry() {
+    let (server, home) = rate_limited().await;
+    let (_tx, rx) = tokio::sync::watch::channel(true);
+    let mut ch = channel_on(&server.uri(), home.path(), vec![OWNER], opts()).with_shutdown(rx);
+    let t = std::time::Instant::now();
+    ch.send(&owner(), "Warden is shutting down").await;
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn shutdown_cuts_a_429_wait_short() {
+    let (server, home) = rate_limited().await;
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let mut ch = channel_on(&server.uri(), home.path(), vec![OWNER], opts()).with_shutdown(rx);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tx.send_replace(true);
+        // Keep the sender alive: a dropped sender means no shutdown.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    let t = std::time::Instant::now();
+    ch.send(&owner(), "hi").await;
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn after_shutdown_requests_get_the_short_timeout() {
+    let h = Harness::new().await;
+    Mock::given(method("POST"))
+        .and(path(method_path("sendMessage")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": true, "result": {"message_id": 1}}))
+                .set_delay(Duration::from_secs(20)),
+        )
+        .with_priority(1)
+        .mount(&h.server)
+        .await;
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let mut ch = h.channel().with_shutdown(rx);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tx.send_replace(true);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    // In flight when shutdown starts: it gets the short timeout from then.
+    let t = std::time::Instant::now();
+    ch.send(&owner(), "slow").await;
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    // Started after shutdown: the short timeout from the start.
+    let t = std::time::Instant::now();
+    ch.send(&owner(), "slow again").await;
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
 }

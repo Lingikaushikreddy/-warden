@@ -24,9 +24,13 @@
 //! SIGTERM asks the engine to stop after the current step (a running tool
 //! always finishes; a pending prompt is refused); later signals only say so
 //! again. A fatal Telegram condition (token rejected, 409 conflict, offset
-//! unwritable) also stops the engine, even with `--console`. Afterwards
-//! audit `daemon session ended` (best effort) and exit 1 if Telegram failed
-//! fatally, else 0.
+//! unwritable) also stops the engine, even with `--console`. Once shutdown
+//! has started, every Telegram request gets at most 5 s and no 429 retry,
+//! so the last messages fit a service manager's 60 s stop timeout.
+//! Afterwards: one best-effort flush of the deletions still owed (replies
+//! that may hold the PIN), bounded to 10 s; messages still queued are
+//! dropped (delivery is at most once); then audit `daemon session ended`
+//! (best effort) and exit 1 if Telegram failed fatally, else 0.
 //!
 //! The approver store lock is held for the daemon's lifetime; the audit log
 //! only while a message is handled, so `warden undo` works while it idles.
@@ -71,6 +75,9 @@ const LOCK_FILE: &str = "daemon.lock";
 const LAUNCHD_LABEL: &str = "local.warden.daemon";
 /// Where a service file's secret values go.
 const PLACEHOLDER: &str = "REPLACE_ME";
+/// Longest the final flush of pending deletions may take after the engine
+/// has stopped.
+const FINAL_FLUSH: Duration = Duration::from_secs(10);
 
 pub fn cmd_daemon(
     home: &Path,
@@ -250,8 +257,12 @@ fn serve<P: Planner>(
         ..TelegramOptions::default()
     };
     let slot = FatalSlot::default();
+    // The sender lives for the whole run: a dropped sender would mean
+    // "never shut down" to the engine and the channel.
+    let (tx, rx) = watch::channel(false);
     let telegram = Watched {
-        inner: TelegramChannel::new(api, tg.owner_ids.clone(), offsets, start_offset, opts),
+        inner: TelegramChannel::new(api, tg.owner_ids.clone(), offsets, start_offset, opts)
+            .with_shutdown(rx.clone()),
         slot: slot.clone(),
     };
     let banner = format!(
@@ -266,9 +277,10 @@ fn serve<P: Planner>(
                 tokio::io::BufReader::new(tokio::io::stdin()),
                 tokio::io::stdout(),
             );
-            run(planner, parts, Pair::new(telegram, stdio), &slot, &banner).await
+            let channel = Pair::new(telegram, stdio);
+            run(planner, parts, channel, &slot, (tx, rx), &banner).await
         } else {
-            run(planner, parts, telegram, &slot, &banner).await
+            run(planner, parts, telegram, &slot, (tx, rx), &banner).await
         }
     });
     // Every engine task has been awaited. Do not wait on a stdin reader
@@ -278,12 +290,14 @@ fn serve<P: Planner>(
 }
 
 /// Step 9 and the session: run until the channel closes, a signal asks for
-/// shutdown or Telegram fails fatally.
+/// shutdown or Telegram fails fatally. `shutdown` is the signal the engine
+/// and the Telegram channel observe.
 async fn run<P: Planner, C: Channel>(
     planner: P,
     parts: Parts,
     channel: C,
     slot: &FatalSlot,
+    shutdown: (watch::Sender<bool>, watch::Receiver<bool>),
     banner: &str,
 ) -> u8 {
     let Parts {
@@ -295,9 +309,7 @@ async fn run<P: Planner, C: Channel>(
         snapshots,
         config,
     } = parts;
-    // The sender lives for the whole run: a dropped sender would mean
-    // "never shut down" to the engine.
-    let (tx, rx) = watch::channel(false);
+    let (tx, rx) = shutdown;
     let engine = Engine::try_new(
         cfg,
         planner,
@@ -359,6 +371,11 @@ async fn run<P: Planner, C: Channel>(
             }
         }
     }
+    // Requests from here on get the short shutdown timeout.
+    tx.send_replace(true);
+    // Deletions still owed (replies that may hold the PIN), best effort and
+    // bounded. Messages still queued are dropped (delivery is at most once).
+    let _ = tokio::time::timeout(FINAL_FLUSH, engine.channel_mut().flush_pending()).await;
 
     if let Err(e) = session_entry(&audit, DAEMON_SESSION, "daemon session ended") {
         err!("warning: could not record the session end in the audit log: {e}");
@@ -440,6 +457,10 @@ impl Channel for Watched {
     async fn retract_last(&mut self, to: &SenderId) {
         self.inner.retract_last(to).await;
         self.note();
+    }
+
+    async fn flush_pending(&mut self) {
+        self.inner.flush_pending().await;
     }
 
     fn serves(&self, who: &SenderId) -> bool {

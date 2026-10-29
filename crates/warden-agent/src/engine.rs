@@ -831,6 +831,12 @@ where
         &self.channel
     }
 
+    /// The channel, for work after [`Engine::run`] has returned (such as
+    /// [`Channel::flush_pending`]).
+    pub fn channel_mut(&mut self) -> &mut C {
+        &mut self.channel
+    }
+
     /// How many PIN checks the PIN-like message check has made so far.
     #[cfg(feature = "test-hooks")]
     pub fn pin_like_checks_for_test(&self) -> usize {
