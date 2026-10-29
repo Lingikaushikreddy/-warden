@@ -25,7 +25,7 @@
 - **Decision: approvals keep the challenge code.** `yes <code>` must come from the number the request came from. A reply whose `context.id` names a message other than the prompt is No. Why: the same chat-bound rule as Telegram.
 - **Decision: no PIN over WhatsApp, ever.** `WhatsAppChannel::accepts_pin` is always `false`, with no config option. The engine therefore refuses PIN-tier actions with no prompt and tells the owner to do them at the computer. `retract_last` is the default no-op. Why: the Cloud API cannot delete a user's message, so a PIN typed into WhatsApp stays in the chat and at Meta. The docs say so plainly. The engine's existing rule (PIN-like owner text never reaches the planner) is unchanged.
 - **Decision: 24-hour customer-service window, free-form text only, no templates.** The channel keeps the latest inbound `timestamp` per owner number (any verified message from that number, capped at the local clock) in memory. A send is allowed only while `now + 5 min < last_inbound + 24 h`. Otherwise it is dropped and counted (`window_drops`), and an approval prompt returns `ApprovalReply::Undelivered`, which the engine audits as `refused: prompt not delivered`. A Graph error 131047 counts the same way. The map is not persisted, so after a restart Warden cannot message an owner until that owner writes. Why: Meta rejects free-form messages outside the window. The 5-minute margin keeps a send near the edge from failing at Meta, and a channel counter fits the code (channels have no audit sink).
-- **Decision: outbound text.** `POST {api_base}/{graph_version}/{phone_number_id}/messages` with body `{"messaging_product":"whatsapp","recipient_type":"individual","to":<digits>,"type":"text","text":{"preview_url":false,"body":<text>}}`. Every text goes through redaction, then sanitizing, then a cut to 4096 UTF-16 units ending in `…`. UTF-16 units are never fewer than characters, so this stays within WhatsApp's 4096-character body limit. `graph_version` defaults to `v23.0` and must be bumped as Meta retires versions. `api_base` defaults to `https://graph.facebook.com` and is validated by `http::check_base_url`. Auth errors (HTTP 401, Graph code 190) are a fatal `TokenRejected`. Rate limits (HTTP 429, codes 4, 80007, 130429, 131056) get one retry after `rate_limit_backoff`, unless shutdown has started.
+- **Decision: outbound text.** `POST {api_base}/{graph_version}/{phone_number_id}/messages` with body `{"messaging_product":"whatsapp","recipient_type":"individual","to":<digits>,"type":"text","text":{"preview_url":false,"body":<text>}}`. Every text goes through redaction, then sanitizing, then a cut to 4096 UTF-16 units ending in `…`. UTF-16 units are never fewer than characters, so this stays within WhatsApp's 4096-character body limit. `graph_version` defaults to `v26.0` and must be bumped as Meta retires versions. `api_base` defaults to `https://graph.facebook.com` and is validated by `http::check_base_url`. Auth errors (HTTP 401, Graph code 190) are a fatal `TokenRejected`. Rate limits (HTTP 429, codes 4, 80007, 130429, 131048, 131056) get one retry after `rate_limit_backoff`, unless shutdown has started.
 - **Decision: startup verifies the token.** `warden daemon` calls `GET /{graph_version}/{phone_number_id}?fields=display_phone_number,verified_name` before opening any state, as Plan 3 does with `getMe`. Why: a wrong token or `phone_number_id` fails at start instead of at the first reply. The display number goes in the banner.
 - **Decision: one daemon, any mix of channels.** The daemon runs whichever of `[telegram]` and `[whatsapp]` is present (at least one) as `Pair::new(Pair::new(Option<telegram>, Option<whatsapp>), Option<stdio>)`. A fatal error from either channel stops the daemon with exit 1 (`Watched<C>`, `FatalSlot` over `ChannelFatal`). `print-service` writes `REPLACE_ME` for every configured secret env name.
 - **Decision: counters, not logs.** The listener counts refused requests (unsigned, bad signature, too large, malformed, foreign, queue full, busy). The channel counts window drops. At exit the daemon prints non-zero counts as one stderr line. No per-request line is ever printed, and no logger is installed.
@@ -106,7 +106,7 @@ README.md, docs/SECURITY-NOTES.md              modify
 **Interfaces:**
 - Consumes: `check_env_name`, `shown_key`, `ConfigError::{Invalid, WrongType, WrongKind, UnknownField, SecretInFile}`, the `telegram()` parser pattern.
 - Produces:
-  - `pub const DEFAULT_WHATSAPP_TOKEN_ENV: &str = "WARDEN_WHATSAPP_TOKEN"`, `DEFAULT_WHATSAPP_APP_SECRET_ENV = "WARDEN_WHATSAPP_APP_SECRET"`, `DEFAULT_WHATSAPP_VERIFY_TOKEN_ENV = "WARDEN_WHATSAPP_VERIFY_TOKEN"`, `DEFAULT_WHATSAPP_LISTEN = "127.0.0.1:8097"`, `DEFAULT_GRAPH_VERSION = "v23.0"`, `DEFAULT_GRAPH_API_BASE = "https://graph.facebook.com"`
+  - `pub const DEFAULT_WHATSAPP_TOKEN_ENV: &str = "WARDEN_WHATSAPP_TOKEN"`, `DEFAULT_WHATSAPP_APP_SECRET_ENV = "WARDEN_WHATSAPP_APP_SECRET"`, `DEFAULT_WHATSAPP_VERIFY_TOKEN_ENV = "WARDEN_WHATSAPP_VERIFY_TOKEN"`, `DEFAULT_WHATSAPP_LISTEN = "127.0.0.1:8097"`, `DEFAULT_GRAPH_VERSION = "v26.0"`, `DEFAULT_GRAPH_API_BASE = "https://graph.facebook.com"`
   - `pub struct WhatsAppConfig { pub owner_numbers: Vec<String> /* digits only */, pub phone_number_id: String, pub access_token_env: String, pub app_secret_env: String, pub verify_token_env: String, pub listen: std::net::SocketAddr, pub max_message_age_secs: u64, pub graph_version: String, pub api_base: Option<String> }`; `Config` gains `pub whatsapp: Option<WhatsAppConfig>`
   - Parsing: `[whatsapp]` becomes the second allowed nested table, parsed after `[telegram]`. Field names in errors are `whatsapp.<name>`. Rules:
     - `owner_numbers` is required: 1-8 strings, each one optional `+` then 7-15 ASCII digits (`Invalid("whatsapp.owner_numbers", ..)`); the stored value has no `+`.
@@ -122,13 +122,13 @@ README.md, docs/SECURITY-NOTES.md              modify
 
 - [ ] **Step 1: Write the failing tests.**
   - config:
-    - `whatsapp_table_parses_with_defaults`: the three env defaults, `listen == "127.0.0.1:8097".parse()`, age 120, `graph_version == "v23.0"`, `api_base == None`.
+    - `whatsapp_table_parses_with_defaults`: the three env defaults, `listen == "127.0.0.1:8097".parse()`, age 120, `graph_version == "v26.0"`, `api_base == None`.
     - `whatsapp_owner_numbers_rules`: `[]`, 9 entries, `"+1 555 123 4567"`, `"abc"`, 6 digits and 16 digits are refused; `"+15551234567"` is stored as `"15551234567"`.
     - `whatsapp_phone_number_id_required_digits`.
     - `whatsapp_listen_must_be_loopback`: `0.0.0.0:8097`, `[::]:8097`, `192.168.1.5:8097`, `localhost:8097` and `[::ffff:127.0.0.1]:8097` are refused; `127.0.0.1:0` and `[::1]:8097` are accepted.
     - `whatsapp_secret_fields_in_file_are_rejected`: `access_token`, `app_secret`, `verify_token`, `whatsapp_token` give `SecretInFile`; the message names `access_token_env` and not the value.
     - `whatsapp_env_names_must_all_differ`: every pair among the three, each against `api_key_env`, and each against `[telegram] bot_token_env`.
-    - `whatsapp_graph_version_shape`: `"23.0"`, `"v23"` and `"v23.0/../x"` are refused.
+    - `whatsapp_graph_version_shape`: `"23.0"`, `"v23"` and `"v26.0/../x"` are refused.
     - `unknown_whatsapp_field_is_rejected`; `both_channel_tables_parse_together`; `third_nested_table_still_rejected`; `whatsapp_max_message_age_out_of_range_is_invalid` (9 and 3601); `whatsapp_wrong_kinds_are_named` (`owner_numbers = "155"`, `listen = 8097`).
     - Unit test `secret_key_names` gains the 4 new keys, and `access_token_env`, `app_secret_env`, `verify_token_env`, `phone_number_id`, `owner_numbers` as not secret.
   - redact:
@@ -159,12 +159,12 @@ README.md, docs/SECURITY-NOTES.md              modify
   - `pub enum WhatsAppError { Config(&'static str), Transport(&'static str /* timeout|connect|other */), Status(u16), Graph { status: u16, code: i64, subcode: Option<i64> }, Malformed(&'static str), TooLarge }`, with a fixed-text `Display`. The Graph `error.message`, `error_user_msg` and `fbtrace_id` are never kept.
   - `pub enum ErrorClass { AuthRejected, RateLimited, OutsideWindow, Other }` and `impl WhatsAppError { pub fn class(&self) -> ErrorClass }`:
     - status 401, or code 190: `AuthRejected`;
-    - status 429, or code 4, 80007, 130429 or 131056: `RateLimited`;
+    - status 429, or code 4, 80007, 130429, 131048 or 131056: `RateLimited`;
     - code 131047: `OutsideWindow`;
     - anything else: `Other`.
 
 - [ ] **Step 1: Write the failing tests:**
-  - `send_text_body_is_exact`: wiremock `body_json` equality. The path is `/v23.0/<id>/messages`, the header is `authorization: Bearer <token>`, the URL has no query and does not contain the token, and the text `[x](https://evil.example/?d=1) <b>` is sent byte for byte.
+  - `send_text_body_is_exact`: wiremock `body_json` equality. The path is `/v26.0/<id>/messages`, the header is `authorization: Bearer <token>`, the URL has no query and does not contain the token, and the text `[x](https://evil.example/?d=1) <b>` is sent byte for byte.
   - `send_text_returns_wamid`, `phone_number_uses_get_bearer_and_fields`.
   - `graph_error_keeps_code_and_subcode_only`: a 400 with `code` 100, `error_subcode` 33 and a `message` containing `LEAKME`; `format!("{e} {e:?}")` lacks `LEAKME`.
   - `auth_errors_are_auth_rejected`: a 401, and a 400 with code 190.
@@ -487,7 +487,7 @@ Run:
 
 - [ ] **Step 1: Write the failing tests.**
   - Helpers:
-    - `Wa::start()`: wiremock on a test-owned runtime. It serves `GET /v23.0/<PNID>`, records `POST /v23.0/<PNID>/messages` bodies and answers with increasing `wamid.test<n>` ids.
+    - `Wa::start()`: wiremock on a test-owned runtime. It serves `GET /v26.0/<PNID>`, records `POST /v26.0/<PNID>/messages` bodies and answers with increasing `wamid.test<n>` ids.
     - `Env::mock_wa(api_base, script, telegram: Option<&str>)` writes `[whatsapp] owner_numbers = ["15550000042"], phone_number_id = "<PNID>", listen = "127.0.0.1:0", api_base = …`.
     - `listen_addr(&Daemon) -> SocketAddr` parses `listen=` from stderr.
     - `post_webhook(addr, body: &Value, secret: Option<&str>) -> u16` uses a raw `std::net::TcpStream` (HTTP/1.1, `Connection: close`) and computes `sha256=` with `hmac`/`sha2`.
@@ -559,7 +559,7 @@ Run:
 
 - [ ] **Step 1: Write** the README changes.
 - [ ] **Step 2: Write** the SECURITY-NOTES changes.
-- [ ] **Step 3: Check** each new claim against the code. Run `grep -n "8097\|WARDEN_WHATSAPP\|v23.0\|whatsapp-seen\|/webhook" README.md docs/SECURITY-NOTES.md crates -r` and confirm every value matches the constants. Run `cargo test --workspace` (no code changed). Expected: PASS.
+- [ ] **Step 3: Check** each new claim against the code. Run `grep -n "8097\|WARDEN_WHATSAPP\|v26.0\|whatsapp-seen\|/webhook" README.md docs/SECURITY-NOTES.md crates -r` and confirm every value matches the constants. Run `cargo test --workspace` (no code changed). Expected: PASS.
 - [ ] **Step 4: Commit** `docs: whatsapp channel setup, limits and security notes`
 
 ---
