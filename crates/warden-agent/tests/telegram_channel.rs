@@ -231,7 +231,7 @@ async fn stale_messages_are_dropped_and_owner_is_told_once() {
     assert_eq!(sent[0]["chat_id"], OWNER);
     assert_eq!(
         sent[0]["text"],
-        "ignored 2 message(s) older than 120 s (sent while Warden was not running)"
+        "ignored 2 message(s) older than 120 s (Warden was not running or was busy)"
     );
 }
 
@@ -359,7 +359,7 @@ async fn ask_approval_accepts_yes_code_from_the_sender_chat() {
     let text = sent[0]["text"].as_str().unwrap();
     assert!(text.contains("Reply \"yes 4821\""), "{text}");
     assert!(!text.contains("PIN"), "{text}");
-    // Two tokens: nothing to delete.
+    // `yes <code>` that parsed as Yes holds no PIN: nothing to delete.
     assert!(h.bodies("deleteMessage").await.is_empty());
 }
 
@@ -740,14 +740,19 @@ async fn overflow_evicts_strangers_before_owner_text() {
     h.script.batch(batch);
     let mut ch = h.channel();
     let mut strangers = 0;
-    loop {
-        let m = ch.recv().await.unwrap();
-        if m.sender == owner() {
-            assert_eq!(m.text, "real");
-            break;
+    // Bounded: a regression that loses the owner text fails, not hangs.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let m = ch.recv().await.unwrap();
+            if m.sender == owner() {
+                assert_eq!(m.text, "real");
+                break;
+            }
+            strangers += 1;
         }
-        strangers += 1;
-    }
+    })
+    .await
+    .expect("the owner text never came out of the queue");
     assert_eq!(strangers, 63);
     assert_eq!(ch.dropped_count(), 1);
     assert!(recv_quiet(&mut ch).await);
@@ -824,4 +829,122 @@ async fn cancelled_prompt_old_code_in_new_prompt_is_no() {
     };
     h.script.batch(vec![owner_text(1, "yes 1111")]);
     assert_eq!(ch.ask_approval(&owner(), &b).await, ApprovalReply::No);
+}
+
+fn pin_opts() -> TelegramOptions {
+    TelegramOptions {
+        allow_pin_approvals: true,
+        ..opts()
+    }
+}
+
+/// The `message_id`s of every `deleteMessage` call, sorted.
+async fn deleted_ids(h: &Harness) -> Vec<i64> {
+    let mut ids: Vec<i64> = h
+        .bodies("deleteMessage")
+        .await
+        .iter()
+        .map(|b| {
+            assert_eq!(b["chat_id"], OWNER, "{b:?}");
+            b["message_id"].as_i64().unwrap()
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[tokio::test]
+async fn short_pin_replies_at_a_yespin_prompt_are_deleted() {
+    // None of these approves (no code, or no PIN after it), but each may be
+    // the PIN typed on its own or after a forgotten code.
+    for reply in ["yes 482193", "482193", "4821 482193"] {
+        let h = Harness::new().await;
+        h.script.batch(vec![owner_text(7, reply)]);
+        let mut ch = h.channel_with(vec![OWNER], pin_opts());
+        assert_eq!(
+            ch.ask_approval(&owner(), &prompt(Tier::YesPin)).await,
+            ApprovalReply::No,
+            "{reply}"
+        );
+        assert_eq!(deleted_ids(&h).await, vec![107], "{reply}");
+    }
+}
+
+#[tokio::test]
+async fn failed_two_token_reply_at_a_yes_prompt_is_deleted() {
+    let h = Harness::new().await;
+    h.script.batch(vec![owner_text(7, "yes 482193")]);
+    h.script.batch(vec![owner_text(8, "no")]);
+    let mut ch = h.channel();
+    for _ in 0..2 {
+        assert_eq!(
+            ch.ask_approval(&owner(), &prompt(Tier::Yes)).await,
+            ApprovalReply::No
+        );
+    }
+    // `yes 482193` may be `yes <PIN>`; a bare `no` holds nothing.
+    assert_eq!(deleted_ids(&h).await, vec![107]);
+}
+
+#[tokio::test]
+async fn stale_pin_shaped_messages_are_deleted_and_plain_text_is_not() {
+    let h = Harness::new().await;
+    h.script.batch(vec![
+        private_text(7, OWNER, "482193", NOW_S - 1000),
+        private_text(8, OWNER, "yes 482193", NOW_S - 1000),
+        private_text(9, OWNER, "hello", NOW_S - 1000),
+    ]);
+    let mut ch = h.channel();
+    for _ in 0..3 {
+        let m = ch.recv().await.unwrap();
+        assert_eq!((m.sender.0.as_str(), m.text.as_str()), ("tg-stale:42", ""));
+    }
+    assert_eq!(deleted_ids(&h).await, vec![107, 108]);
+}
+
+#[tokio::test]
+async fn discarded_short_pin_replies_are_deleted() {
+    let h = Harness::new().await;
+    h.script.batch(vec![
+        owner_text(1, "first"),
+        owner_text(2, "yes 482193"),
+        owner_text(3, "482193"),
+        owner_text(4, "hello there"),
+    ]);
+    let mut ch = h.channel();
+    assert_eq!(ch.recv().await.unwrap().text, "first");
+    assert!(ch.discard_pending_input(&owner()).await > 0);
+    assert_eq!(deleted_ids(&h).await, vec![102, 103]);
+}
+
+#[tokio::test]
+async fn queued_owner_text_is_rechecked_for_age_when_popped() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let h = Harness::new().await;
+    h.script.batch(vec![
+        owner_text(7, "first"),
+        owner_text(8, "delete notes.txt"),
+        owner_text(9, "482193"),
+    ]);
+    let now = Arc::new(AtomicU64::new((NOW_S as u64) * 1000 + 500));
+    let clock = Arc::clone(&now);
+    let mut ch = channel_on(&h.server.uri(), h.home.path(), vec![OWNER], opts())
+        .with_clock(Box::new(move || clock.load(Ordering::SeqCst)));
+    assert_eq!(ch.recv().await.unwrap().text, "first");
+    // The engine spends an hour on `first` (say, prompts to other owners);
+    // the rest of the batch waits in the queue meanwhile.
+    now.fetch_add(3_600_000, Ordering::SeqCst);
+    for _ in 0..2 {
+        let m = ch.recv().await.unwrap();
+        assert_eq!(m.sender, SenderId("tg-stale:42".into()));
+        assert_eq!(m.text, "");
+    }
+    assert!(recv_quiet(&mut ch).await);
+    assert_eq!(deleted_ids(&h).await, vec![109]);
+    let sent = h.bodies("sendMessage").await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        sent[0]["text"],
+        "ignored 2 message(s) older than 120 s (Warden was not running or was busy)"
+    );
 }

@@ -88,7 +88,7 @@ const NON_OWNER_AUDIT_EVERY_MS: u64 = 60_000;
 /// How many recent challenge codes a new one must differ from.
 const RECENT_CHALLENGES: usize = 100;
 /// Owner messages with at most this many tokens are checked for the PIN.
-const MAX_PIN_LIKE_TOKENS: usize = 8;
+pub(crate) const MAX_PIN_LIKE_TOKENS: usize = 8;
 /// At most this many distinct candidates per message are checked against
 /// the PIN, so a long message cannot cost many slow PIN-hash checks.
 const MAX_PIN_LIKE_CANDIDATES: usize = 64;

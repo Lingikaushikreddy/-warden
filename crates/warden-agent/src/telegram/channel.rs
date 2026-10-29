@@ -30,7 +30,7 @@ use crate::channel::{
     parse_reply, render_prompt, sanitize_for_display, ApprovalPrompt, ApprovalReply, Channel,
     Inbound, SenderId,
 };
-use crate::engine::is_approval_shaped;
+use crate::engine::{is_approval_shaped, MAX_PIN_LIKE_TOKENS};
 use crate::redact::redact;
 
 /// `getUpdates` batch size.
@@ -45,8 +45,9 @@ const MAX_TEXT_UTF16: usize = 4096;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Longest `retry_after` honored by `send`.
 const MAX_RETRY_AFTER_SECS: u64 = 30;
-/// A reply with this many tokens may hold a PIN and is deleted.
-const DELETE_MIN_TOKENS: usize = 3;
+/// A dropped owner message this short with a run of this many digits may
+/// be a bare PIN and is deleted.
+const PIN_DIGIT_RUN: usize = 4;
 
 const PIN_WARNING: &str = "Your PIN will pass through Telegram's servers; Warden deletes your reply after reading it (best effort).";
 const NOT_TEXT: &str = "only text messages are supported";
@@ -110,11 +111,20 @@ fn tagged(tag: &str, id: Option<i64>) -> SenderId {
     SenderId(format!("tg-{tag}:{}", id.unwrap_or(0)))
 }
 
+/// Where an owner text came from.
+#[derive(Clone, Copy)]
+struct Origin {
+    chat: i64,
+    message_id: i64,
+    /// Telegram's `date`, in seconds.
+    date_s: i64,
+}
+
 /// One item waiting for `recv`.
 struct Item {
     inbound: Inbound,
-    /// For owner text: the chat and message it came from.
-    origin: Option<(i64, i64)>,
+    /// For owner text: where it came from.
+    origin: Option<Origin>,
 }
 
 /// One update after filtering, owner check and age check.
@@ -123,6 +133,7 @@ enum Event {
     OwnerText {
         chat: i64,
         message_id: i64,
+        date_s: i64,
         reply_to: Option<i64>,
         text: Zeroizing<String>,
     },
@@ -180,6 +191,33 @@ fn system_clock_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Might this dropped (never acted on) owner text hold the PIN? It does
+/// when it is approval-shaped with 2+ tokens (`yes <PIN>`, `yes <code>
+/// <PIN>`), or short (at most [`MAX_PIN_LIKE_TOKENS`] tokens) with a run of
+/// [`PIN_DIGIT_RUN`]+ digits (a bare PIN). Such text is deleted.
+fn may_hold_pin(text: &str) -> bool {
+    let tokens = text.split_whitespace().count();
+    if is_approval_shaped(text) && tokens >= 2 {
+        return true;
+    }
+    if tokens == 0 || tokens > MAX_PIN_LIKE_TOKENS {
+        return false;
+    }
+    let mut run = 0usize;
+    for c in text.chars() {
+        run = if c.is_numeric() { run + 1 } else { 0 };
+        if run >= PIN_DIGIT_RUN {
+            return true;
+        }
+    }
+    false
+}
+
+/// The notice for `n` owner messages dropped as older than `secs`.
+fn stale_notice(n: usize, secs: u64) -> String {
+    format!("ignored {n} message(s) older than {secs} s (Warden was not running or was busy)")
 }
 
 /// Cut `s` to at most 4096 UTF-16 code units, ending with `…` when cut.
@@ -266,7 +304,7 @@ impl TelegramChannel {
             return;
         }
         self.dropped = self.dropped.saturating_add(1);
-        let Some((chat, id)) = item.origin else {
+        let Some(o) = item.origin else {
             return;
         };
         match self.queue.iter().rposition(|i| i.origin.is_none()) {
@@ -275,7 +313,7 @@ impl TelegramChannel {
                 self.queue.push_back(item);
             }
             None => {
-                let _ = self.drop_text(chat, id, &item.inbound.text);
+                let _ = self.drop_text(o.chat, o.message_id, &item.inbound.text);
             }
         }
     }
@@ -293,6 +331,7 @@ impl TelegramChannel {
             Event::OwnerText {
                 chat,
                 message_id,
+                date_s,
                 text,
                 ..
             } => {
@@ -305,7 +344,11 @@ impl TelegramChannel {
                         sender: sender_id(chat),
                         text: text.as_str().to_owned(),
                     },
-                    origin: Some((chat, message_id)),
+                    origin: Some(Origin {
+                        chat,
+                        message_id,
+                        date_s,
+                    }),
                 });
             }
             Event::OwnerNotText { chat } => self.notify(chat, NOT_TEXT),
@@ -439,8 +482,6 @@ impl TelegramChannel {
         self.backoff = self.opts.backoff_base;
         self.skips_in_a_row = 0;
 
-        let now = i128::from((self.clock)());
-        let max_age = i128::try_from(self.opts.max_message_age.as_millis()).unwrap_or(i128::MAX);
         let mut stale: Vec<(i64, usize)> = Vec::new();
         let mut events = Vec::with_capacity(updates.len());
         for u in updates {
@@ -459,25 +500,15 @@ impl TelegramChannel {
                             sender: sender_id(from_id),
                             text: String::new(),
                         }));
-                    } else if i128::from(date_s) * 1000 + max_age < now {
-                        // Never acted on. One that may hold a PIN is deleted.
-                        if is_approval_shaped(&text)
-                            && text.split_whitespace().count() >= DELETE_MIN_TOKENS
-                        {
-                            self.deletes.push((chat_id, message_id));
-                        }
-                        match stale.iter_mut().find(|(c, _)| *c == chat_id) {
-                            Some((_, n)) => *n += 1,
-                            None => stale.push((chat_id, 1)),
-                        }
-                        events.push(Event::Pass(Inbound {
-                            sender: tagged("stale", Some(from_id)),
-                            text: String::new(),
-                        }));
+                    } else if self.is_stale(date_s) {
+                        let _ = self.drop_text(chat_id, message_id, &text);
+                        count_stale(&mut stale, chat_id);
+                        events.push(Event::Pass(stale_inbound(from_id)));
                     } else {
                         events.push(Event::OwnerText {
                             chat: chat_id,
                             message_id,
+                            date_s,
                             reply_to,
                             text,
                         });
@@ -501,14 +532,64 @@ impl TelegramChannel {
                 })),
             }
         }
-        for (chat, n) in stale {
-            let secs = self.opts.max_message_age.as_secs();
-            let text = format!(
-                "ignored {n} message(s) older than {secs} s (sent while Warden was not running)"
-            );
-            self.notify(chat, text);
-        }
+        self.notify_stale(stale);
         Ok(events)
+    }
+
+    /// Is a message sent at `date_s` (Telegram's `date`) too old to act on?
+    fn is_stale(&self, date_s: i64) -> bool {
+        let now = i128::from((self.clock)());
+        let max_age = i128::try_from(self.opts.max_message_age.as_millis()).unwrap_or(i128::MAX);
+        i128::from(date_s) * 1000 + max_age < now
+    }
+
+    fn notify_stale(&mut self, stale: Vec<(i64, usize)>) {
+        let secs = self.opts.max_message_age.as_secs();
+        for (chat, n) in stale {
+            self.notify(chat, stale_notice(n, secs));
+        }
+    }
+
+    /// Re-apply the age rule to queued owner texts (they may have waited
+    /// while the engine was busy): each stale one becomes a `tg-stale`
+    /// item with empty text in place, gets the drop deletion rule, and its
+    /// owner one notice. Synchronous, so it cannot be cancelled half way.
+    /// Returns whether anything expired.
+    fn expire_queued(&mut self) -> bool {
+        let mut stale: Vec<(i64, usize)> = Vec::new();
+        let mut queue = std::mem::take(&mut self.queue);
+        for item in &mut queue {
+            let Some(o) = item.origin else { continue };
+            if !self.is_stale(o.date_s) {
+                continue;
+            }
+            let _ = self.drop_text(o.chat, o.message_id, &item.inbound.text);
+            count_stale(&mut stale, o.chat);
+            // Owner chats are private: the chat id is the owner's user id.
+            *item = Item {
+                inbound: stale_inbound(o.chat),
+                origin: None,
+            };
+        }
+        self.queue = queue;
+        let expired = !stale.is_empty();
+        self.notify_stale(stale);
+        expired
+    }
+}
+
+/// The non-owner item a stale owner message becomes.
+fn stale_inbound(from_id: i64) -> Inbound {
+    Inbound {
+        sender: tagged("stale", Some(from_id)),
+        text: String::new(),
+    }
+}
+
+fn count_stale(stale: &mut Vec<(i64, usize)>, chat: i64) {
+    match stale.iter_mut().find(|(c, _)| *c == chat) {
+        Some((_, n)) => *n += 1,
+        None => stale.push((chat, 1)),
     }
 }
 
@@ -522,9 +603,15 @@ impl Channel for TelegramChannel {
                 return None;
             }
             self.flush().await;
+            // Age is checked again here, with no await before the pop, not
+            // only when polled: an owner text that waited too long in the
+            // queue is never acted on. What expiry queued is flushed first.
+            if self.expire_queued() {
+                continue;
+            }
             if let Some(item) = self.queue.pop_front() {
-                if let Some((chat, id)) = item.origin {
-                    self.last_delivered.insert(chat, id);
+                if let Some(o) = item.origin {
+                    self.last_delivered.insert(o.chat, o.message_id);
                 }
                 return Some(item.inbound);
             }
@@ -612,6 +699,7 @@ impl Channel for TelegramChannel {
                         message_id,
                         reply_to,
                         text,
+                        ..
                     } if c == chat && reply.is_none() => {
                         reply = Some(Some((message_id, reply_to, text)));
                     }
@@ -632,9 +720,13 @@ impl Channel for TelegramChannel {
             } else {
                 parse_reply(&text, needs_pin, &prompt.challenge)
             };
-            let may_hold_pin = text.split_whitespace().count() >= DELETE_MIN_TOKENS;
+            // At a PIN prompt every reply may hold the PIN (`482193`, `yes
+            // 482193`, `<code> <PIN>`), whatever it parsed to. At a yes
+            // prompt, only `yes <code>` itself is known to hold none.
+            let delete =
+                needs_pin || (text.split_whitespace().count() >= 2 && answer != ApprovalReply::Yes);
             drop(text);
-            if may_hold_pin {
+            if delete {
                 self.deletes.push((chat, message_id));
                 self.flush().await;
             }
@@ -653,8 +745,12 @@ impl Channel for TelegramChannel {
         let queued = std::mem::take(&mut self.queue);
         for item in queued {
             match item.origin {
-                Some((c, id)) if c == chat => {
-                    dropped = dropped.saturating_add(self.drop_text(c, id, &item.inbound.text));
+                Some(o) if o.chat == chat => {
+                    dropped = dropped.saturating_add(self.drop_text(
+                        o.chat,
+                        o.message_id,
+                        &item.inbound.text,
+                    ));
                 }
                 _ => self.queue.push_back(item),
             }
@@ -703,9 +799,10 @@ impl Channel for TelegramChannel {
 
 impl TelegramChannel {
     /// Account for one dropped owner message; schedule its deletion when
-    /// it may hold a PIN. Returns its size in bytes (at least 1).
+    /// it may hold a PIN ([`may_hold_pin`]). Returns its size in bytes (at
+    /// least 1).
     fn drop_text(&mut self, chat: i64, message_id: i64, text: &str) -> usize {
-        if is_approval_shaped(text) && text.split_whitespace().count() >= DELETE_MIN_TOKENS {
+        if may_hold_pin(text) {
             self.deletes.push((chat, message_id));
         }
         text.len().max(1)
