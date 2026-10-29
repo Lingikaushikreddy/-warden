@@ -184,6 +184,8 @@ pub struct WhatsAppChannel {
     last_inbound: HashMap<String, u64>,
     window_drops: Arc<AtomicU64>,
     statuses: Arc<AtomicU64>,
+    /// Owner texts never handed to the engine because Warden stopped first.
+    unread_at_stop: Arc<AtomicU64>,
     /// Owners whose consumed text may hold the PIN in the batch being
     /// handled; each gets one [`CANNOT_DELETE`] notice when it is done.
     delete_due: Vec<String>,
@@ -207,15 +209,21 @@ fn system_clock_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// The notice for `n` owner messages Warden stopped before reading.
+fn unread_notice(n: usize) -> String {
+    format!("Warden stopped before reading {n} message(s); send them again.")
+}
+
 /// The notice for `n` owner messages dropped as older than `secs`.
 fn stale_notice(n: usize, secs: u64) -> String {
     format!("ignored {n} message(s) older than {secs} s (Warden was not running or was busy)")
 }
 
-fn count_stale(stale: &mut Vec<(String, usize)>, from: &str) {
-    match stale.iter_mut().find(|(f, _)| f == from) {
+/// Add one to `from`'s count.
+fn count_per_owner(counts: &mut Vec<(String, usize)>, from: &str) {
+    match counts.iter_mut().find(|(f, _)| f == from) {
         Some((_, n)) => *n += 1,
-        None => stale.push((from.to_string(), 1)),
+        None => counts.push((from.to_string(), 1)),
     }
 }
 
@@ -285,6 +293,7 @@ impl WhatsAppChannel {
             last_inbound: HashMap::new(),
             window_drops: Arc::new(AtomicU64::new(0)),
             statuses: Arc::new(AtomicU64::new(0)),
+            unread_at_stop: Arc::new(AtomicU64::new(0)),
             delete_due: Vec::new(),
             fatal: None,
             shutdown: None,
@@ -338,6 +347,14 @@ impl WhatsAppChannel {
     /// can be read after the channel is wrapped.
     pub fn status_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.statuses)
+    }
+
+    /// Owner texts that were taken from Meta (answered 200) but never
+    /// handed to the engine because Warden stopped first (see
+    /// [`Channel::flush_pending`]). A handle shared with the channel, so it
+    /// can be read after the channel is wrapped.
+    pub fn unread_at_stop_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.unread_at_stop)
     }
 
     fn shutting_down(&self) -> bool {
@@ -554,7 +571,7 @@ impl WhatsAppChannel {
                         }));
                     } else if self.is_stale(at_ms) {
                         self.consumed(&from, &body);
-                        count_stale(&mut stale, &from);
+                        count_per_owner(&mut stale, &from);
                         events.push(Event::Pass(stale_inbound(&from)));
                     } else {
                         events.push(Event::OwnerText {
@@ -610,7 +627,7 @@ impl WhatsAppChannel {
             }
             let from = o.from.clone();
             self.consumed(&from, &item.inbound.text);
-            count_stale(&mut stale, &from);
+            count_per_owner(&mut stale, &from);
             *item = Item {
                 inbound: stale_inbound(&from),
                 origin: None,
@@ -672,6 +689,42 @@ impl WhatsAppChannel {
                 continue;
             }
             let _ = self.deliver(&to, &text).await;
+        }
+    }
+
+    /// At stop: take every batch still waiting from the listener (each was
+    /// answered 200, so Meta will not deliver it again) and ingest it, so
+    /// its ids are recorded as seen as usual. Every owner text that will
+    /// not be handled, queued before or found now, is counted
+    /// ([`Self::unread_at_stop_counter`]), and each owner with any gets one
+    /// notice (inside the window only). Synchronous.
+    fn drain_unread(&mut self) {
+        let mut unread: Vec<(String, usize)> = Vec::new();
+        for item in std::mem::take(&mut self.queue) {
+            if let Some(o) = item.origin {
+                count_per_owner(&mut unread, &o.from);
+            }
+        }
+        // The listener has stopped, so this ends. A failed seen write makes
+        // `ingest` fatal and return nothing; the later batches are tried
+        // all the same, and every notice is then skipped.
+        while let Ok(batch) = self.inbound.try_recv() {
+            for ev in self.ingest(batch) {
+                match ev {
+                    Event::OwnerText { from, .. } => count_per_owner(&mut unread, &from),
+                    Event::OwnerNotText { from, .. } => self.notify(&from, NOT_TEXT),
+                    // Nothing reads the queue any more.
+                    Event::Pass(_) => {}
+                }
+            }
+        }
+        self.queue_delete_notices();
+        for (from, n) in unread {
+            self.unread_at_stop
+                .fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
+            if self.in_window(&from) {
+                self.notify(&from, unread_notice(n));
+            }
         }
     }
 
@@ -904,10 +957,15 @@ impl Channel for WhatsAppChannel {
         let _ = self.deliver(&number, CANNOT_DELETE).await;
     }
 
-    /// Send the notices still queued (stale, not-text, delete-it-yourself),
-    /// best effort, inside the window only, and within
-    /// `shutdown_request_timeout` in all; whatever is left then is dropped.
+    /// Called once the engine has stopped. First the batches still waiting
+    /// from the listener are ingested and every owner text that will not be
+    /// handled is counted; each such owner is told, once, to send them
+    /// again. Then the notices still queued (stale, not-text,
+    /// delete-it-yourself, unread) are sent, best effort, inside the window
+    /// only, and within `shutdown_request_timeout` in all; whatever is left
+    /// then is dropped.
     async fn flush_pending(&mut self) {
+        self.drain_unread();
         let limit = self.opts.shutdown_request_timeout;
         let _ = tokio::time::timeout(limit, self.flush()).await;
         self.notices.clear();

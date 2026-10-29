@@ -1413,6 +1413,64 @@ async fn flush_pending_sends_queued_notices() {
     assert_eq!(h.sent().await.len(), before);
 }
 
+/// Final review C1: batches answered 200 but still waiting at stop are
+/// ingested (their ids recorded as seen), every owner text that will not
+/// be handled is counted, and each such owner gets one notice.
+#[tokio::test]
+async fn flush_pending_tells_owners_about_messages_unread_at_stop() {
+    let h = Harness::new().await;
+    let (tx, mut ch) = h.channel_with(&[OWNER, OWNER2], Box::new(|| NOW_MS));
+    open_window(&tx, &mut ch).await;
+    // "two" stays in the channel's own queue.
+    tx.send(batch(vec![
+        text("wamid.q1", OWNER, "one"),
+        text("wamid.q2", OWNER, "two"),
+    ]))
+    .await
+    .unwrap();
+    assert_eq!(ch.recv().await.unwrap().text, "one");
+    // Still in the listener queue at stop.
+    tx.send(batch(vec![
+        text("wamid.w1", OWNER, "three"),
+        text("wamid.w1", OWNER, "three again"),
+        WaEvent::Status,
+        text("wamid.s1", STRANGER, "not counted"),
+        refused("wamid.img", OWNER, RefuseReason::NotText),
+    ]))
+    .await
+    .unwrap();
+    tx.send(batch(vec![text("wamid.w2", OWNER2, "four")]))
+        .await
+        .unwrap();
+    let unread = ch.unread_at_stop_counter();
+    let before = h.sent().await.len();
+    ch.flush_pending().await;
+    assert_eq!(unread.load(Ordering::Relaxed), 3);
+    let sent = h.sent_texts().await;
+    assert_eq!(
+        sent[before..].to_vec(),
+        vec![
+            (OWNER.into(), "only text messages are supported".into()),
+            (
+                OWNER.into(),
+                "Warden stopped before reading 2 message(s); send them again.".into()
+            ),
+            (
+                OWNER2.into(),
+                "Warden stopped before reading 1 message(s); send them again.".into()
+            ),
+        ]
+    );
+    // Recorded as seen, like any other ingest: never replayed.
+    let seen = SeenStore::open(h.home.path()).unwrap();
+    assert!(seen.contains("wamid.w1") && seen.contains("wamid.w2"));
+    // Nothing is left for a second flush.
+    let before = h.sent().await.len();
+    ch.flush_pending().await;
+    assert_eq!(h.sent().await.len(), before);
+    assert_eq!(unread.load(Ordering::Relaxed), 3);
+}
+
 /// A Graph API that does not answer cannot hold up shutdown: the flush
 /// ends within the shutdown request timeout.
 #[tokio::test]

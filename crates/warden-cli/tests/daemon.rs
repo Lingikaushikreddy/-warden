@@ -1901,6 +1901,36 @@ fn daemon_serves_telegram_and_whatsapp_together() {
     assert!(wa.sent_contains("reply two"));
 }
 
+/// A WhatsApp text answered 200 while the engine waits on a Telegram
+/// prompt is still in the batch queue at SIGTERM. Meta will not deliver it
+/// again, so the owner is told to send it again and the exit line counts it.
+#[test]
+fn whatsapp_batch_unread_at_stop_gets_a_notice_and_is_counted() {
+    let e = Env::new();
+    let tg = Tg::start();
+    let wa = Wa::start();
+    let a = e.root.join("a.txt");
+    fs::write(&a, "old").unwrap();
+    e.mock_wa(&wa.base(), write_script("a.txt", "new"), Some(&tg.base()));
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    tg.push(vec![owner_text(1, "update a.txt")]);
+    let _code = wait_for_code(&mut d, &tg);
+    post_owner(&mut d, addr, "wamid.unread", "what time is it");
+    assert_eq!(d.stop(), 0, "{}", d.stderr());
+    assert_eq!(fs::read_to_string(&a).unwrap(), "old");
+    assert_eq!(
+        wa.texts_to(WA_OWNER),
+        vec!["Warden stopped before reading 1 message(s); send them again.".to_string()],
+        "{}",
+        d.stderr()
+    );
+    let se = d.stderr();
+    assert!(se.contains("; other: 1 unread at stop"), "{se}");
+    // Recorded as seen: a redelivery after a restart is not acted on.
+    assert!(!e.audit_text().contains("what time is it"));
+}
+
 #[test]
 fn whatsapp_token_rejected_at_startup_exits_1() {
     let e = Env::new();

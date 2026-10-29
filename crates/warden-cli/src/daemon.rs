@@ -368,6 +368,7 @@ struct Counters {
     stats: Arc<WebhookStats>,
     window_drops: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
+    unread_at_stop: Arc<AtomicU64>,
 }
 
 /// The channel's counts at exit.
@@ -376,18 +377,22 @@ struct ChannelCounts {
     window_drops: u64,
     /// Items dropped because the channel's queue was full.
     dropped: u64,
+    /// Owner texts taken from Meta but never read because Warden stopped.
+    unread_at_stop: u64,
 }
 
 /// The exit line for these counts, if any listener counter, the window
-/// counter or the channel's drop counter is non-zero. The first part is
+/// counter, the channel's drop counter or its unread-at-stop counter is
+/// non-zero. The first part is
 /// fixed; the other non-zero refusal and drop counts follow it. Delivery
 /// statuses are normal traffic and are not reported.
 fn counters_line(s: &StatsSnapshot, c: ChannelCounts) -> Option<String> {
     let ChannelCounts {
         window_drops,
         dropped,
+        unread_at_stop,
     } = c;
-    if s.is_zero() && window_drops == 0 && dropped == 0 {
+    if s.is_zero() && window_drops == 0 && dropped == 0 && unread_at_stop == 0 {
         return None;
     }
     let mut line = format!(
@@ -403,6 +408,7 @@ fn counters_line(s: &StatsSnapshot, c: ChannelCounts) -> Option<String> {
         (s.busy, "busy"),
         (s.handshake_refused, "handshake-refused"),
         (dropped, "queue-dropped"),
+        (unread_at_stop, "unread at stop"),
     ]
     .iter()
     .filter(|(n, _)| *n > 0)
@@ -584,6 +590,7 @@ fn serve<P: Planner>(
                 stats: Arc::clone(&stats),
                 window_drops: channel.window_drops(),
                 dropped: channel.dropped_counter(),
+                unread_at_stop: channel.unread_at_stop_counter(),
             };
             let task: ListenerTask = Box::pin(listener.serve(lcfg, batch_tx, stats, rx.clone()));
             (
@@ -621,10 +628,12 @@ fn serve<P: Planner>(
 /// engine, the channels and the webhook listener observe; `whatsapp` is the
 /// listener to start once the session has begun, and its counters. A fatal
 /// channel error sets `shutdown` at once, which also closes the webhook
-/// listener, so Meta is not answered 200 for batches nobody will read. The
-/// listener alone holds the batch queue's sender (moved into its serving
-/// future), so its end is what the WhatsApp channel sees as the queue
-/// closing.
+/// listener, so Meta stops being answered 200 for new batches. Batches
+/// already answered 200 but still queued are read by the final flush: their
+/// ids are recorded as seen, and each owner with texts in them is told to
+/// send them again (counted as unread at stop). The listener alone holds
+/// the batch queue's sender (moved into its serving future), so its end is
+/// what the WhatsApp channel sees as the queue closing.
 async fn run<P: Planner, C: Channel>(
     planner: P,
     parts: Parts,
@@ -717,8 +726,10 @@ async fn run<P: Planner, C: Channel>(
             h.abort();
         }
     }
-    // Deletions still owed (replies that may hold the PIN), best effort and
-    // bounded. Messages still queued are dropped (delivery is at most once).
+    // Deletions still owed (replies that may hold the PIN) and notices,
+    // best effort and bounded. Messages still queued are not acted on
+    // (delivery is at most once); WhatsApp owners are told to send theirs
+    // again.
     let _ = tokio::time::timeout(FINAL_FLUSH, engine.channel_mut().flush_pending()).await;
 
     if let Err(e) = session_entry(&audit, DAEMON_SESSION, "daemon session ended") {
@@ -730,6 +741,7 @@ async fn run<P: Planner, C: Channel>(
             ChannelCounts {
                 window_drops: c.window_drops.load(Ordering::Relaxed),
                 dropped: c.dropped.load(Ordering::Relaxed),
+                unread_at_stop: c.unread_at_stop.load(Ordering::Relaxed),
             },
         );
         if let Some(line) = line {
@@ -1077,8 +1089,32 @@ mod tests {
         let counts = |window_drops, dropped| ChannelCounts {
             window_drops,
             dropped,
+            unread_at_stop: 0,
         };
         assert_eq!(counters_line(&zero, counts(0, 0)), None);
+        // The unread-at-stop count alone makes the line print.
+        assert_eq!(
+            counters_line(
+                &zero,
+                ChannelCounts {
+                    unread_at_stop: 3,
+                    ..counts(0, 1)
+                }
+            )
+            .unwrap(),
+            "whatsapp: refused 0 unsigned, 0 bad-signature, 0 oversized, 0 slow webhook requests; 0 replies not sent outside the 24 h window; other: 1 queue-dropped, 3 unread at stop"
+        );
+        assert_eq!(
+            counters_line(
+                &zero,
+                ChannelCounts {
+                    unread_at_stop: 2,
+                    ..counts(0, 0)
+                }
+            )
+            .unwrap(),
+            "whatsapp: refused 0 unsigned, 0 bad-signature, 0 oversized, 0 slow webhook requests; 0 replies not sent outside the 24 h window; other: 2 unread at stop"
+        );
         assert_eq!(
             counters_line(&zero, counts(0, 1)).unwrap(),
             "whatsapp: refused 0 unsigned, 0 bad-signature, 0 oversized, 0 slow webhook requests; 0 replies not sent outside the 24 h window; other: 1 queue-dropped"
