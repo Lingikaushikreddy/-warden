@@ -902,8 +902,9 @@ sender without `true` is not a shutdown request.
 
 `warden_agent::telegram` (`api.rs`, `update.rs`, `offset.rs`,
 `channel.rs`): the `Channel` trait over the Telegram Bot API, with long
-polling (`getUpdates`) only. Warden opens no inbound port and sets no
-webhook.
+polling (`getUpdates`) only. The Telegram channel opens no inbound port
+and sets no webhook (the WhatsApp channel's loopback listener is
+described under "WhatsApp channel").
 
 **Trust model.**
 
@@ -1066,8 +1067,9 @@ media.
   sender `wa:<digits>`. The digits must be Meta's WhatsApp id for the
   account, which for some countries (for example Mexico, `521…`, or
   Brazil's ninth digit) differs from the dialled number; the owner copies
-  it from the `ignored: non-owner` audit entry (`wa:<digits>`). Whoever controls one of those WhatsApp accounts is an
-  owner and can approve `Yes` actions. Business-number chats are not
+  it from the `ignored: non-owner` audit entry (`wa:<digits>`). Whoever
+  controls one of those WhatsApp accounts is an owner and can approve
+  `Yes` actions. Business-number chats are not
   end-to-end encrypted to Warden: the Cloud API decrypts at Meta, which
   sees, and could forge, every request, reply and prompt. Meta signs each
   webhook with the app secret; nothing else authenticates a request.
@@ -1077,9 +1079,10 @@ media.
   phone_number_id` (others, and a missing one, are counted as `foreign`
   and skipped), and at most 256 items per notification: the messages of
   every change first, then the statuses, so statuses never push a message
-  out; items past the cap are dropped and counted (`truncated`). A message becomes text only when its `type` is
-  `"text"` with a `text.body`, its `id`, `from` (1-20 digits) and
-  `timestamp` are valid, it carries no `errors`, and neither
+  out; items past the cap are dropped and counted (`truncated`). A
+  message becomes text only when its `type` is `"text"` with a
+  `text.body`, its `id`, `from` (1-20 digits) and `timestamp` are valid,
+  it carries no `errors`, and neither
   `context.forwarded` nor `context.frequently_forwarded` is set (a flag of
   any value but `false` or `null` counts as set). Refused, with their
   tags: forwarded (`forward`), carrying `errors` or `type: "unsupported"`
@@ -1102,13 +1105,17 @@ media.
   prompt to the requester's number only. The reply is the next text from
   THAT number; messages from anyone else, other owners included, are
   queued for later. A text that is `yes <code>` for this prompt is
-  accepted whatever its timestamp (the code is drawn fresh per prompt, so
-  it cannot predate it, and clock skew between Meta and the local clock
-  must not lock the owner out). Any other text, and any non-text message,
-  counts as the reply only if it is stamped no earlier than 5 s before the
-  prompt was sent; earlier ones were typed before the prompt existed and
-  are queued for `recv`. A non-text reply is No, and so is a reply whose
-  `context.id` quotes a message other than the prompt. The text is judged
+  accepted whatever its timestamp, within `max_message_age_secs` (an
+  older one is stale and never acted on; the code is drawn fresh per
+  prompt, so it cannot predate it, and clock skew between Meta and the
+  local clock must not lock the owner out). Any other text, and a
+  `non-text` message (media and the like), counts as the reply only if it
+  is stamped no earlier than 5 s before the prompt was sent; earlier ones
+  were typed before the prompt existed and are queued for `recv`.
+  Reactions, forwards, `system`, `unsupported` and `malformed` messages
+  are never the reply: they are queued like any other refused message. A
+  `non-text` reply is No, and so is a reply whose `context.id` quotes a
+  message other than the prompt. The text is judged
   by the same `parse_reply` as the terminal. A prompt is never cut: one
   over 4096 UTF-16 units is not sent (the owner gets `request too long to
   approve safely; refused`) and is No. A prompt that cannot be sent
@@ -1186,7 +1193,8 @@ no logger is installed (see "Telegram channel", "The token").
   socket at once and gives connections in progress at most 2 s more. From
   the moment shutdown starts, every POST gets 503 (not counted), so Meta
   redelivers it after the restart instead of it being answered 200 and
-  then lost; the seen store drops what was already taken.
+  then lost. Batches already answered 200 before then are not handled:
+  see "Shutdown bounds".
 
 **Secrets.**
 
@@ -1201,8 +1209,9 @@ no logger is installed (see "Telegram channel", "The token").
   key must all be different values`) when any two of the secret values it
   holds are equal: the three WhatsApp secrets, the bot token and the API
   key, with any mix of channels (so a Telegram-only config whose bot token
-  equals the API key is refused too). Distinct values matter because the verify token travels in a URL query
-  (Meta's handshake GET), and tunnel request logs can record it.
+  equals the API key is refused too). Distinct values matter because the
+  verify token travels in a URL query (Meta's handshake GET), and tunnel
+  request logs can record it.
 - Shapes: the access token is 32-2048 characters of `[A-Za-z0-9._-]`, the
   app secret 16-128 ASCII letters and digits, the verify token 16-128
   characters of `[A-Za-z0-9._~-]`. Each is zeroized on drop, has no
@@ -1214,14 +1223,18 @@ no logger is installed (see "Telegram channel", "The token").
   is not zeroized). It never goes in a URL. `GraphApi`'s `Debug` shows only
   the base URL, the Graph version and the phone number id.
 - **Redaction.** The redactor gains a Meta access token pattern: `EAA`
-  followed by 40 or more letters and digits, with a left boundary (start of
-  text or a character that is not a letter or digit; see `redact.rs`). It may over-redact a long identifier that happens
-  to start with `EAA`. A Meta or Telegram token right after a percent
-  escape (`access_token%3DEAA…`, as in a URL-encoded query) is redacted
-  too; the escape is kept. There is no pattern for the app secret: 32 hex
-  digits look like ordinary hashes, and redacting every hash would make
-  file contents useless to the model. The verify token is chosen by the
-  owner and has no fixed shape either.
+  followed by 40 or more letters and digits, with a left boundary (start
+  of text or a character that is not a letter or digit; see `redact.rs`).
+  It may over-redact a long identifier that happens to start with `EAA`.
+  A Meta or Telegram token right after a percent escape
+  (`access_token%3DEAA…`, as in a URL-encoded query) is redacted too; the
+  escape is kept. Known misses: a token encoded twice (`%2520EAA…`: the
+  character before `EAA` is the digit `0`, not an escape), and a Telegram
+  token whose colon is encoded (`<id>%3A<secret>`), are not redacted.
+  There is no pattern for the app secret: 32 hex digits look like
+  ordinary hashes, and redacting every hash would make file contents
+  useless to the model. The verify token is chosen by the owner and has
+  no fixed shape either.
 
 **Deduplication: at most once.** Meta retries webhooks, so the same message
 can arrive twice. `<home>/whatsapp-seen` records the message ids
@@ -1234,7 +1247,10 @@ ids already recorded or repeated in the batch are dropped, and the
 remaining owner ids are recorded BEFORE any message in the batch is
 queued; the in-memory set changes only after the write succeeds. A failed
 write is fatal and the batch is dropped. A crash between the listener's
-200 and that write loses the batch instead of replaying it.
+200 and that write loses the batch instead of replaying it, with no
+notice. A clean stop loses messages too: owner texts answered 200 but
+not yet handled are recorded as seen and never acted on (see "Shutdown
+bounds").
 
 Eviction is by age. Past 1024 entries, only entries older than
 `max_message_age_secs` are dropped (oldest first): a redelivery of those
@@ -1286,9 +1302,9 @@ itself and that may hold the PIN: a text dropped as stale (at arrival or
 in the queue) or by `discard_pending_input` that is approval-shaped with 2
 or more tokens, or has at most 8 tokens and a run of 4 or more digits; and
 any approval reply that did not approve, except a bare `no` (so `yes
-<code> <PIN>`, but also a wrong code or any other text). At most one notice per owner per batch
-handled; best effort, and only inside the window (outside it the notice is
-skipped and not counted).
+<code> <PIN>`, but also a wrong code or any other text). At most one
+notice per owner per batch handled; best effort, and only inside the
+window (outside it the notice is skipped and not counted).
 
 **Outbound.** `send` delivers only to an owner (`wa:<owner number>`;
 anything else is dropped), after `redact` and display sanitizing, cut to
@@ -1306,8 +1322,9 @@ notices wait to be sent; more are dropped.
 rustls, proxy variables ignored, redirects not followed (a 3xx is an
 error). `api_base` (default `https://graph.facebook.com`) must be
 `https://`, or `http://` to a loopback host (used by the tests), with no
-credentials, query or fragment. `graph_version` (default `v26.0`, checked
-2026-10-29; it must be raised as Meta retires versions) must look like
+credentials, query or fragment. `graph_version` (default `v26.0`, the
+latest Graph version listed in Meta's changelog on 2026-10-29; it must be
+raised as Meta retires versions) must look like
 `v<1-3 digits>.<1-2 digits>` and `phone_number_id` must be 1-32 digits,
 since both go into the URL path. Each request has a 30 s timeout, and
 responses are read in chunks capped at 64 KiB. Of a Graph error only the
@@ -1336,9 +1353,23 @@ messages and takes only the batches already waiting when it is called.
 **Shutdown bounds.** Once shutdown has started (`with_shutdown`, wired by
 the daemon), a rate-limit wait in progress ends at once with no retry,
 and each request, one already in flight included, gets at most 5 s more.
-After the engine stops, `flush_pending` sends the notices still waiting
-(stale, non-text, delete-it-yourself), inside the window only, within 5 s
-in all; whatever is left then is dropped. The listener stops as above.
+After the engine stops (on a signal or a fatal error alike),
+`flush_pending` first ingests the batches still waiting from the
+listener, each already answered 200, so Meta will not deliver them
+again; their owner message ids are recorded as seen as usual. Every
+owner text that will not be handled, whether queued earlier or found
+now, is lost: it is never acted on, now or after a restart. Each owner
+with any gets one notice, `Warden stopped before reading {n}
+message(s); send them again.`, inside the window only; an owner outside
+the window is not told. All of them are counted for the daemon's exit
+line (`<n> unread at stop`), told or not. `flush_pending` then sends the
+notices still waiting (stale, non-text, delete-it-yourself, unread),
+inside the window only, within 5 s in all; whatever is left then is
+dropped, and none is sent once the WhatsApp channel itself has failed
+fatally (a rejected token, an unwritable seen store). Batches that arrive
+once
+shutdown has started get 503 and Meta redelivers them (see "The
+listener", "Shutdown").
 
 ## Daemon
 
@@ -1366,8 +1397,9 @@ configured (with `--console` for the console).
      bot token`; anything else is `cannot reach Telegram (<kind>)`);
   9. with `[whatsapp]`: the Graph phone number lookup (`GET
      /{graph_version}/{phone_number_id}?fields=display_phone_number,verified_name`):
-     HTTP 401 or code 190 is `WhatsApp rejected the access token`; code 100
-     or HTTP 404 is `the access token cannot see phone_number_id <id>`;
+     HTTP 401 or code 190 is `WhatsApp rejected the access token`; code
+     100, or an HTTP 404 without a Graph error body, is `the access token
+     cannot see phone_number_id <id>`;
      anything else is `cannot reach the WhatsApp Cloud API (<kind>)`, where
      the kind holds only fixed words and numbers;
   10. with `[whatsapp]`: the webhook listener is bound (not yet serving):
@@ -1413,10 +1445,15 @@ configured (with `--console` for the console).
   finish, then aborts it. Then the daemon performs once more any deletion
   still owed (a reply that may hold the PIN whose `deleteMessage` was cut
   off) and sends the WhatsApp notices still waiting, best effort and
-  bounded to 10 s in total. Messages already
-  fetched but not yet handled are dropped, not replayed on the next start
-  (delivery is at most once). Then `daemon session ended` is audited (best
-  effort) and the exit code is 0.
+  bounded to 10 s in total. Messages already fetched (Telegram) or
+  answered 200 (WhatsApp) but not yet handled are lost: never acted on,
+  and not replayed on the next start (delivery is at most once), after a
+  clean stop as after a fatal error. Telegram drops them silently;
+  WhatsApp records them as seen and tells each owner, inside the window
+  only (an owner outside it is not told), `Warden stopped before reading
+  {n} message(s); send them again.`
+  (see "WhatsApp channel", "Shutdown bounds"). Then `daemon session
+  ended` is audited (best effort) and the exit code is 0.
 - **Fatal channel errors** come from two sources, Telegram (token
   rejected, 409 conflict, offset unwritable) and WhatsApp (`WhatsApp
   rejected the access token`, `cannot save the WhatsApp seen-message
@@ -1431,6 +1468,12 @@ configured (with `--console` for the console).
   terminal accepts the PIN, Telegram only with `allow_pin_approvals`,
   WhatsApp never. Closing stdin does not stop the daemon: `Pair` keeps
   reading the other side.
+- **One channel at a time during a prompt.** `Pair` sends an approval
+  prompt to one side and waits on that side only, so while a prompt is
+  open (up to `approval_timeout`, 120 s) the other channel is not read.
+  Its messages may pass `max_message_age_secs` meanwhile and are then
+  dropped as stale with a notice, and a WhatsApp listener that dies
+  during the prompt is noticed only after it ends.
 - **stderr** carries the banner, warnings and errors: never message text,
   tokens, secrets or the API key. The banner is `warden daemon:`, then
   `telegram @<bot>` with Telegram, then `whatsapp <display number>
@@ -1440,13 +1483,16 @@ configured (with `--console` for the console).
   characters. Nothing is printed per request, and no logger is installed
   (see "Telegram channel").
 - **Exit counters.** With WhatsApp, after `daemon session ended`, one
-  stderr line is printed when any listener counter, the window counter or
-  the channel's queue-drop counter is non-zero: `whatsapp: refused <n>
-  unsigned, <n> bad-signature, <n> oversized, <n> slow webhook requests;
-  <n> replies not sent outside the 24 h window`, followed by `; other: `
-  and the non-zero ones of `malformed`, `bad-request`, `foreign`,
-  `truncated`, `queue-full`, `busy`, `handshake-refused` and
-  `queue-dropped` (`<n> <name>`, comma-separated). Delivery statuses are
+  stderr line is printed when any listener counter (requests refused or
+  dropped, items `truncated`), the window counter, the channel's
+  queue-drop counter or its unread-at-stop counter is non-zero:
+  `whatsapp: refused <n> unsigned, <n> bad-signature, <n> oversized, <n>
+  slow webhook requests; <n> replies not sent outside the 24 h window`,
+  followed by `; other: ` and the non-zero ones of `malformed`,
+  `bad-request`, `foreign`, `truncated`, `queue-full`, `busy`,
+  `handshake-refused`, `queue-dropped` and `unread at stop` (`<n>
+  <name>`, comma-separated). Sends that fail for any other reason
+  (transport errors, rate limits) are not counted. Delivery statuses are
   normal traffic and are not reported.
 - **Clock.** The approver store's high-water mark (`<home>/clock-mark`,
   see "Agent approver store") clamps a clock that went backwards: approvals
@@ -1461,8 +1507,10 @@ configured (with `--console` for the console).
 **Service files.** `warden daemon print-service --launchd | --systemd
 [--config <path>]` prints a launchd agent plist (label
 `local.warden.daemon`) or a systemd user unit. It loads the config only to
-read the two variable names (`api_key_env`, `bot_token_env`), never their
-values, writes nothing (not even the data dir) and prints to stdout. The
+read the secret variable names, up to five (`api_key_env`, then
+`[telegram] bot_token_env` and the three `[whatsapp]` `*_env` names, for
+the tables present), never their values, writes nothing (not even the
+data dir) and prints to stdout. The
 paths are the canonical binary (`current_exe`), the absolute data dir and
 the canonical config (only when `--config` is given). A path that is not
 UTF-8 or contains a control character, `"`, `\`, `%`, `$`, `'`, `&`, `<`,
@@ -1474,13 +1522,23 @@ secrets; its leading comment says to `chmod 600` it), and for systemd in
 `EnvironmentFile=%h/.config/warden/daemon.env`, which the unit's comments
 say to create with mode 0600. Both restart only after a failed exit
 (launchd `KeepAlive` `{SuccessfulExit: false}` with `ThrottleInterval` 60;
-systemd `Restart=on-failure`, `RestartSec=60`), so a fatal Telegram error
-is retried once a minute and a clean stop stays stopped. Both allow 60 s
+systemd `Restart=on-failure`, `RestartSec=60`), so a fatal channel error
+(Telegram or WhatsApp) is retried once a minute and a clean stop stays
+stopped. Both allow 60 s
 for a graceful stop (`ExitTimeOut`, `TimeoutStopSec`) and stop with
 SIGTERM. The unit also sets `NoNewPrivileges=yes` and `UMask=0077`.
 launchd writes stderr to `<home>/daemon.log`, which it creates with its
 default umask (typically mode 0644, inside the 0700 data dir). It holds no
-secrets: stderr never carries message text, the token or the API key.
+secrets: stderr never carries message text, a channel secret or the API
+key.
+
+A filled-in plist holds every secret in plain text, and the redactor has
+no pattern for the WhatsApp app secret or the verify token (see
+"WhatsApp channel", "Redaction"), so an agent read of the plist would
+pass those two to the planner. The root guard refuses
+only the home folder and its ancestors, so a root of
+`~/Library/LaunchAgents` or `~/Library` is accepted: never put the
+Warden root over `~/Library/LaunchAgents`.
 
 **Recovery when an unattended daemon will not start.** Stop anything using
 the data dir first.

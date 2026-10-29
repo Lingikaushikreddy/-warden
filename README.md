@@ -31,13 +31,12 @@ anything that matters.
   calls (`list_dir`, `read_file`, `write_file`, `delete_file`), and Warden
   gates every call. One line of input is one message.
 - **`warden daemon`**, the same engine on Telegram and/or WhatsApp,
-  unattended: you message your own bot, and approvals come back as
-  `yes <code>` in the same chat. See [Telegram daemon](#telegram-daemon).
-- **The WhatsApp channel** for `warden daemon`, over Meta's official
-  WhatsApp Cloud API: you message a WhatsApp business number from your own
-  phone, and approvals come back as `yes <code>` in the same chat. Inbound
-  messages arrive by webhook on a loopback-only listener that you expose
-  with your own tunnel. See [WhatsApp](#whatsapp).
+  unattended: you message your own Telegram bot, or a WhatsApp business
+  number (over Meta's official WhatsApp Cloud API), and approvals come
+  back as `yes <code>` in the same chat. WhatsApp messages arrive by
+  webhook on a loopback-only listener that you expose with your own
+  tunnel. See [Telegram daemon](#telegram-daemon) and
+  [WhatsApp](#whatsapp).
 
 ## The safety model, in plain words
 
@@ -252,7 +251,8 @@ you put your own tunnel in front of it. Read the WhatsApp entries in
 [Honest limits](#honest-limits) first: Meta sees every message, and the
 tunnel is a public endpoint.
 
-**1. Set up Meta.** At a high level:
+**1. Set up Meta.** At a high level (per Meta's developer docs as of
+2026-10; Meta's dashboard changes, so the names may differ):
 
 - create a Meta developer app and add the WhatsApp product to it;
 - use the test number Meta gives you, or register a business number;
@@ -275,10 +275,10 @@ It prints a public `https://` host name. In the app's WhatsApp webhook
 settings, set the callback URL to `https://<tunnel host>/webhook` (Warden
 serves that one path only), set the verify token to a value you choose
 (16-128 characters of letters, digits, `.`, `_`, `~` or `-`), and
-subscribe to the `messages` field. Meta checks the callback by calling it,
-so start the daemon (step 5) before you save the settings. A quick tunnel
-gets a new host name each time it starts, so the callback URL must then be
-updated.
+subscribe to the `messages` field. Per Meta's docs, Meta checks the
+callback by calling it when you save, so start the daemon (step 5) first.
+In Cloudflare's current behaviour, a quick tunnel gets a new host name
+each time it starts, so the callback URL must then be updated.
 
 **3. Configure.** Add a `[whatsapp]` table to the config:
 
@@ -302,8 +302,9 @@ No secret goes in the file: an `access_token`, `app_secret`,
 the variable names must all differ from each other, from `api_key_env`
 and from `[telegram] bot_token_env`. A `listen` address that is not
 loopback (`0.0.0.0`, `[::]`, a LAN address, a host name) is refused.
-`graph_version` defaults to `v26.0` (verified current on 2026-10-29);
-Meta retires old versions, so it must be raised when Meta does.
+`graph_version` defaults to `v26.0`, the latest Graph version listed in
+Meta's changelog on 2026-10-29; Meta retires old versions, so it must be
+raised when Meta does.
 
 A config may have a `[whatsapp]` table alone, or with a `[telegram]`
 table: one daemon then serves both, each owner on their own channel.
@@ -342,22 +343,31 @@ cannot see the number (`the access token cannot see phone_number_id
 <id>`); and when the listen address is taken (`<address> is already in
 use`). `--console` works as with Telegram.
 
-When it stops, it prints one line of counters if the listener refused
-anything or a reply could not be sent, for example `whatsapp: refused 1
-unsigned, 1 bad-signature, 0 oversized, 0 slow webhook requests; 0
-replies not sent outside the 24 h window`. Refused unsigned or
-badly-signed requests usually mean someone other than Meta found the
-tunnel, or the app secret is wrong.
+When it stops, it prints one line of counters if the listener refused or
+dropped any request, items were cut from a notification (`truncated`)
+or dropped from a full queue, a message was not sent because the 24-hour
+window was closed, or messages were left unread at stop, for example
+`whatsapp: refused 1 unsigned, 1 bad-signature, 0 oversized, 0 slow
+webhook requests; 0 replies not sent outside the 24 h window`. Sends that
+failed for another reason (a network error, a rate limit) are not
+counted. Refused unsigned or badly-signed requests usually mean someone
+other than Meta found the tunnel, or the app secret is wrong.
 
 **Using it.** Message the business number from an owner number. Only text
 is acted on: media, reactions, interactive and button replies, forwarded
 messages and messages older than `max_message_age_secs` are never acted on
-(they are audited as ignored), and an owner's media or other non-text
-message (not a reaction or a forward) gets `only text messages are
-supported`. When an action needs consent you get the
-same prompt as the terminal; reply `yes <code>` from the same number
-(anything else is a no, and so is a reply that quotes a different
+(they are audited as ignored, at most one such entry a minute), and an
+owner's media or other non-text message (not a reaction or a forward)
+gets `only text messages are supported`. When an action needs consent you
+get the same prompt as the terminal; reply `yes <code>` from the same
+number (anything else is a no, and so is a reply that quotes a different
 message).
+
+**One chat at a time.** With both Telegram and WhatsApp configured, while
+an approval prompt is open on one of them (up to 120 s) the other is not
+read: its messages may pass `max_message_age_secs` meanwhile and are then
+dropped with a notice, and if the WhatsApp listener dies during that
+time, the daemon notices only after the prompt ends.
 
 - **PIN actions happen at the computer.** An action that needs the PIN (a
   delete) is always refused over WhatsApp without a prompt, and you are
@@ -430,15 +440,21 @@ which has the details.
   shares one PIN and one PIN lockout, so wrong PINs from one owner lock
   all of them (a compromised account can lock PIN approvals for everyone
   for up to 24 hours).
-- **At-most-once delivery.** The daemon records that it has seen a batch
-  of messages before acting on it, so a crash or kill mid-message loses
-  that message rather than replaying it. Messages fetched but not yet
-  handled when it stops (SIGTERM included) are dropped too. On WhatsApp,
-  a crash after Warden has answered Meta's webhook but before it has
-  recorded the messages loses them as well. While it is stopping, the
-  listener answers 503, so Meta delivers those webhooks again after the
-  restart (and messages older than `max_message_age_secs` by then are
-  dropped as stale).
+- **At-most-once delivery, so a stop can lose messages.** The daemon
+  records that it has seen a batch of messages before acting on it, so a
+  crash or kill mid-message loses that message rather than replaying it.
+  Any stop, a clean Ctrl-C or SIGTERM included, also loses messages
+  already received but not yet handled: they are never acted on, now or
+  after the restart. On Telegram they are dropped silently. On WhatsApp,
+  messages Meta was already told were received are recorded as seen and
+  dropped, and each owner they came from gets one message, `Warden
+  stopped before reading <n> message(s); send them again.`, but only
+  inside that owner's 24-hour window: outside it, the owner is not told.
+  The exit line counts them (`<n> unread at stop`). A crash or kill after
+  Warden has answered Meta's webhook loses those messages with no notice
+  at all. Webhooks that arrive once stopping has begun are answered 503,
+  so Meta delivers them again after the restart (and messages older than
+  `max_message_age_secs` by then are dropped as stale).
 - **WhatsApp Business chats are not end-to-end encrypted to Warden.** The
   Cloud API decrypts messages at Meta, so Meta sees every request, every
   reply and every approval prompt.
@@ -450,9 +466,10 @@ which has the details.
   send requests to it. They are refused unless they carry a valid HMAC
   signature made with the app secret (and the subscription check needs the
   verify token), but that signature is the only protection. The tunnel's
-  provider (for example Cloudflare, whose quick tunnels end TLS at
-  Cloudflare) sees every webhook body, and its request logs may record the
-  verify token, which Meta sends in the URL.
+  provider (for example Cloudflare, whose quick tunnels, in Cloudflare's
+  current behaviour, end TLS at Cloudflare) sees every webhook body, and
+  its request logs may record the verify token, which Meta sends in the
+  URL.
 - **Whoever controls an owner's WhatsApp account is the owner.** A stolen
   phone or a hijacked account can send requests and approve `Yes`
   actions.
@@ -464,7 +481,16 @@ which has the details.
   delivered and the approval simply times out (a no).
 - **Service files hold secrets** once you fill them in. Keep them `chmod
   600`. The tokens, the WhatsApp app secret and verify token, and the API
-  key also live in the daemon's environment.
+  key also live in the daemon's environment. A filled-in launchd plist
+  holds the WhatsApp app secret and verify token as plain text that the
+  redactor does not recognise, so a read of it would pass them to the
+  model: never set `root` to `~/Library/LaunchAgents` or a folder that
+  contains it (such as `~/Library`, or, with `--allow-home-root`, your
+  home folder).
+- **Some encoded tokens are not redacted.** A token that is
+  percent-encoded twice (`%2520EAA…`), or a Telegram token whose colon is
+  percent-encoded (`%3A`), does not match the redactor's patterns and
+  reaches the model as is.
 - **Large writes.** The model's output is capped at 4096 tokens per step,
   so `write_file` content larger than about 16 KB cannot be produced in one
   call (a cut-off call is refused, never offered for approval). A write
@@ -489,7 +515,8 @@ injection) is compiled only with the `test-hooks` Cargo feature, which
 Signal or Matrix channels, WhatsApp message templates (so Warden cannot
 message you outside the 24-hour window) and WhatsApp media, a tray app,
 remote undo (undo over Telegram or WhatsApp), WASM skills, MCP, a mesh or
-relay between devices, a website, and a local routing model. None of these exist in this repository.
+relay between devices, a website, and a local routing model. None of
+these exist in this repository.
 
 ## Docs
 
