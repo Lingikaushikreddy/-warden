@@ -1267,7 +1267,8 @@ deduplicated, but it is only ever audited.
 `max_message_age_secs` (default 120, 10-3600) before the local clock is
 never acted on: it reaches the engine as `wa-stale:<number>` with empty
 text, and the owner is told `ignored <n> message(s) older than <s> s
-(Warden was not running or was busy)` once per batch. The age is checked
+(Warden was not running or was busy)`, queued once per batch (see
+"Notices may repeat" below). The age is checked
 when a batch arrives and again when a queued owner text is handed to the
 engine. Meta's timestamps are capped at the local clock, so a sender clock
 running ahead cannot keep a message fresh (or extend the window below).
@@ -1303,8 +1304,15 @@ in the queue) or by `discard_pending_input` that is approval-shaped with 2
 or more tokens, or has at most 8 tokens and a run of 4 or more digits; and
 any approval reply that did not approve, except a bare `no` (so `yes
 <code> <PIN>`, but also a wrong code or any other text). At most one
-notice per owner per batch handled; best effort, and only inside the
-window (outside it the notice is skipped and not counted).
+notice per owner is queued per batch handled; best effort, and only inside
+the window (outside it the notice is skipped and not counted).
+
+**Notices may repeat.** "One notice per batch" counts notices queued, not
+notices delivered. A notice is removed from the queue only once its send
+has finished, so a send cancelled midway (for example when `Pair` takes a
+message from the other channel first) is sent again on the next flush,
+and the owner may get the same notice more than once. It is never lost by
+the cancel, and never sent for a batch that did not ask for it.
 
 **Outbound.** `send` delivers only to an owner (`wa:<owner number>`;
 anything else is dropped), after `redact` and display sanitizing, cut to
@@ -1353,20 +1361,29 @@ messages and takes only the batches already waiting when it is called.
 **Shutdown bounds.** Once shutdown has started (`with_shutdown`, wired by
 the daemon), a rate-limit wait in progress ends at once with no retry,
 and each request, one already in flight included, gets at most 5 s more.
-After the engine stops (on a signal or a fatal error alike),
-`flush_pending` first ingests the batches still waiting from the
-listener, each already answered 200, so Meta will not deliver them
-again; their owner message ids are recorded as seen as usual. Every
+After the engine stops (on a signal or a fatal error alike), the daemon
+first calls `drain_at_stop`, which is synchronous and has no time bound,
+so no other channel's slow flush can skip it. It ingests the batches
+still waiting from the listener, each already answered 200, so Meta will
+not deliver them again; their owner message ids are recorded as seen as
+usual. If that write fails, the channel fails fatally
+(`SeenUnwritable`): no notice is sent, and the daemon prints the reason
+and exits 1. Every
 owner text that will not be handled, whether queued earlier or found
 now, is lost: it is never acted on, now or after a restart. Each owner
 with any gets one notice, `Warden stopped before reading {n}
 message(s); send them again.`, inside the window only; an owner outside
 the window is not told. All of them are counted for the daemon's exit
-line (`<n> unread at stop`), told or not. `flush_pending` then sends the
-notices still waiting (stale, non-text, delete-it-yourself, unread),
-inside the window only, within 5 s in all; whatever is left then is
-dropped, and none is sent once the WhatsApp channel itself has failed
-fatally (a rejected token, an unwritable seen store). Batches that arrive
+line (`<n> unread at stop`), told or not; `drain_at_stop` only queues
+the notices. Then the timed `flush_pending` runs (its own drain finds
+nothing left, so nothing is counted twice) and sends the notices still
+waiting (stale, non-text, delete-it-yourself, unread), inside the window
+only, within 5 s in all; whatever is left then is dropped. `Pair` flushes
+both of its sides at once, so hung Telegram deletions do not use up the
+daemon's 10 s before these notices are tried. No notice is sent once
+the WhatsApp channel itself has failed fatally, for any reason (for
+example a rejected token, an unwritable seen store, or the listener
+stopping on its own, `ListenerStopped`). Batches that arrive
 once
 shutdown has started get 503 and Meta redelivers them (see "The
 listener", "Shutdown").
@@ -1442,10 +1459,14 @@ configured (with `--console` for the console).
   the webhook listener closes its listening socket and answers 503 to
   any POST still in progress (connections get at most 2 s more). After
   the engine stops, the daemon waits at most 5 s for the listener to
-  finish, then aborts it. Then the daemon performs once more any deletion
-  still owed (a reply that may hold the PIN whose `deleteMessage` was cut
-  off) and sends the WhatsApp notices still waiting, best effort and
-  bounded to 10 s in total. Messages already fetched (Telegram) or
+  finish, then aborts it. Then it drains the WhatsApp batches still
+  queued (`drain_at_stop`: recorded as seen, counted, notices queued; no
+  time bound, no network), and only then runs the timed flush: it
+  performs once more any deletion still owed (a reply that may hold the
+  PIN whose `deleteMessage` was cut off) and sends the WhatsApp notices
+  still waiting, both channels side by side, best effort and bounded to
+  10 s in total. A seen-list write failure during the drain is a fatal
+  error (exit 1, below). Messages already fetched (Telegram) or
   answered 200 (WhatsApp) but not yet handled are lost: never acted on,
   and not replayed on the next start (delivery is at most once), after a
   clean stop as after a fatal error. Telegram drops them silently;
@@ -1460,9 +1481,14 @@ configured (with `--console` for the console).
   list`, `the WhatsApp webhook listener stopped`). Each channel is wrapped
   so that its first fatal condition is recorded and wakes the run loop,
   even inside a `Pair`. That sets the shutdown signal at once, which also
-  closes the webhook listener (so Meta is not answered 200 for batches
-  nobody will read), stops the engine the same way as a signal, and exits
-  1 with the reason on stderr (`error: <reason>`), also with `--console`.
+  closes the webhook listener: once stopping has begun, new batches are
+  refused (503) so Meta delivers them again later, and batches already
+  answered 200 and still queued are drained and counted at stop (see the
+  shutdown bullet above). It stops the engine the same way as a signal,
+  and exits 1 with the reason on stderr (`error: <reason>`), also with
+  `--console`. A fatal condition found after the engine has stopped (a
+  seen-list write failing during the stop-time drain or the final flush)
+  is recorded the same way and also exits 1.
 - **`--console`** pairs the terminal (sender `local`) with the configured
   remote channels (`Pair`). Each owner is served on their own side; the
   terminal accepts the PIN, Telegram only with `allow_pin_approvals`,

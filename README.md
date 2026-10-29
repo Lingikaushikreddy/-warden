@@ -450,7 +450,10 @@ which has the details.
   dropped, and each owner they came from gets one message, `Warden
   stopped before reading <n> message(s); send them again.`, but only
   inside that owner's 24-hour window: outside it, the owner is not told.
-  The exit line counts them (`<n> unread at stop`). A crash or kill after
+  This is done before the time-limited final send, so a slow Telegram
+  cleanup cannot skip it. The exit line counts them (`<n> unread at
+  stop`). Warden's notices are best effort and may occasionally arrive
+  twice (a send cut off midway is retried). A crash or kill after
   Warden has answered Meta's webhook loses those messages with no notice
   at all. Webhooks that arrive once stopping has begun are answered 503,
   so Meta delivers them again after the restart (and messages older than
