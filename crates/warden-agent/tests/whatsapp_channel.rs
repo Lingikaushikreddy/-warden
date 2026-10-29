@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use warden_agent::channel::{ApprovalPrompt, ApprovalReply, Channel, SenderId};
+use warden_agent::channel::{ApprovalPrompt, ApprovalReply, Channel, Pair, SenderId};
 use warden_agent::whatsapp::{
     sender_id, AccessToken, GraphApi, RefuseReason, SeenStore, WaEvent, WebhookBatch,
     WhatsAppChannel, WhatsAppFatal, WhatsAppOptions, WINDOW_MS,
@@ -1469,6 +1469,55 @@ async fn flush_pending_tells_owners_about_messages_unread_at_stop() {
     ch.flush_pending().await;
     assert_eq!(h.sent().await.len(), before);
     assert_eq!(unread.load(Ordering::Relaxed), 3);
+}
+
+/// Final review C2: a notice whose send is cancelled (here by a [`Pair`]
+/// whose other side delivered first) is sent again on the next flush,
+/// not lost.
+#[tokio::test]
+async fn notice_cancelled_mid_send_is_sent_on_the_next_flush() {
+    let h = Harness::new().await;
+    let (tx, ch) = h.channel();
+    let other_home = tempfile::tempdir().unwrap();
+    let (tx2, other) = channel_on(
+        &h.server.uri(),
+        other_home.path(),
+        &[OWNER2],
+        Box::new(|| NOW_MS),
+    );
+    let mut pair = Pair::new(ch, other);
+    h.script.push(sent_ok().set_delay(Duration::from_secs(10)));
+    tx.send(batch(vec![refused(
+        "wamid.img",
+        OWNER,
+        RefuseReason::NotText,
+    )]))
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tx2.send(batch(vec![text("wamid.o2", OWNER2, "first")]))
+            .await
+            .unwrap();
+    });
+    // The WhatsApp side is mid-send of its notice when the other side
+    // delivers, and its `recv` is dropped.
+    let m = tokio::time::timeout(Duration::from_secs(5), pair.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(m.text, "first");
+    assert_eq!(h.sent().await.len(), 1);
+    let m = tokio::time::timeout(Duration::from_secs(5), pair.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(m.sender, SenderId(format!("wa-non-text:{OWNER}")));
+    let notice = (
+        OWNER.to_string(),
+        "only text messages are supported".to_string(),
+    );
+    assert_eq!(h.sent_texts().await, vec![notice.clone(), notice]);
 }
 
 /// A Graph API that does not answer cannot hold up shutdown: the flush

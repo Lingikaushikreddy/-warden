@@ -681,14 +681,16 @@ impl WhatsAppChannel {
         }
     }
 
-    /// Send queued notices, best effort. A notice is removed before its
-    /// request, so a cancelled flush skips it rather than repeating it.
+    /// Send queued notices, best effort. A notice is removed only after
+    /// its request has finished, so a flush cancelled mid-send (for
+    /// example by [`crate::channel::Pair`] when the other channel delivers
+    /// first) sends it again next time; a notice may then arrive twice.
     async fn flush(&mut self) {
-        while let Some((to, text)) = self.notices.pop_front() {
-            if self.fatal.is_some() {
-                continue;
+        while let Some((to, text)) = self.notices.front().cloned() {
+            if self.fatal.is_none() {
+                let _ = self.deliver(&to, &text).await;
             }
-            let _ = self.deliver(&to, &text).await;
+            self.notices.pop_front();
         }
     }
 
