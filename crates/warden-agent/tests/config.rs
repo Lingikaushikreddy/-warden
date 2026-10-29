@@ -5,8 +5,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use warden_agent::config::{
-    Config, ConfigError, Provider, TelegramConfig, DEFAULT_TELEGRAM_API_BASE,
-    DEFAULT_TELEGRAM_TOKEN_ENV,
+    Config, ConfigError, Provider, TelegramConfig, WhatsAppConfig, DEFAULT_GRAPH_API_BASE,
+    DEFAULT_GRAPH_VERSION, DEFAULT_TELEGRAM_API_BASE, DEFAULT_TELEGRAM_TOKEN_ENV,
+    DEFAULT_WHATSAPP_APP_SECRET_ENV, DEFAULT_WHATSAPP_LISTEN, DEFAULT_WHATSAPP_TOKEN_ENV,
+    DEFAULT_WHATSAPP_VERIFY_TOKEN_ENV,
 };
 
 fn write(dir: &Path, body: &str) -> PathBuf {
@@ -31,6 +33,7 @@ fn defaults_apply() {
             base_url: None,
             api_key_env: "ANTHROPIC_API_KEY".into(),
             telegram: None,
+            whatsapp: None,
         }
     );
 }
@@ -503,4 +506,414 @@ fn bot_token_env_must_differ_from_api_key_env() {
         "root = \"/srv\"\napi_key_env = \"MY_KEY\"\n[telegram]\nowner_ids = [42]\nbot_token_env = \"ANTHROPIC_API_KEY\"\n",
     );
     assert!(Config::load(&p).is_ok());
+}
+
+// ------------------------------------------------- plan 4: [whatsapp]
+
+/// A minimal valid `[whatsapp]` table body.
+const WA_MIN: &str = "owner_numbers = [\"15551234567\"]\nphone_number_id = \"106540352242922\"\n";
+
+fn wa(body: &str) -> Result<Config, ConfigError> {
+    let d = tempfile::tempdir().unwrap();
+    let p = write(d.path(), &format!("root = \"/srv\"\n[whatsapp]\n{body}"));
+    Config::load(&p)
+}
+
+fn load(body: &str) -> Result<Config, ConfigError> {
+    let d = tempfile::tempdir().unwrap();
+    let p = write(d.path(), body);
+    Config::load(&p)
+}
+
+#[test]
+fn whatsapp_table_parses_with_defaults() {
+    let c = wa(WA_MIN).unwrap();
+    let w = c.whatsapp.expect("whatsapp table");
+    assert_eq!(
+        w,
+        WhatsAppConfig {
+            owner_numbers: vec!["15551234567".into()],
+            phone_number_id: "106540352242922".into(),
+            access_token_env: "WARDEN_WHATSAPP_TOKEN".into(),
+            app_secret_env: "WARDEN_WHATSAPP_APP_SECRET".into(),
+            verify_token_env: "WARDEN_WHATSAPP_VERIFY_TOKEN".into(),
+            listen: "127.0.0.1:8097".parse().unwrap(),
+            max_message_age_secs: 120,
+            graph_version: "v26.0".into(),
+            api_base: None,
+        }
+    );
+    assert_eq!(DEFAULT_WHATSAPP_TOKEN_ENV, "WARDEN_WHATSAPP_TOKEN");
+    assert_eq!(
+        DEFAULT_WHATSAPP_APP_SECRET_ENV,
+        "WARDEN_WHATSAPP_APP_SECRET"
+    );
+    assert_eq!(
+        DEFAULT_WHATSAPP_VERIFY_TOKEN_ENV,
+        "WARDEN_WHATSAPP_VERIFY_TOKEN"
+    );
+    assert_eq!(DEFAULT_WHATSAPP_LISTEN, "127.0.0.1:8097");
+    assert_eq!(DEFAULT_GRAPH_VERSION, "v26.0");
+    assert_eq!(DEFAULT_GRAPH_API_BASE, "https://graph.facebook.com");
+    assert_eq!(c.telegram, None);
+    // Every field set.
+    let c = wa(r#"owner_numbers = ["+15551234567", "447700900123"]
+phone_number_id = "1"
+access_token_env = "WA_TOK"
+app_secret_env = "WA_APP"
+verify_token_env = "WA_VER"
+listen = "[::1]:9000"
+max_message_age_secs = 3600
+graph_version = "v27.1"
+api_base = "http://127.0.0.1:9999"
+"#)
+    .unwrap();
+    let w = c.whatsapp.unwrap();
+    assert_eq!(w.owner_numbers, vec!["15551234567", "447700900123"]);
+    assert_eq!(w.phone_number_id, "1");
+    assert_eq!(w.access_token_env, "WA_TOK");
+    assert_eq!(w.app_secret_env, "WA_APP");
+    assert_eq!(w.verify_token_env, "WA_VER");
+    assert_eq!(w.listen, "[::1]:9000".parse().unwrap());
+    assert_eq!(w.max_message_age_secs, 3600);
+    assert_eq!(w.graph_version, "v27.1");
+    assert_eq!(w.api_base.as_deref(), Some("http://127.0.0.1:9999"));
+    // No table: no WhatsApp.
+    assert_eq!(load("root = \"/srv\"\n").unwrap().whatsapp, None);
+}
+
+#[test]
+fn whatsapp_owner_numbers_rules() {
+    const F: &str = "whatsapp.owner_numbers";
+    let pid = "phone_number_id = \"1\"\n";
+    for nums in [
+        "[]".to_string(),
+        format!("[{}]", ["\"15551234567\""; 9].join(", ")),
+        "[\"+1 555 123 4567\"]".to_string(),
+        "[\"+1-555-123-4567\"]".to_string(),
+        "[\"abc\"]".to_string(),
+        "[\"123456\"]".to_string(),
+        "[\"1234567890123456\"]".to_string(),
+        "[\"++15551234567\"]".to_string(),
+        "[\"\"]".to_string(),
+    ] {
+        let e = wa(&format!("owner_numbers = {nums}\n{pid}")).unwrap_err();
+        assert!(matches!(e, ConfigError::Invalid(F, _)), "{nums}: {e:?}");
+        assert!(e.to_string().contains(F), "{e}");
+        assert!(!e.to_string().contains("555"), "{e}");
+    }
+    // Required.
+    let e = wa(pid).unwrap_err();
+    assert!(matches!(e, ConfigError::Invalid(F, _)), "{e:?}");
+    // `+` is stripped; 7 and 15 digits and 8 entries are fine.
+    let c = wa(&format!("owner_numbers = [\"+15551234567\"]\n{pid}")).unwrap();
+    assert_eq!(c.whatsapp.unwrap().owner_numbers, vec!["15551234567"]);
+    let c = wa(&format!(
+        "owner_numbers = [\"1234567\", \"+123456789012345\"]\n{pid}"
+    ))
+    .unwrap();
+    assert_eq!(
+        c.whatsapp.unwrap().owner_numbers,
+        vec!["1234567", "123456789012345"]
+    );
+    let eight = ["\"15551234567\""; 8].join(", ");
+    let c = wa(&format!("owner_numbers = [{eight}]\n{pid}")).unwrap();
+    assert_eq!(c.whatsapp.unwrap().owner_numbers.len(), 8);
+}
+
+#[test]
+fn whatsapp_phone_number_id_required_digits() {
+    const F: &str = "whatsapp.phone_number_id";
+    let owners = "owner_numbers = [\"15551234567\"]\n";
+    let e = wa(owners).unwrap_err();
+    assert!(matches!(e, ConfigError::Invalid(F, _)), "{e:?}");
+    for bad in ["", "12a4", "+123", "1 2", &"1".repeat(33), "../x"] {
+        let e = wa(&format!("{owners}phone_number_id = \"{bad}\"\n")).unwrap_err();
+        assert!(matches!(e, ConfigError::Invalid(F, _)), "{bad:?}: {e:?}");
+    }
+    // An integer is the wrong kind: ids are strings.
+    let e = wa(&format!("{owners}phone_number_id = 123\n")).unwrap_err();
+    assert!(matches!(e, ConfigError::WrongType(F)), "{e:?}");
+    let max = "9".repeat(32);
+    let c = wa(&format!("{owners}phone_number_id = \"{max}\"\n")).unwrap();
+    assert_eq!(c.whatsapp.unwrap().phone_number_id, max);
+}
+
+#[test]
+fn whatsapp_listen_must_be_loopback() {
+    const F: &str = "whatsapp.listen";
+    for bad in [
+        "0.0.0.0:8097",
+        "[::]:8097",
+        "192.168.1.5:8097",
+        "localhost:8097",
+        "[::ffff:127.0.0.1]:8097",
+        "127.0.0.1",
+        "",
+    ] {
+        let e = wa(&format!("{WA_MIN}listen = \"{bad}\"\n")).unwrap_err();
+        assert!(matches!(e, ConfigError::Invalid(F, _)), "{bad:?}: {e:?}");
+        let msg = e.to_string();
+        assert!(msg.contains("loopback"), "{msg}");
+        assert!(msg.contains("tunnel"), "{msg}");
+    }
+    for good in [
+        "127.0.0.1:0",
+        "[::1]:8097",
+        "127.0.0.1:8097",
+        "127.1.2.3:80",
+    ] {
+        let c = wa(&format!("{WA_MIN}listen = \"{good}\"\n")).unwrap();
+        assert_eq!(c.whatsapp.unwrap().listen, good.parse().unwrap());
+    }
+}
+
+#[test]
+fn whatsapp_secret_fields_in_file_are_rejected() {
+    let value = "EAAGm0PX4ZCpsBAKZB0123456789abcdefghijklmnopqrstuvwxyz";
+    for key in [
+        "access_token",
+        "app_secret",
+        "verify_token",
+        "whatsapp_token",
+        "AccessToken",
+        "app-secret",
+    ] {
+        let e = wa(&format!("{WA_MIN}{key} = \"{value}\"\n")).unwrap_err();
+        assert!(matches!(e, ConfigError::SecretInFile(_)), "{key}: {e:?}");
+        let msg = e.to_string();
+        assert!(msg.contains("access_token_env"), "{msg}");
+        assert!(msg.contains("app_secret_env"), "{msg}");
+        assert!(msg.contains("verify_token_env"), "{msg}");
+        assert!(!msg.contains(value), "{msg}");
+        assert!(!msg.contains("EAAG"), "{msg}");
+        assert!(!format!("{e:?}").contains("EAAG"));
+        // Also at the top level, and inside another table.
+        let e = load(&format!("root = \"/srv\"\n{key} = \"{value}\"\n")).unwrap_err();
+        assert!(matches!(e, ConfigError::SecretInFile(_)), "{key}: {e:?}");
+        let e = load(&format!(
+            "root = \"/srv\"\n[telegram]\nowner_ids = [42]\n{key} = \"{value}\"\n"
+        ))
+        .unwrap_err();
+        assert!(matches!(e, ConfigError::SecretInFile(_)), "{key}: {e:?}");
+    }
+}
+
+#[test]
+fn whatsapp_env_names_must_all_differ() {
+    const TOK: &str = "whatsapp.access_token_env";
+    const APP: &str = "whatsapp.app_secret_env";
+    const VER: &str = "whatsapp.verify_token_env";
+    // Every pair among the three: the later field is named.
+    for (body, field) in [
+        ("access_token_env = \"X\"\napp_secret_env = \"X\"\n", APP),
+        ("access_token_env = \"X\"\nverify_token_env = \"X\"\n", VER),
+        ("app_secret_env = \"X\"\nverify_token_env = \"X\"\n", VER),
+        // Against the other field's default.
+        ("app_secret_env = \"WARDEN_WHATSAPP_TOKEN\"\n", APP),
+        ("verify_token_env = \"WARDEN_WHATSAPP_APP_SECRET\"\n", VER),
+    ] {
+        let e = wa(&format!("{WA_MIN}{body}")).unwrap_err();
+        assert!(
+            matches!(e, ConfigError::Invalid(f, _) if f == field),
+            "{body:?}: {e:?}"
+        );
+        assert!(
+            e.to_string()
+                .contains("must name a different environment variable than"),
+            "{e}"
+        );
+    }
+    // Each against the default and a configured `api_key_env`.
+    for field in [TOK, APP, VER] {
+        let name = field.trim_start_matches("whatsapp.");
+        let e = wa(&format!("{WA_MIN}{name} = \"ANTHROPIC_API_KEY\"\n")).unwrap_err();
+        assert!(
+            matches!(e, ConfigError::Invalid(f, _) if f == field),
+            "{e:?}"
+        );
+        assert!(e.to_string().contains("`api_key_env`"), "{e}");
+        let e = load(&format!(
+            "root = \"/srv\"\napi_key_env = \"MY_KEY\"\n[whatsapp]\n{WA_MIN}{name} = \"MY_KEY\"\n"
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(e, ConfigError::Invalid(f, _) if f == field),
+            "{e:?}"
+        );
+        // Each against `[telegram] bot_token_env`, set and default.
+        let e = load(&format!(
+            "root = \"/srv\"\n[telegram]\nowner_ids = [42]\nbot_token_env = \"BOT\"\n[whatsapp]\n{WA_MIN}{name} = \"BOT\"\n"
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(e, ConfigError::Invalid(f, _) if f == field),
+            "{e:?}"
+        );
+        assert!(e.to_string().contains("`telegram.bot_token_env`"), "{e}");
+        let e = load(&format!(
+            "root = \"/srv\"\n[telegram]\nowner_ids = [42]\n[whatsapp]\n{WA_MIN}{name} = \"WARDEN_TELEGRAM_TOKEN\"\n"
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(e, ConfigError::Invalid(f, _) if f == field),
+            "{e:?}"
+        );
+        // Without a [telegram] table the bot token name is free.
+        let c = wa(&format!("{WA_MIN}{name} = \"WARDEN_TELEGRAM_TOKEN\"\n")).unwrap();
+        assert!(c.whatsapp.is_some());
+    }
+    // Each must be a variable name, and is never echoed.
+    for field in [TOK, APP, VER] {
+        let name = field.trim_start_matches("whatsapp.");
+        for bad in ["", "1ABC", "A B", "AKIAIOSFODNN7EXAMPLE"] {
+            let e = wa(&format!("{WA_MIN}{name} = \"{bad}\"\n")).unwrap_err();
+            assert!(
+                matches!(e, ConfigError::Invalid(f, _) if f == field),
+                "{bad:?}: {e:?}"
+            );
+            assert!(!e.to_string().contains("AKIA"), "{e}");
+        }
+        let e = wa(&format!("{WA_MIN}{name} = 5\n")).unwrap_err();
+        assert!(
+            matches!(e, ConfigError::WrongType(f) if f == field),
+            "{e:?}"
+        );
+    }
+}
+
+#[test]
+fn whatsapp_graph_version_shape() {
+    const F: &str = "whatsapp.graph_version";
+    for bad in [
+        "23.0",
+        "v23",
+        "v26.0/../x",
+        "v1234.0",
+        "v1.123",
+        "V26.0",
+        "",
+    ] {
+        let e = wa(&format!("{WA_MIN}graph_version = \"{bad}\"\n")).unwrap_err();
+        assert!(matches!(e, ConfigError::Invalid(F, _)), "{bad:?}: {e:?}");
+        assert!(bad.is_empty() || !e.to_string().contains(bad), "{e}");
+    }
+    let e = wa(&format!("{WA_MIN}graph_version = 26\n")).unwrap_err();
+    assert!(matches!(e, ConfigError::WrongType(F)), "{e:?}");
+    for good in ["v1.0", "v26.0", "v999.99"] {
+        let c = wa(&format!("{WA_MIN}graph_version = \"{good}\"\n")).unwrap();
+        assert_eq!(c.whatsapp.unwrap().graph_version, good);
+    }
+}
+
+#[test]
+fn unknown_whatsapp_field_is_rejected() {
+    let e = wa(&format!("{WA_MIN}owner_number = \"1\"\n")).unwrap_err();
+    assert!(matches!(e, ConfigError::UnknownField(_)), "{e:?}");
+    assert!(
+        e.to_string()
+            .contains("unknown field `whatsapp.owner_number`"),
+        "{e}"
+    );
+    // A Telegram-only field is unknown here.
+    let e = wa(&format!("{WA_MIN}allow_pin_approvals = false\n")).unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("unknown field `whatsapp.allow_pin_approvals`"),
+        "{e}"
+    );
+}
+
+#[test]
+fn both_channel_tables_parse_together() {
+    let c = load(&format!(
+        "root = \"/srv\"\n[telegram]\nowner_ids = [42]\n[whatsapp]\n{WA_MIN}"
+    ))
+    .unwrap();
+    assert_eq!(c.telegram.unwrap().owner_ids, vec![42]);
+    assert_eq!(c.whatsapp.unwrap().owner_numbers, vec!["15551234567"]);
+    // Order in the file does not matter.
+    let c = load(&format!(
+        "root = \"/srv\"\n[whatsapp]\n{WA_MIN}[telegram]\nowner_ids = [42]\n"
+    ))
+    .unwrap();
+    assert!(c.telegram.is_some() && c.whatsapp.is_some());
+}
+
+#[test]
+fn third_nested_table_still_rejected() {
+    for body in [
+        format!(
+            "root = \"/srv\"\n[telegram]\nowner_ids = [42]\n[whatsapp]\n{WA_MIN}[slack]\nx = 1\n"
+        ),
+        format!("root = \"/srv\"\n[whatsapp]\n{WA_MIN}[whatsapp.inner]\nx = 1\n"),
+        format!("root = \"/srv\"\n[[whatsapp]]\n{WA_MIN}"),
+        "root = \"/srv\"\nwhatsapp = \"on\"\n".to_string(),
+    ] {
+        assert!(load(&body).is_err(), "{body:?}");
+    }
+    let e = load(&format!(
+        "root = \"/srv\"\n[whatsapp]\n{WA_MIN}[slack]\nx = 1\n"
+    ))
+    .unwrap_err();
+    assert!(e.to_string().contains("unknown field `slack`"), "{e}");
+    let e = load("root = \"/srv\"\nwhatsapp = \"on\"\n").unwrap_err();
+    assert!(
+        matches!(e, ConfigError::WrongKind("whatsapp", "a table")),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn whatsapp_max_message_age_out_of_range_is_invalid() {
+    for v in [9, 3601, 0, -1] {
+        let e = wa(&format!("{WA_MIN}max_message_age_secs = {v}\n")).unwrap_err();
+        assert!(
+            matches!(e, ConfigError::Invalid("whatsapp.max_message_age_secs", _)),
+            "{v}: {e:?}"
+        );
+    }
+    for v in [10, 3600] {
+        let c = wa(&format!("{WA_MIN}max_message_age_secs = {v}\n")).unwrap();
+        assert_eq!(c.whatsapp.unwrap().max_message_age_secs, v);
+    }
+}
+
+#[test]
+fn whatsapp_wrong_kinds_are_named() {
+    let pid = "phone_number_id = \"1\"\n";
+    for body in [
+        format!("owner_numbers = \"155\"\n{pid}"),
+        format!("owner_numbers = [155]\n{pid}"),
+    ] {
+        let e = wa(&body).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                ConfigError::WrongKind("whatsapp.owner_numbers", "a list of strings")
+            ),
+            "{body:?}: {e:?}"
+        );
+        assert!(e.to_string().contains("whatsapp.owner_numbers"), "{e}");
+        assert!(!e.to_string().contains("155"), "{e}");
+    }
+    let e = wa(&format!("{WA_MIN}listen = 8097\n")).unwrap_err();
+    assert!(
+        matches!(e, ConfigError::WrongType("whatsapp.listen")),
+        "{e:?}"
+    );
+    assert!(!e.to_string().contains("8097"), "{e}");
+    let e = wa(&format!("{WA_MIN}max_message_age_secs = \"60\"\n")).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            ConfigError::WrongKind("whatsapp.max_message_age_secs", "an integer")
+        ),
+        "{e:?}"
+    );
+    let e = wa(&format!("{WA_MIN}api_base = 5\n")).unwrap_err();
+    assert!(
+        matches!(e, ConfigError::WrongType("whatsapp.api_base")),
+        "{e:?}"
+    );
 }

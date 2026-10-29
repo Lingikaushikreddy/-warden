@@ -1336,3 +1336,53 @@ fn telegram_token_in_bot_api_url_is_redacted() {
         "a/bot[REDACTED:api_key]/sendMessage b/file/bot[REDACTED:api_key]/doc.pdf"
     );
 }
+
+#[test]
+fn meta_access_token_is_redacted() {
+    // A Meta (WhatsApp Cloud API) access token: `EAA` then a long
+    // alphanumeric run; real ones are about 150-250 chars.
+    let tail: String = "Zx9Qm2Lk7Vb4Np1Rt8Ws5Yd3Hf6Jg0Ca"
+        .chars()
+        .cycle()
+        .take(150)
+        .collect();
+    let tok = format!("EAAG{tail}");
+    let (r, rep) = redact(&tok);
+    assert_eq!(r.as_str(), "[REDACTED:api_key]");
+    assert_eq!(rep.kinds, vec!["api_key"]);
+    assert_eq!(rep.count, 1);
+    assert_eq!(out(&format!("key {tok} end")), "key [REDACTED:api_key] end");
+    // After `token=`.
+    let r = out(&format!("token={tok}"));
+    assert_eq!(r, "token=[REDACTED:api_key]");
+    // In JSON, under a non-secret key.
+    let r = out(&format!(r#"{{"note":"{tok}"}}"#));
+    assert_eq!(r, r#"{"note":"[REDACTED:api_key]"}"#);
+    let (v, _) = redact_json(&json!({ "note": tok }));
+    assert_eq!(v, json!({ "note": "[REDACTED:api_key]" }));
+    // The shortest length matched: `EAA` + 40.
+    let min = format!("EAA{}", &tail[..40]);
+    assert_eq!(out(&min), "[REDACTED:api_key]");
+    // Idempotent.
+    let once = out(&format!("a {tok} b"));
+    assert_eq!(out(&once), once);
+}
+
+#[test]
+fn eaa_prefix_words_are_not_redacted() {
+    let tail: String = "Zx9Qm2Lk7Vb4Np1Rt8Ws5Yd3Hf6Jg0Ca"
+        .chars()
+        .cycle()
+        .take(60)
+        .collect();
+    for line in [
+        "EAAS".to_string(),
+        "the EAAS acronym".to_string(),
+        format!("EAA{}", &tail[..39]),
+        format!("x EAA{} y", &tail[..39]),
+        format!("xEAA{tail}"),
+        format!("x 1EAA{tail}"),
+    ] {
+        assert_eq!(out(&line), line, "{line}");
+    }
+}

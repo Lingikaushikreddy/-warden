@@ -81,8 +81,9 @@
 //! `sk-ant-<letters><2 digits>-...`) match anywhere, even mid-word, so chains
 //! of keys are caught. The variable-length ones that also occur inside
 //! ordinary words (`sk-`, `sk_/rk_live_/test_`, `hf_`, `glpat-`, `xapp-`,
-//! `xox?-`, `github_pat_`, and Telegram bot tokens
-//! `<8-10 digits>:<35 chars>`) need a left boundary: start of text or a char
+//! `xox?-`, `github_pat_`, Telegram bot tokens
+//! `<8-10 digits>:<35 chars>`, and Meta access tokens `EAA` + 40 or more
+//! letters and digits) need a left boundary: start of text or a char
 //! that is not a letter or digit (`_`, `-`, quotes, `=`, `(` all count), so
 //! `risk-assessment-for-the-quarter` and `network_test_connectivitycheck`
 //! are left alone. A bounded key glued to an unbounded one
@@ -286,6 +287,8 @@ fn build_patterns() -> Patterns {
             r"|xox[abprs]-[A-Za-z0-9-]{10,}",
             r"|github_pat_[A-Za-z0-9_]{22,}",
             r"|[0-9]{8,10}:[A-Za-z0-9_-]{35}",
+            // A Meta (WhatsApp Cloud API) access token.
+            r"|EAA[A-Za-z0-9]{40,}",
             r")",
             r"|sk-ant-[a-z]+[0-9]{2}-[A-Za-z0-9_-]{16,}",
             r"|gh[pousr]_[A-Za-z0-9]{36}",

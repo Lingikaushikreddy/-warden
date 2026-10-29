@@ -14,23 +14,43 @@
 //! allow_pin_approvals = false    # default
 //! max_message_age_secs = 120     # default, 10-3600
 //! # api_base = "https://api.telegram.org"   # default when unset
+//!
+//! [whatsapp]                     # optional; enables the WhatsApp channel
+//! owner_numbers = ["+15551234567"]   # required, 1-8 E.164 numbers
+//! phone_number_id = "106540352242922" # required, the Cloud API sender id
+//! access_token_env = "WARDEN_WHATSAPP_TOKEN"            # default
+//! app_secret_env = "WARDEN_WHATSAPP_APP_SECRET"         # default
+//! verify_token_env = "WARDEN_WHATSAPP_VERIFY_TOKEN"     # default
+//! listen = "127.0.0.1:8097"      # default; loopback only
+//! max_message_age_secs = 120     # default, 10-3600
+//! graph_version = "v26.0"        # default
+//! # api_base = "https://graph.facebook.com" # default when unset
 //! ```
 //!
 //! Rules (all fail closed):
 //!
 //! - **No secrets in the file.** A key named `api_key`, `apikey`, `key`,
-//!   `token`, `secret`, `password`, `bot_token`, `telegram_token` or
-//!   `telegram_bot_token` (any case, `-` or `_` ignored, at any depth) is
+//!   `token`, `secret`, `password`, `bot_token`, `telegram_token`,
+//!   `telegram_bot_token`, `access_token`, `app_secret`, `verify_token` or
+//!   `whatsapp_token` (any case, `-` or `_` ignored, at any depth) is
 //!   refused: the API key comes from the environment variable named by
-//!   `api_key_env`, and the Telegram bot token from the one named by
-//!   `[telegram] bot_token_env`, never from the file.
+//!   `api_key_env`, the Telegram bot token from the one named by
+//!   `[telegram] bot_token_env`, and the WhatsApp secrets from the ones
+//!   named by `[whatsapp] access_token_env`, `app_secret_env` and
+//!   `verify_token_env`, never from the file.
+//! - **Secret variables are distinct.** `api_key_env`, `[telegram]
+//!   bot_token_env` and the three `[whatsapp]` `*_env` names must all name
+//!   different environment variables.
 //! - **No values in errors.** [`ConfigError`] names fields, lines and the
 //!   file path, never a value from the file (a TOML parse error reports its
 //!   line only, because toml's own message quotes the source).
 //! - **`root` is required** and must be absolute; there is no default, so
 //!   the agent never falls back to `$HOME` or `/`.
-//! - Unknown fields are refused. The only nested table is `[telegram]`;
-//!   any other is refused. Top-level fields are strings.
+//! - Unknown fields are refused. The only nested tables are `[telegram]`
+//!   and `[whatsapp]`; any other is refused. Top-level fields are strings.
+//! - **`[whatsapp] listen` is loopback only** (`127.0.0.0/8` or `::1`, as
+//!   an IP and port: no host names). Warden never opens a public port; the
+//!   owner exposes it through their own tunnel.
 //! - The file must be a regular file (symlinks are followed; it is opened
 //!   with `O_NONBLOCK` and checked through the handle, so a FIFO is refused
 //!   instead of hanging) that is not writable by group or others, and at
@@ -59,16 +79,30 @@ pub const DEFAULT_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 pub const DEFAULT_TELEGRAM_TOKEN_ENV: &str = "WARDEN_TELEGRAM_TOKEN";
 /// Default Telegram Bot API base URL.
 pub const DEFAULT_TELEGRAM_API_BASE: &str = "https://api.telegram.org";
-/// Default `[telegram] max_message_age_secs`.
+/// Default environment variable holding the WhatsApp Cloud API access token.
+pub const DEFAULT_WHATSAPP_TOKEN_ENV: &str = "WARDEN_WHATSAPP_TOKEN";
+/// Default environment variable holding the Meta app secret (webhook HMAC key).
+pub const DEFAULT_WHATSAPP_APP_SECRET_ENV: &str = "WARDEN_WHATSAPP_APP_SECRET";
+/// Default environment variable holding the webhook verify token.
+pub const DEFAULT_WHATSAPP_VERIFY_TOKEN_ENV: &str = "WARDEN_WHATSAPP_VERIFY_TOKEN";
+/// Default `[whatsapp] listen`: loopback only.
+pub const DEFAULT_WHATSAPP_LISTEN: &str = "127.0.0.1:8097";
+/// Default Graph API version. Must be bumped as Meta retires versions.
+pub const DEFAULT_GRAPH_VERSION: &str = "v26.0";
+/// Default Graph API base URL.
+pub const DEFAULT_GRAPH_API_BASE: &str = "https://graph.facebook.com";
+/// Default `[telegram]` and `[whatsapp]` `max_message_age_secs`.
 const DEFAULT_MAX_MESSAGE_AGE_SECS: u64 = 120;
-/// Most `[telegram] owner_ids`.
+/// Most `[telegram] owner_ids`, and most `[whatsapp] owner_numbers`.
 const MAX_OWNER_IDS: usize = 8;
+/// Longest `[whatsapp] phone_number_id`, in digits.
+const MAX_PHONE_NUMBER_ID_DIGITS: usize = 32;
 /// Largest owner id accepted (2^52; Telegram user ids fit in 52 bits).
 const MAX_OWNER_ID: i64 = 1 << 52;
 /// Largest config file accepted, in bytes.
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 /// Key names (lowercased, `-` and `_` removed) that would hold a secret.
-const SECRET_KEYS: [&str; 8] = [
+const SECRET_KEYS: [&str; 12] = [
     "apikey",
     "key",
     "token",
@@ -77,6 +111,10 @@ const SECRET_KEYS: [&str; 8] = [
     "bottoken",
     "telegramtoken",
     "telegrambottoken",
+    "accesstoken",
+    "appsecret",
+    "verifytoken",
+    "whatsapptoken",
 ];
 
 /// Which planner the agent talks to.
@@ -104,6 +142,8 @@ pub struct Config {
     pub api_key_env: String,
     /// The `[telegram]` table; `None` when absent.
     pub telegram: Option<TelegramConfig>,
+    /// The `[whatsapp]` table; `None` when absent.
+    pub whatsapp: Option<WhatsAppConfig>,
 }
 
 /// The `[telegram]` table. Holds no secrets: the bot token is read from the
@@ -119,6 +159,30 @@ pub struct TelegramConfig {
     /// Messages older than this (by Telegram's `date`) are never acted on.
     pub max_message_age_secs: u64,
     /// `None` means [`DEFAULT_TELEGRAM_API_BASE`].
+    pub api_base: Option<String>,
+}
+
+/// The `[whatsapp]` table. Holds no secrets: the access token, app secret
+/// and verify token are read from the environment variables it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhatsAppConfig {
+    /// Allowlisted owner numbers (1-8), digits only (E.164 without `+`).
+    pub owner_numbers: Vec<String>,
+    /// The Cloud API phone number id that sends and receives (1-32 digits).
+    pub phone_number_id: String,
+    /// Name of the environment variable holding the access token.
+    pub access_token_env: String,
+    /// Name of the environment variable holding the app secret.
+    pub app_secret_env: String,
+    /// Name of the environment variable holding the webhook verify token.
+    pub verify_token_env: String,
+    /// Webhook listener address; always a loopback IP.
+    pub listen: std::net::SocketAddr,
+    /// Messages older than this (by WhatsApp's `timestamp`) are never acted on.
+    pub max_message_age_secs: u64,
+    /// Graph API version path segment, `v<major>.<minor>`.
+    pub graph_version: String,
+    /// `None` means [`DEFAULT_GRAPH_API_BASE`].
     pub api_base: Option<String>,
 }
 
@@ -183,9 +247,12 @@ impl fmt::Display for ConfigError {
                 f,
                 "config field `{k}` looks like a secret; secrets must not be stored in the \
                  config file: remove it and put the API key in the environment variable named \
-                 by `api_key_env` (default {DEFAULT_API_KEY_ENV}), or the Telegram bot token in \
+                 by `api_key_env` (default {DEFAULT_API_KEY_ENV}), the Telegram bot token in \
                  the one named by `[telegram] bot_token_env` (default \
-                 {DEFAULT_TELEGRAM_TOKEN_ENV})"
+                 {DEFAULT_TELEGRAM_TOKEN_ENV}), or the WhatsApp secrets in the ones named by \
+                 `[whatsapp] access_token_env`, `app_secret_env` and `verify_token_env` \
+                 (defaults {DEFAULT_WHATSAPP_TOKEN_ENV}, {DEFAULT_WHATSAPP_APP_SECRET_ENV}, \
+                 {DEFAULT_WHATSAPP_VERIFY_TOKEN_ENV})"
             ),
             ConfigError::UnknownField(k) => write!(f, "unknown field `{k}` in config file"),
             ConfigError::WrongType(k) => write!(f, "config field `{k}` must be a string"),
@@ -242,6 +309,19 @@ const TELEGRAM_FIELDS: [(&str, &str); 5] = [
     ("allow_pin_approvals", "telegram.allow_pin_approvals"),
     ("max_message_age_secs", "telegram.max_message_age_secs"),
     ("api_base", "telegram.api_base"),
+];
+
+/// Every field the `[whatsapp]` table accepts.
+const WHATSAPP_FIELDS: [&str; 9] = [
+    "owner_numbers",
+    "phone_number_id",
+    "access_token_env",
+    "app_secret_env",
+    "verify_token_env",
+    "listen",
+    "max_message_age_secs",
+    "graph_version",
+    "api_base",
 ];
 
 /// A key name safe to show: `[A-Za-z0-9_-]`, at most 64 characters.
@@ -408,6 +488,219 @@ fn telegram(t: &toml::Table, api_key_env: &str) -> Result<TelegramConfig, Config
     })
 }
 
+/// The error for an env name that repeats `other`, a field already taken.
+fn same_env_as(field: &'static str, other: &'static str) -> ConfigError {
+    let why = match other {
+        "api_key_env" => "must name a different environment variable than `api_key_env`",
+        "telegram.bot_token_env" => {
+            "must name a different environment variable than `telegram.bot_token_env`"
+        }
+        "whatsapp.access_token_env" => {
+            "must name a different environment variable than `whatsapp.access_token_env`"
+        }
+        "whatsapp.app_secret_env" => {
+            "must name a different environment variable than `whatsapp.app_secret_env`"
+        }
+        _ => "must name a different environment variable than the other secret variables",
+    };
+    ConfigError::Invalid(field, why)
+}
+
+/// One `[whatsapp]` `*_env` field: default, string, variable name, and
+/// different from every name in `taken`, which it then joins.
+fn whatsapp_env(
+    t: &toml::Table,
+    key: &str,
+    field: &'static str,
+    default: &str,
+    taken: &mut Vec<(&'static str, String)>,
+) -> Result<String, ConfigError> {
+    let name = match t.get(key) {
+        None => default.to_string(),
+        Some(toml::Value::String(s)) => s.clone(),
+        Some(_) => return Err(ConfigError::WrongType(field)),
+    };
+    check_env_name(field, &name)?;
+    if let Some((other, _)) = taken.iter().find(|(_, n)| *n == name) {
+        return Err(same_env_as(field, other));
+    }
+    taken.push((field, name.clone()));
+    Ok(name)
+}
+
+/// `v<1-3 digits>.<1-2 digits>`, a Graph API version path segment.
+fn valid_graph_version(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix('v') else {
+        return false;
+    };
+    let Some((major, minor)) = rest.split_once('.') else {
+        return false;
+    };
+    let digits = |p: &str, max: usize| {
+        !p.is_empty() && p.len() <= max && p.bytes().all(|b| b.is_ascii_digit())
+    };
+    digits(major, 3) && digits(minor, 2)
+}
+
+/// Parse the `[whatsapp]` table. Secret-looking keys were refused before.
+/// `taken` holds the secret variable names already in use (`api_key_env`
+/// and, if present, `[telegram] bot_token_env`), which the three WhatsApp
+/// names must differ from, as they must from each other.
+fn whatsapp(
+    t: &toml::Table,
+    taken: &[(&'static str, &str)],
+) -> Result<WhatsAppConfig, ConfigError> {
+    for k in t.keys() {
+        if !WHATSAPP_FIELDS.contains(&k.as_str()) {
+            return Err(ConfigError::UnknownField(format!(
+                "whatsapp.{}",
+                shown_key(k)
+            )));
+        }
+    }
+    const NUMS: &str = "whatsapp.owner_numbers";
+    const PID: &str = "whatsapp.phone_number_id";
+    const LISTEN: &str = "whatsapp.listen";
+    const AGE: &str = "whatsapp.max_message_age_secs";
+    const VER: &str = "whatsapp.graph_version";
+    const BASE: &str = "whatsapp.api_base";
+
+    let owner_numbers = match t.get("owner_numbers") {
+        None => {
+            return Err(ConfigError::Invalid(
+                NUMS,
+                "is required: the WhatsApp numbers (E.164) allowed to use the agent",
+            ))
+        }
+        Some(toml::Value::Array(items)) => items
+            .iter()
+            .map(|i| {
+                i.as_str()
+                    .ok_or(ConfigError::WrongKind(NUMS, "a list of strings"))
+            })
+            .collect::<Result<Vec<&str>, ConfigError>>()?,
+        Some(_) => return Err(ConfigError::WrongKind(NUMS, "a list of strings")),
+    };
+    if owner_numbers.is_empty() || owner_numbers.len() > MAX_OWNER_IDS {
+        return Err(ConfigError::Invalid(NUMS, "must list 1 to 8 numbers"));
+    }
+    let owner_numbers = owner_numbers
+        .into_iter()
+        .map(|n| {
+            let d = n.strip_prefix('+').unwrap_or(n);
+            if (7..=15).contains(&d.len()) && d.bytes().all(|b| b.is_ascii_digit()) {
+                Ok(d.to_string())
+            } else {
+                Err(ConfigError::Invalid(
+                    NUMS,
+                    "must hold E.164 numbers: an optional `+` then 7-15 digits, \
+                     no spaces or dashes",
+                ))
+            }
+        })
+        .collect::<Result<Vec<String>, ConfigError>>()?;
+
+    let phone_number_id = match t.get("phone_number_id") {
+        None => {
+            return Err(ConfigError::Invalid(
+                PID,
+                "is required: the Cloud API phone number id, as a string of digits",
+            ))
+        }
+        Some(toml::Value::String(s)) => s.clone(),
+        Some(_) => return Err(ConfigError::WrongType(PID)),
+    };
+    if phone_number_id.is_empty()
+        || phone_number_id.len() > MAX_PHONE_NUMBER_ID_DIGITS
+        || !phone_number_id.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(ConfigError::Invalid(PID, "must be 1-32 digits"));
+    }
+
+    let mut names: Vec<(&'static str, String)> =
+        taken.iter().map(|(f, n)| (*f, n.to_string())).collect();
+    let access_token_env = whatsapp_env(
+        t,
+        "access_token_env",
+        "whatsapp.access_token_env",
+        DEFAULT_WHATSAPP_TOKEN_ENV,
+        &mut names,
+    )?;
+    let app_secret_env = whatsapp_env(
+        t,
+        "app_secret_env",
+        "whatsapp.app_secret_env",
+        DEFAULT_WHATSAPP_APP_SECRET_ENV,
+        &mut names,
+    )?;
+    let verify_token_env = whatsapp_env(
+        t,
+        "verify_token_env",
+        "whatsapp.verify_token_env",
+        DEFAULT_WHATSAPP_VERIFY_TOKEN_ENV,
+        &mut names,
+    )?;
+
+    let listen = match t.get("listen") {
+        None => DEFAULT_WHATSAPP_LISTEN.to_string(),
+        Some(toml::Value::String(s)) => s.clone(),
+        Some(_) => return Err(ConfigError::WrongType(LISTEN)),
+    };
+    // A `SocketAddr` is an IP and a port, so host names never parse.
+    // `::ffff:127.0.0.1` is not loopback to `Ipv6Addr::is_loopback`.
+    let listen = match listen.parse::<std::net::SocketAddr>() {
+        Ok(a) if a.ip().is_loopback() => a,
+        _ => return Err(ConfigError::Invalid(
+            LISTEN,
+            "must be a loopback address such as 127.0.0.1:8097; expose it through your own tunnel",
+        )),
+    };
+
+    let max_message_age_secs = match t.get("max_message_age_secs") {
+        None => DEFAULT_MAX_MESSAGE_AGE_SECS,
+        Some(toml::Value::Integer(n)) => match u64::try_from(*n) {
+            Ok(n) if (10..=3600).contains(&n) => n,
+            _ => {
+                return Err(ConfigError::Invalid(
+                    AGE,
+                    "must be between 10 and 3600 seconds",
+                ))
+            }
+        },
+        Some(_) => return Err(ConfigError::WrongKind(AGE, "an integer")),
+    };
+
+    let graph_version = match t.get("graph_version") {
+        None => DEFAULT_GRAPH_VERSION.to_string(),
+        Some(toml::Value::String(s)) => s.clone(),
+        Some(_) => return Err(ConfigError::WrongType(VER)),
+    };
+    if !valid_graph_version(&graph_version) {
+        return Err(ConfigError::Invalid(
+            VER,
+            "must be a Graph API version such as v26.0",
+        ));
+    }
+
+    let api_base = match t.get("api_base") {
+        None => None,
+        Some(toml::Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(ConfigError::WrongType(BASE)),
+    };
+
+    Ok(WhatsAppConfig {
+        owner_numbers,
+        phone_number_id,
+        access_token_env,
+        app_secret_env,
+        verify_token_env,
+        listen,
+        max_message_age_secs,
+        graph_version,
+        api_base,
+    })
+}
+
 /// `[A-Za-z0-9._@:-]{1,64}` and left unchanged by the redactor, so it is
 /// safe to show (banner, logs) and cannot be a pasted secret.
 fn valid_owner(s: &str) -> bool {
@@ -475,11 +768,16 @@ impl Config {
         if let Some(k) = find_secret_key(&table) {
             return Err(ConfigError::SecretInFile(k));
         }
-        // The one nested table. Taken out before the string-only checks.
+        // The nested tables. Taken out before the string-only checks.
         let telegram = match table.remove("telegram") {
             None => None,
             Some(toml::Value::Table(t)) => Some(t),
             Some(_) => return Err(ConfigError::WrongKind("telegram", "a table")),
+        };
+        let whatsapp = match table.remove("whatsapp") {
+            None => None,
+            Some(toml::Value::Table(t)) => Some(t),
+            Some(_) => return Err(ConfigError::WrongKind("whatsapp", "a table")),
         };
         let known = known_fields();
         for (k, v) in &table {
@@ -499,6 +797,15 @@ impl Config {
             .as_ref()
             .map(|t| self::telegram(t, &config.api_key_env))
             .transpose()?;
+        let mut taken: Vec<(&'static str, &str)> = vec![("api_key_env", &config.api_key_env)];
+        if let Some(tg) = &config.telegram {
+            taken.push(("telegram.bot_token_env", &tg.bot_token_env));
+        }
+        let whatsapp = whatsapp
+            .as_ref()
+            .map(|t| self::whatsapp(t, &taken))
+            .transpose()?;
+        config.whatsapp = whatsapp;
         Ok(config)
     }
 
@@ -531,6 +838,7 @@ impl Config {
             base_url: raw.base_url,
             api_key_env,
             telegram: None,
+            whatsapp: None,
         })
     }
 }
@@ -575,6 +883,15 @@ mod tests {
             assert!(is_secret_key(k), "{k}");
         }
         for k in [
+            "access_token",
+            "APP_SECRET",
+            "verify-token",
+            "whatsapp_token",
+            "AccessToken",
+        ] {
+            assert!(is_secret_key(k), "{k}");
+        }
+        for k in [
             "api_key_env",
             "root",
             "model",
@@ -582,6 +899,11 @@ mod tests {
             "base_url",
             "bot_token_env",
             "owner_ids",
+            "access_token_env",
+            "app_secret_env",
+            "verify_token_env",
+            "phone_number_id",
+            "owner_numbers",
         ] {
             assert!(!is_secret_key(k), "{k}");
         }
