@@ -342,6 +342,9 @@ async fn run<P: Planner, C: Channel>(
                 Some(()) = sigint.recv() => on_signal(&mut signalled),
                 Some(()) = sigterm.recv() => on_signal(&mut signalled),
                 () = slot.notify.notified() => {
+                    // A fatal Telegram error: stop, and treat any later
+                    // signal as a repeat.
+                    signalled = true;
                     tx.send_replace(true);
                 }
             }

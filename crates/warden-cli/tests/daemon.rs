@@ -52,11 +52,11 @@ impl Log {
     }
 }
 
-/// `getUpdates`: queued batches first, then an empty batch after 100 ms
+/// `getUpdates`: queued responses first, then an empty batch after 100 ms
 /// (an idle long poll). Every request body is recorded.
 #[derive(Clone, Default)]
 struct Updates {
-    queue: Arc<Mutex<VecDeque<Vec<Value>>>>,
+    queue: Arc<Mutex<VecDeque<ResponseTemplate>>>,
     polls: Log,
 }
 
@@ -65,14 +65,11 @@ impl Respond for Updates {
         if let Ok(v) = serde_json::from_slice::<Value>(&req.body) {
             self.polls.0.lock().unwrap().push(v);
         }
-        match self.queue.lock().unwrap().pop_front() {
-            Some(batch) => {
-                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": batch}))
-            }
-            None => ResponseTemplate::new(200)
+        self.queue.lock().unwrap().pop_front().unwrap_or_else(|| {
+            ResponseTemplate::new(200)
                 .set_body_json(json!({"ok": true, "result": []}))
-                .set_delay(Duration::from_millis(100)),
-        }
+                .set_delay(Duration::from_millis(100))
+        })
     }
 }
 
@@ -166,7 +163,14 @@ impl Tg {
     }
 
     fn push(&self, batch: Vec<Value>) {
-        self.updates.queue.lock().unwrap().push_back(batch);
+        self.push_response(
+            ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": batch})),
+        );
+    }
+
+    /// Queue a raw `getUpdates` response (an error, say).
+    fn push_response(&self, r: ResponseTemplate) {
+        self.updates.queue.lock().unwrap().push_back(r);
     }
 
     /// Texts sent to `chat`.
@@ -764,6 +768,71 @@ fn token_rejected_by_telegram_exits_1() {
     assert_eq!(o.status.code(), Some(1), "{se}");
     assert!(se.contains("Telegram rejected the bot token"), "{se}");
     assert_eq!(home_listing(&e.home), vec!["daemon.lock".to_string()]);
+    assert_token_absent(&e, &String::from_utf8_lossy(&o.stdout), &se);
+}
+
+#[test]
+fn revoked_token_404_on_get_me_exits_1() {
+    let e = Env::new();
+    let tg = Tg::start_with_get_me(ResponseTemplate::new(404).set_body_json(json!({
+        "ok": false, "error_code": 404, "description": "Not Found"
+    })));
+    e.mock(&tg.base(), json!([]));
+    let o = e.daemon_cmd().output().unwrap();
+    let se = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert_eq!(o.status.code(), Some(1), "{se}");
+    assert!(se.contains("Telegram rejected the bot token"), "{se}");
+    assert_eq!(home_listing(&e.home), vec!["daemon.lock".to_string()]);
+    assert_token_absent(&e, &String::from_utf8_lossy(&o.stdout), &se);
+}
+
+#[test]
+fn unreachable_telegram_exits_1_naming_the_kind() {
+    let e = Env::new();
+    // A loopback port nobody listens on.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    e.mock(&format!("http://127.0.0.1:{port}"), json!([]));
+    let o = e.daemon_cmd().output().unwrap();
+    let se = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert_eq!(o.status.code(), Some(1), "{se}");
+    assert!(se.contains("cannot reach Telegram (connect)"), "{se}");
+    assert_eq!(home_listing(&e.home), vec!["daemon.lock".to_string()]);
+    assert_token_absent(&e, &String::from_utf8_lossy(&o.stdout), &se);
+}
+
+/// Run a daemon whose first `getUpdates` answers `code`; it must exit 1
+/// with `fatal` on stderr after auditing the session end.
+fn fatal_mid_run(code: u16, fatal: &str) {
+    let e = Env::new();
+    let tg = Tg::start();
+    e.mock(&tg.base(), json!([]));
+    tg.push_response(ResponseTemplate::new(code).set_body_json(json!({
+        "ok": false, "error_code": code, "description": "x"
+    })));
+    let mut d = e.spawn();
+    d.ready();
+    assert_eq!(d.wait_exit(), 1, "{}", d.stderr());
+    let se = d.stderr();
+    assert!(se.contains(&format!("error: {fatal}")), "{se}");
+    assert_eq!(
+        e.decisions().last().map(String::as_str),
+        Some("daemon session ended"),
+        "{}",
+        e.audit_text()
+    );
+    assert_token_absent(&e, &d.stdout(), &se);
+}
+
+#[test]
+fn telegram_fatal_mid_run_exits_1() {
+    fatal_mid_run(
+        409,
+        "another program is receiving updates for this bot (Telegram 409 conflict)",
+    );
+    fatal_mid_run(401, "Telegram rejected the bot token");
 }
 
 /// Every regular file under `dir`, recursively.
@@ -892,4 +961,21 @@ fn warden_undo_works_while_the_daemon_is_idle() {
     e.warden().args(["audit", "verify"]).assert().success();
     // The deleteMessage log exists for PIN-shaped replies only; none here.
     assert!(tg.deleted.all().is_empty(), "{:?}", tg.deleted.all());
+}
+
+/// Neither the token nor its secret half is in `stdout`, `stderr` or any
+/// file under the data dir.
+fn assert_token_absent(e: &Env, stdout: &str, stderr: &str) {
+    for needle in [TOKEN, TOKEN_SECRET] {
+        assert!(!stdout.contains(needle), "stdout: {stdout}");
+        assert!(!stderr.contains(needle), "stderr: {stderr}");
+    }
+    let mut files = Vec::new();
+    files_under(&e.home, &mut files);
+    for f in files {
+        let text = String::from_utf8_lossy(&fs::read(&f).unwrap()).into_owned();
+        for needle in [TOKEN, TOKEN_SECRET] {
+            assert!(!text.contains(needle), "{} holds the token", f.display());
+        }
+    }
 }

@@ -1,12 +1,14 @@
 //! Startup shared by `warden agent` and `warden daemon`.
 //!
 //! Every step fails closed: it prints a message to stderr and returns exit
-//! code 1 before anything is executed. [`prepare`] and the planner key have
+//! code 1 before anything is executed. Steps 1-3 and the planner key have
 //! no side effects beyond creating the data dir, so a bad config, root or
 //! missing key leaves no audit log, approver key or snapshot store behind.
 //!
-//! - [`prepare`]: the data dir ([`check_home`]), the config
-//!   ([`load_config`]) and the root ([`resolve_root`]);
+//! - steps 1-3, which each command calls in its own order (the daemon takes
+//!   its lock between the first two): the data dir ([`check_home`]), the
+//!   config ([`load_config`]) and the root ([`resolve_root`]), giving a
+//!   [`Prepared`];
 //! - [`api_key`] / [`anthropic_planner`]: the planner (Anthropic: the key
 //!   from the environment variable named by `api_key_env`, never from the
 //!   file);
@@ -251,22 +253,6 @@ pub(crate) fn load_config(home: &Path, config: Option<PathBuf>) -> Result<(Confi
         EXIT_ERROR
     })?;
     Ok((cfg, config_path))
-}
-
-/// Steps 1-3: the data dir, the config, the root.
-pub(crate) fn prepare(
-    home: &Path,
-    config: Option<PathBuf>,
-    allow_home_root: bool,
-) -> Result<Prepared, u8> {
-    check_home(home)?;
-    let (cfg, config_path) = load_config(home, config)?;
-    let root = resolve_root(&cfg.root, allow_home_root)?;
-    Ok(Prepared {
-        cfg,
-        config_path,
-        root,
-    })
 }
 
 /// The Anthropic API key from the variable named by `api_key_env`. A

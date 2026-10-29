@@ -9,11 +9,11 @@
 //! 1. create the data dir (0700); refuse it if it is a symlink, not owned by
 //!    the current user, or writable by group or others;
 //! 2. load the config (`<home>/config.toml` or `--config`) and resolve its
-//!    canonical path;
+//!    canonical path; refuse an owner other than `local` (the stdio
+//!    channel's only sender);
 //! 3. resolve `root`: it must exist, be a directory, not be `/`, and not be
 //!    `$HOME` or an ancestor of it unless `--allow-home-root` (an unset or
-//!    unresolvable `HOME` also needs the flag); then refuse an owner other
-//!    than `local` (the stdio channel's only sender);
+//!    unresolvable `HOME` also needs the flag);
 //! 4. build the planner (Anthropic: the key from the environment variable
 //!    named by `api_key_env`, never from the file);
 //! 5. open the audit log (a broken or locked log is refused). From here on
@@ -44,7 +44,8 @@ use warden_agent::engine::Engine;
 use warden_agent::planner::Planner;
 
 use crate::startup::{
-    self, err, open_parts, session_entry, shown, Parts, SharedAudit, AGENT_SESSION, STDIO_OWNER,
+    self, err, open_parts, session_entry, shown, Parts, Prepared, SharedAudit, AGENT_SESSION,
+    STDIO_OWNER,
 };
 use crate::{EXIT_ERROR, EXIT_OK};
 
@@ -55,12 +56,21 @@ pub fn cmd_agent(home: &Path, config: Option<PathBuf>, allow_home_root: bool) ->
 }
 
 fn start(home: &Path, config: Option<PathBuf>, allow_home_root: bool) -> Result<u8, u8> {
-    // 1-3. Data dir, config, root.
-    let prepared = startup::prepare(home, config, allow_home_root)?;
-    if prepared.cfg.owner != STDIO_OWNER {
+    // 1. Data dir.
+    startup::check_home(home)?;
+    // 2. Config; the stdio channel has the single owner `local`.
+    let (cfg, config_path) = startup::load_config(home, config)?;
+    if cfg.owner != STDIO_OWNER {
         err!("error: the stdio channel only supports owner = \"local\"; remove `owner` from the config");
         return Err(EXIT_ERROR);
     }
+    // 3. Root.
+    let root = startup::resolve_root(&cfg.root, allow_home_root)?;
+    let prepared = Prepared {
+        cfg,
+        config_path,
+        root,
+    };
     let owners = vec![SenderId(prepared.cfg.owner.clone())];
 
     // 4. Planner (no files touched), then 5-8.
