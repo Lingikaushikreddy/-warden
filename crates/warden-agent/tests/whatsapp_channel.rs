@@ -395,6 +395,28 @@ async fn overflow_evicts_non_owner_items_before_owner_text() {
     assert_eq!(ch.dropped_count(), 1);
 }
 
+/// The daemon wraps the channel, so it reads the status and drop counts
+/// through shared handles taken before wrapping.
+#[tokio::test]
+async fn status_and_drop_counters_are_shared_handles() {
+    let h = Harness::new().await;
+    let (tx, ch) = h.channel();
+    let statuses = ch.status_counter();
+    let dropped = ch.dropped_counter();
+    let mut wrapped = Box::new(ch);
+    let mut events: Vec<WaEvent> = (0..70)
+        .map(|i| text(&format!("wamid.s{i}"), &format!("1555000{i:04}"), "spam"))
+        .collect();
+    events.push(WaEvent::Status);
+    events.push(WaEvent::Status);
+    tx.send(batch(events)).await.unwrap();
+    wrapped.recv().await.unwrap();
+    assert_eq!(statuses.load(Ordering::Relaxed), 2);
+    assert_eq!(dropped.load(Ordering::Relaxed), 6);
+    assert_eq!(wrapped.status_count(), 2);
+    assert_eq!(wrapped.dropped_count(), 6);
+}
+
 #[tokio::test]
 async fn discard_drops_pending_owner_messages_and_keeps_others() {
     let h = Harness::new().await;

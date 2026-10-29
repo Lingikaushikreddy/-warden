@@ -175,14 +175,14 @@ pub struct WhatsAppChannel {
     opts: WhatsAppOptions,
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
     queue: VecDeque<Item>,
-    dropped: u64,
+    dropped: Arc<AtomicU64>,
     /// Warden's own texts to send, `(owner number, text)`.
     notices: VecDeque<(String, String)>,
     /// Per owner number: the latest inbound time (Unix ms, capped at the
     /// local clock when it arrived).
     last_inbound: HashMap<String, u64>,
     window_drops: Arc<AtomicU64>,
-    statuses: u64,
+    statuses: Arc<AtomicU64>,
     fatal: Option<WhatsAppFatal>,
     /// Shutdown signal ([`Self::with_shutdown`]).
     shutdown: Option<watch::Receiver<bool>>,
@@ -263,11 +263,11 @@ impl WhatsAppChannel {
             opts,
             clock: Box::new(system_clock_ms),
             queue: VecDeque::new(),
-            dropped: 0,
+            dropped: Arc::new(AtomicU64::new(0)),
             notices: VecDeque::new(),
             last_inbound: HashMap::new(),
             window_drops: Arc::new(AtomicU64::new(0)),
-            statuses: 0,
+            statuses: Arc::new(AtomicU64::new(0)),
             fatal: None,
             shutdown: None,
         }
@@ -295,7 +295,13 @@ impl WhatsAppChannel {
 
     /// Items dropped because the queue was full.
     pub fn dropped_count(&self) -> u64 {
-        self.dropped
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// [`Self::dropped_count`] as a handle shared with the channel, so it
+    /// can be read after the channel is wrapped.
+    pub fn dropped_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.dropped)
     }
 
     /// Sends dropped because the owner's 24-hour window was closed (or
@@ -307,7 +313,13 @@ impl WhatsAppChannel {
 
     /// Delivery statuses received (counted and dropped).
     pub fn status_count(&self) -> u64 {
-        self.statuses
+        self.statuses.load(Ordering::Relaxed)
+    }
+
+    /// [`Self::status_count`] as a handle shared with the channel, so it
+    /// can be read after the channel is wrapped.
+    pub fn status_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.statuses)
     }
 
     fn shutting_down(&self) -> bool {
@@ -383,7 +395,7 @@ impl WhatsAppChannel {
             self.queue.push_back(item);
             return;
         }
-        self.dropped = self.dropped.saturating_add(1);
+        self.dropped.fetch_add(1, Ordering::Relaxed);
         if item.origin.is_none() {
             return;
         }
@@ -433,7 +445,7 @@ impl WhatsAppChannel {
         let mut fresh = Vec::with_capacity(batch.events.len());
         for ev in batch.events {
             if matches!(ev, WaEvent::Status) {
-                self.statuses = self.statuses.saturating_add(1);
+                self.statuses.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             if let Some(w) = wamid_of(&ev) {
