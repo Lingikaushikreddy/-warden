@@ -270,7 +270,12 @@ fn expired_records_are_pruned_on_open() {
     assert_ne!(ino_before, ino_after);
     assert_eq!(
         dir_names(&home),
-        vec!["approver.key", "approver.lock", "spent-nonces"]
+        vec![
+            "approver.key",
+            "approver.lock",
+            "clock-mark",
+            "spent-nonces"
+        ]
     );
 }
 
@@ -497,7 +502,12 @@ fn key_and_spent_and_lock_files_are_0600_and_home_is_0700() {
     assert_eq!(spent_len(&home), 0);
     assert_eq!(
         dir_names(&home),
-        vec!["approver.key", "approver.lock", "spent-nonces"]
+        vec![
+            "approver.key",
+            "approver.lock",
+            "clock-mark",
+            "spent-nonces"
+        ]
     );
 }
 
@@ -633,4 +643,173 @@ fn authorize_error_implements_error_and_display() {
     assert!(AuthorizeError::Persist(ErrorKind::PermissionDenied)
         .to_string()
         .contains("persist"));
+}
+
+// --- Clock high-water mark ---
+
+const HOUR: u64 = 3_600_000;
+
+fn mark_path(home: &Path) -> PathBuf {
+    home.join("clock-mark")
+}
+
+fn stored_mark(home: &Path) -> u64 {
+    let bytes = fs::read(mark_path(home)).unwrap();
+    u64::from_be_bytes(bytes.try_into().expect("clock-mark is 8 bytes"))
+}
+
+fn write_mark(home: &Path, bytes: &[u8]) {
+    fs::create_dir_all(home).unwrap();
+    chmod(home, 0o700);
+    fs::write(mark_path(home), bytes).unwrap();
+    chmod(&mark_path(home), 0o600);
+}
+
+#[test]
+fn clock_mark_is_created_0600_and_holds_open_time() {
+    let (_d, home) = new_home();
+    let store = ApproverStore::open(&home, NOW).unwrap();
+    assert_eq!(mode(&mark_path(&home)), 0o600);
+    assert_eq!(fs::metadata(mark_path(&home)).unwrap().len(), 8);
+    assert_eq!(stored_mark(&home), NOW);
+    assert_eq!(store.clock_mark_ms(), NOW);
+    assert_eq!(store.clock_behind_ms(), 0);
+    drop(store);
+
+    // An existing store without a mark (made before the mark existed) gets one.
+    fs::remove_file(mark_path(&home)).unwrap();
+    let store = ApproverStore::open(&home, NOW + 5).unwrap();
+    assert_eq!(stored_mark(&home), NOW + 5);
+    assert_eq!(mode(&mark_path(&home)), 0o600);
+    assert_eq!(store.clock_mark_ms(), NOW + 5);
+}
+
+#[test]
+fn rolled_back_clock_cannot_replay_a_pruned_approval() {
+    let (_d, home) = new_home();
+    let approval = {
+        let mut store = ApproverStore::open(&home, NOW).unwrap();
+        let _tok = store.authorize(&write_action(), &cfg(), NOW, TTL).unwrap();
+        store.last_approval_for_test().unwrap().clone()
+    };
+    // The clock jumps forward an hour: the record is pruned.
+    drop(ApproverStore::open(&home, NOW + HOUR).unwrap());
+    assert_eq!(spent_len(&home), 0);
+    // The clock goes back: the pruned approval must not be redeemable.
+    let mut store = ApproverStore::open(&home, NOW).unwrap();
+    assert!(store.spent_for_test().is_empty());
+    assert_eq!(
+        store.redeem_for_test(&write_action(), &cfg(), &approval, NOW),
+        Err(ApprovalError::Expired)
+    );
+}
+
+#[test]
+fn mark_never_decreases() {
+    let (_d, home) = new_home();
+    drop(ApproverStore::open(&home, NOW + HOUR).unwrap());
+    assert_eq!(stored_mark(&home), NOW + HOUR);
+    let store = ApproverStore::open(&home, NOW).unwrap();
+    assert_eq!(stored_mark(&home), NOW + HOUR);
+    assert_eq!(store.clock_mark_ms(), NOW + HOUR);
+    drop(store);
+    let mut store = ApproverStore::open(&home, NOW + 1).unwrap();
+    let _tok = store.authorize(&write_action(), &cfg(), NOW, TTL).unwrap();
+    assert_eq!(stored_mark(&home), NOW + HOUR);
+    drop(store);
+    drop(ApproverStore::open(&home, NOW + 2 * HOUR).unwrap());
+    assert_eq!(stored_mark(&home), NOW + 2 * HOUR);
+}
+
+#[test]
+fn wrong_size_mark_is_invalid_data() {
+    for bytes in [&b""[..], &[0u8; 7][..], &[0u8; 9][..]] {
+        let (_d, home) = new_home();
+        drop(ApproverStore::open(&home, NOW).unwrap());
+        write_mark(&home, bytes);
+        let err = ApproverStore::open(&home, NOW).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData, "{} bytes", bytes.len());
+        // Never repaired.
+        assert_eq!(fs::read(mark_path(&home)).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn clock_mark_with_loose_permissions_is_refused() {
+    let (_d, home) = new_home();
+    drop(ApproverStore::open(&home, NOW).unwrap());
+    chmod(&mark_path(&home), 0o644);
+    let err = ApproverStore::open(&home, NOW).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+}
+
+#[test]
+fn clock_behind_reports_the_gap() {
+    let (_d, home) = new_home();
+    drop(ApproverStore::open(&home, NOW + HOUR).unwrap());
+    let store = ApproverStore::open(&home, NOW).unwrap();
+    assert_eq!(store.clock_behind_ms(), HOUR);
+    drop(store);
+    let store = ApproverStore::open(&home, NOW + 2 * HOUR).unwrap();
+    assert_eq!(store.clock_behind_ms(), 0);
+}
+
+#[test]
+fn authorize_persists_a_newer_mark() {
+    let (_d, home) = new_home();
+    let mut store = ApproverStore::open(&home, NOW).unwrap();
+    let tok = store
+        .authorize(&write_action(), &cfg(), NOW + HOUR, TTL)
+        .unwrap();
+    assert_eq!(tok.expires_at_ms(), NOW + HOUR + TTL);
+    assert_eq!(stored_mark(&home), NOW + HOUR);
+    assert_eq!(store.clock_mark_ms(), NOW + HOUR);
+}
+
+#[test]
+fn token_expiry_uses_the_mark_when_clock_is_behind() {
+    let (_d, home) = new_home();
+    drop(ApproverStore::open(&home, NOW + HOUR).unwrap());
+    let mut store = ApproverStore::open(&home, NOW).unwrap();
+    let tok = store.authorize(&write_action(), &cfg(), NOW, TTL).unwrap();
+    assert_eq!(tok.expires_at_ms(), NOW + HOUR + TTL);
+    assert_eq!(records(&home)[0].1, NOW + HOUR + TTL);
+    assert_eq!(stored_mark(&home), NOW + HOUR);
+}
+
+#[test]
+fn mark_write_failure_issues_no_token_and_spends_no_nonce() {
+    let (_d, home) = new_home();
+    let mut store = ApproverStore::open(&home, NOW).unwrap();
+    chmod(&mark_path(&home), 0o400);
+    if fs::OpenOptions::new()
+        .write(true)
+        .open(mark_path(&home))
+        .is_ok()
+    {
+        eprintln!("skipping: read-only file is writable (running as root?)");
+        return;
+    }
+    let res = store.authorize(&write_action(), &cfg(), NOW + 1_000, TTL);
+    assert!(
+        matches!(
+            res,
+            Err(AuthorizeError::Persist(ErrorKind::PermissionDenied))
+        ),
+        "{res:?}"
+    );
+    assert!(store.last_approval_for_test().is_none());
+    assert!(store.spent_for_test().is_empty());
+    assert_eq!(spent_len(&home), 0);
+    assert_eq!(stored_mark(&home), NOW);
+    assert_eq!(store.clock_mark_ms(), NOW);
+
+    // Not poisoned: once the mark is writable again, authorize works.
+    chmod(&mark_path(&home), 0o600);
+    let tok = store
+        .authorize(&write_action(), &cfg(), NOW + 1_000, TTL)
+        .unwrap();
+    assert_eq!(tok.expires_at_ms(), NOW + 1_000 + TTL);
+    assert_eq!(stored_mark(&home), NOW + 1_000);
+    assert_eq!(spent_len(&home), 24);
 }

@@ -7,11 +7,11 @@
 //! without reading the body, and tool-use ids and names are restricted to
 //! `[A-Za-z0-9_-]{1,64}` because they are echoed back into later requests.
 
+use crate::http;
 use crate::planner::{Block, PlanRequest, PlanResponse, Planner, PlannerError, Role, ToolId, Turn};
 use crate::redact::redact;
 use crate::tools::ToolCall;
 use reqwest::header::{HeaderValue, CONTENT_TYPE};
-use reqwest::redirect::Policy;
 use reqwest::Url;
 use serde_json::{json, Map, Value};
 use std::fmt;
@@ -37,8 +37,6 @@ pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_TOOL_CALLS: usize = 64;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const USER_AGENT_VALUE: &str = concat!("warden-agent/", env!("CARGO_PKG_VERSION"));
 
 /// A [`Planner`] backed by the Anthropic Messages API.
 pub struct AnthropicPlanner {
@@ -74,30 +72,6 @@ fn valid_model(m: &str) -> bool {
         && redact(m).1.count == 0
 }
 
-fn check_base_url(base_url: &str) -> Result<Url, PlannerError> {
-    let url = Url::parse(base_url).map_err(|_| config_err("invalid base url"))?;
-    let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
-    match url.scheme() {
-        "https" => {}
-        "http" if loopback => {}
-        _ => {
-            return Err(config_err(
-                "base url must be https (http only for loopback)",
-            ))
-        }
-    }
-    if url.host_str().is_none_or(str::is_empty) {
-        return Err(config_err("base url has no host"));
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(config_err("base url must not contain credentials"));
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err(config_err("base url must not have a query or fragment"));
-    }
-    Ok(url)
-}
-
 impl AnthropicPlanner {
     /// Build a planner. `api_key` must be non-empty; `model` must match
     /// `[A-Za-z0-9._:-]{1,100}` and not look like a secret; `base_url` must be
@@ -121,7 +95,7 @@ impl AnthropicPlanner {
         if !valid_model(&model) {
             return Err(config_err("invalid model id"));
         }
-        let url = check_base_url(&base_url)?;
+        let url = http::check_base_url(&base_url).map_err(config_err)?;
         let base = url.as_str().trim_end_matches('/').to_string();
         let endpoint = Url::parse(&format!("{base}/v1/messages"))
             .map_err(|_| config_err("invalid base url"))?;
@@ -131,13 +105,7 @@ impl AnthropicPlanner {
         let mut api_key = api_key;
         api_key.zeroize();
 
-        let client = reqwest::Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
-            .use_rustls_tls()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .user_agent(USER_AGENT_VALUE)
-            .build()
+        let client = http::client()
             .map_err(|_| PlannerError::Transport("could not build HTTP client".into()))?;
         Ok(AnthropicPlanner {
             client,

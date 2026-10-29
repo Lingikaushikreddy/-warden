@@ -525,6 +525,61 @@ fn agent_logs_session_start_and_end() {
 }
 
 #[test]
+fn agent_warns_when_the_clock_is_behind_the_mark() {
+    let e = Env::new();
+    e.mock(&e.root, json!([]));
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let mark = e.home.join("clock-mark");
+    fs::write(&mark, (now_ms + 3_600_000).to_be_bytes()).unwrap();
+    fs::set_permissions(&mark, fs::Permissions::from_mode(0o600)).unwrap();
+    let o = e.cmd().write_stdin("").output().unwrap();
+    let (so, se) = out(&o);
+    assert_eq!(o.status.code(), Some(0), "{so}\n{se}");
+    let warning = se
+        .lines()
+        .find(|l| l.starts_with("warning: the system clock is "))
+        .unwrap_or_else(|| panic!("no clock warning: {se}"));
+    let secs: u64 = warning
+        .strip_prefix("warning: the system clock is ")
+        .and_then(|r| {
+            r.strip_suffix(" s behind the last time Warden ran; approvals use the later time")
+        })
+        .unwrap_or_else(|| panic!("{warning}"))
+        .parse()
+        .unwrap();
+    assert!((3_500..=3_600).contains(&secs), "{warning}");
+    let entries = e.entries();
+    assert!(
+        entries.iter().any(|v| v["action_id"] == "session"
+            && v["decision"] == "clock behind high-water mark"),
+        "{}",
+        e.audit_text()
+    );
+    // The mark was not lowered.
+    assert_eq!(
+        u64::from_be_bytes(fs::read(&mark).unwrap().try_into().unwrap()),
+        now_ms + 3_600_000
+    );
+}
+
+#[test]
+fn agent_does_not_warn_about_the_clock_on_a_fresh_home() {
+    let e = Env::new();
+    e.mock(&e.root, json!([]));
+    let o = e.cmd().write_stdin("").output().unwrap();
+    let (so, se) = out(&o);
+    assert_eq!(o.status.code(), Some(0), "{so}\n{se}");
+    assert!(!se.contains("system clock"), "{se}");
+    assert!(!e.audit_text().contains("high-water"));
+}
+
+#[test]
 fn agent_refuses_a_missing_config_naming_the_path() {
     let e = Env::new();
     let o = e.cmd().write_stdin("").output().unwrap();

@@ -1268,3 +1268,71 @@ fn new_secret_words_false_positive_guards() {
     // `pass` only as a glued fragment is not a word.
     assert_eq!(out("token_bypass_count: 3"), "token_bypass_count: 3");
 }
+
+#[test]
+fn telegram_bot_token_is_redacted() {
+    let tail = "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawQ";
+    assert_eq!(tail.len(), 35);
+    for c in [
+        format!("123456789:{tail}"),
+        format!("12345678:{tail}"),
+        format!("1234567890:{tail}"),
+    ] {
+        let (r, rep) = redact(&format!("key {c} end"));
+        assert_eq!(r.as_str(), "key [REDACTED:api_key] end", "{c}");
+        assert_eq!(rep.kinds, vec!["api_key"]);
+        assert_eq!(rep.count, 1);
+        // At the start of the text and after a boundary char.
+        assert_eq!(out(&c), "[REDACTED:api_key]", "{c}");
+        // Glued to the letters `bot` (the Bot API URL path): `bot` is kept.
+        assert_eq!(out(&format!("bot{c}")), "bot[REDACTED:api_key]", "{c}");
+        // Glued to any other letter: needs a boundary.
+        assert_eq!(out(&format!("x{c}")), format!("x{c}"), "{c}");
+        assert_eq!(
+            out(&format!("url=/bot/{c}/x")),
+            "url=/bot/[REDACTED:api_key]/x"
+        );
+    }
+}
+
+#[test]
+fn ratios_and_times_are_not_redacted() {
+    let short = "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw";
+    assert_eq!(short.len(), 34);
+    for line in [
+        "meet at 10:30".to_string(),
+        "ratio 12345678:abc".to_string(),
+        format!("x 123456789:{short}"),
+        format!("x 1234567:{short}Q"),
+    ] {
+        assert_eq!(out(&line), line, "{line}");
+    }
+}
+
+#[test]
+fn telegram_token_in_bot_api_url_is_redacted() {
+    let secret = "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawQ";
+    let line = format!("curl https://api.telegram.org/bot123456789:{secret}/getMe");
+    let (r, rep) = redact(&line);
+    assert!(
+        r.as_str().contains("/bot[REDACTED:api_key]/getMe"),
+        "{}",
+        r.as_str()
+    );
+    assert!(!r.as_str().contains(secret), "{}", r.as_str());
+    assert!(!r.as_str().contains("123456789:"), "{}", r.as_str());
+    assert_eq!(
+        r.as_str(),
+        "curl https://api.telegram.org/bot[REDACTED:api_key]/getMe"
+    );
+    assert_eq!(rep.kinds, vec!["api_key"]);
+    assert_eq!(rep.count, 1);
+    // Idempotent.
+    assert_eq!(out(r.as_str()), r.as_str());
+    // Two URLs on one line, and the file-download path shape.
+    let two = format!("a/bot1234567890:{secret}/sendMessage b/file/bot12345678:{secret}/doc.pdf");
+    assert_eq!(
+        out(&two),
+        "a/bot[REDACTED:api_key]/sendMessage b/file/bot[REDACTED:api_key]/doc.pdf"
+    );
+}
