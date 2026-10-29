@@ -11,7 +11,9 @@
 //! - a body over `max_body_bytes` is refused (413) before or while it is
 //!   read, and is never parsed;
 //! - `X-Hub-Signature-256` is checked over the raw bytes before anything
-//!   is parsed; an unsigned or badly signed body is never parsed (401);
+//!   is parsed; a POST without one is refused before its body is read,
+//!   and a badly signed body (or two signature headers) is never parsed
+//!   (401);
 //! - a signed batch goes on the channel queue without waiting for the
 //!   engine (200), or gets 503 when the queue is full so Meta retries.
 //!
@@ -119,7 +121,7 @@ macro_rules! stats {
 }
 
 stats! {
-    /// POSTs with no `X-Hub-Signature-256` (401).
+    /// POSTs with no `X-Hub-Signature-256` (401, before the body is read).
     unsigned,
     /// POSTs whose signature is malformed or does not match (401).
     bad_signature,
@@ -128,9 +130,11 @@ stats! {
     /// Bodies not complete within the body timeout (408), and connections
     /// cut off by the header timeout or the overall cap.
     timed_out,
-    /// Signed bodies that are not a WhatsApp notification (200, dropped),
-    /// and bodies the client broke off or framed wrongly (400).
+    /// Signed bodies that are not a WhatsApp notification (200, dropped).
     malformed,
+    /// Bodies the client broke off or framed wrongly, neither over the cap
+    /// nor timed out (400).
+    bad_request,
     /// Changes for another `phone_number_id` (dropped).
     foreign,
     /// Signed batches refused because the queue was full or closed (503).
@@ -284,8 +288,22 @@ async fn notification(req: Request<Incoming>, s: &Shared) -> Response<Full<Bytes
         bump(&s.stats.too_large);
         return reply(StatusCode::PAYLOAD_TOO_LARGE, "payload too large");
     }
-    let (parts, body) = req.into_parts();
-    let read = tokio::time::timeout(s.cfg.body_timeout, Limited::new(body, cap).collect()).await;
+    // More than one signature header is refused, not resolved. With none
+    // at all the body is not even read.
+    let mut sigs = req.headers().get_all(SIGNATURE_HEADER).iter();
+    let sig = match (sigs.next(), sigs.next()) {
+        (None, _) => {
+            bump(&s.stats.unsigned);
+            return reply(StatusCode::UNAUTHORIZED, "unauthorized");
+        }
+        (Some(v), None) => Some(v.as_bytes().to_vec()),
+        (Some(_), Some(_)) => None,
+    };
+    let read = tokio::time::timeout(
+        s.cfg.body_timeout,
+        Limited::new(req.into_body(), cap).collect(),
+    )
+    .await;
     let raw = match read {
         Ok(Ok(collected)) => collected.to_bytes(),
         Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
@@ -293,7 +311,7 @@ async fn notification(req: Request<Incoming>, s: &Shared) -> Response<Full<Bytes
             return reply(StatusCode::PAYLOAD_TOO_LARGE, "payload too large");
         }
         Ok(Err(_)) => {
-            bump(&s.stats.malformed);
+            bump(&s.stats.bad_request);
             return reply(StatusCode::BAD_REQUEST, "bad request");
         }
         Err(_) => {
@@ -302,13 +320,9 @@ async fn notification(req: Request<Incoming>, s: &Shared) -> Response<Full<Bytes
         }
     };
 
-    // More than one signature header is refused, not resolved.
-    let mut sigs = parts.headers.get_all(SIGNATURE_HEADER).iter();
-    let first = sigs.next();
-    let check = if sigs.next().is_some() {
-        SignatureCheck::Invalid
-    } else {
-        check_signature(&s.cfg.app_secret, first.map(|v| v.as_bytes()), &raw)
+    let check = match &sig {
+        Some(sig) => check_signature(&s.cfg.app_secret, Some(sig), &raw),
+        None => SignatureCheck::Invalid,
     };
     match check {
         SignatureCheck::Valid => {}

@@ -389,6 +389,7 @@ async fn connection_limit_holds() {
         c.body_timeout = Duration::from_millis(200);
     })
     .await;
+    let opened = Instant::now();
     let mut idle1 = TcpStream::connect(h.addr).await.unwrap();
     let mut idle2 = TcpStream::connect(h.addr).await.unwrap();
     // Let the listener accept both before the third arrives.
@@ -399,8 +400,15 @@ async fn connection_limit_holds() {
     assert!(resp.is_empty(), "got {resp:?}");
     assert!(h.snap().busy >= 1);
 
-    read_until_closed(&mut idle1, Duration::from_secs(8)).await;
-    read_until_closed(&mut idle2, Duration::from_secs(8)).await;
+    // The header timeout (0.8 s), not the overall cap (about 6 s), frees
+    // the slots.
+    read_until_closed(&mut idle1, Duration::from_secs(2)).await;
+    read_until_closed(&mut idle2, Duration::from_secs(2)).await;
+    assert!(
+        opened.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        opened.elapsed()
+    );
     // The permits are released when the connection tasks end.
     tokio::time::sleep(Duration::from_millis(50)).await;
     let (status, _) = h.signed_post(envelope()).await;
@@ -418,6 +426,104 @@ async fn full_queue_is_503() {
         h.snap(),
         StatsSnapshot {
             queue_full: 1,
+            ..StatsSnapshot::default()
+        }
+    );
+}
+
+/// Send `req` on a fresh raw connection and read until it closes.
+async fn raw_request(h: &Harness, req: &[u8]) -> String {
+    let mut s = TcpStream::connect(h.addr).await.unwrap();
+    s.write_all(req).await.unwrap();
+    read_until_closed(&mut s, Duration::from_secs(2)).await
+}
+
+fn raw_post(sig_lines: &[String], body: &[u8]) -> Vec<u8> {
+    let mut req = format!("POST {WEBHOOK_PATH} HTTP/1.1\r\nHost: x\r\n").into_bytes();
+    for line in sig_lines {
+        req.extend_from_slice(format!("X-Hub-Signature-256: {line}\r\n").as_bytes());
+    }
+    req.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+    req.extend_from_slice(body);
+    req
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_signature_headers_are_refused() {
+    let mut h = start().await;
+    let body = envelope();
+    let good = sign(SECRET, &body);
+    let cases = [
+        vec![good.clone(), good.clone()],
+        vec![good.clone(), "sha256=junk".to_string()],
+        vec!["sha256=junk".to_string(), good.clone()],
+        vec![format!("{good}, {good}")],
+        vec![format!("{good},{good}")],
+    ];
+    for lines in &cases {
+        let resp = raw_request(&h, &raw_post(lines, &body)).await;
+        assert!(resp.starts_with("HTTP/1.1 401"), "{lines:?}: got {resp:?}");
+    }
+    assert!(h.rx.try_recv().is_err());
+    assert_eq!(
+        h.snap(),
+        StatsSnapshot {
+            bad_signature: cases.len() as u64,
+            ..StatsSnapshot::default()
+        }
+    );
+    // The same body with one valid header still goes through.
+    let resp = raw_request(&h, &raw_post(&[good], &body)).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "got {resp:?}");
+    assert!(h.rx.try_recv().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_signature_is_refused_without_reading_the_body() {
+    let mut h = start().await;
+    // A full 1 MiB is declared and none of it is sent: only a refusal
+    // that does not wait for the body answers before the 10 s body timeout.
+    let mut s = TcpStream::connect(h.addr).await.unwrap();
+    s.write_all(
+        format!("POST {WEBHOOK_PATH} HTTP/1.1\r\nHost: x\r\nContent-Length: {MIB}\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let t = Instant::now();
+    let resp = read_until_closed(&mut s, Duration::from_secs(2)).await;
+    assert!(resp.starts_with("HTTP/1.1 401"), "got {resp:?}");
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert!(h.rx.try_recv().is_err());
+    assert_eq!(
+        h.snap(),
+        StatsSnapshot {
+            unsigned: 1,
+            ..StatsSnapshot::default()
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broken_body_framing_is_400_bad_request_not_malformed() {
+    let mut h = start().await;
+    let mut req = format!(
+        "POST {WEBHOOK_PATH} HTTP/1.1\r\nHost: x\r\nX-Hub-Signature-256: {}\r\n\
+         Transfer-Encoding: chunked\r\n\r\n",
+        sign(SECRET, b"")
+    )
+    .into_bytes();
+    req.extend_from_slice(b"zz\r\nnot a chunk\r\n0\r\n\r\n");
+    let resp = raw_request(&h, &req).await;
+    assert!(
+        resp.is_empty() || resp.starts_with("HTTP/1.1 400"),
+        "got {resp:?}"
+    );
+    assert!(h.rx.try_recv().is_err());
+    assert_eq!(
+        h.snap(),
+        StatsSnapshot {
+            bad_request: 1,
             ..StatsSnapshot::default()
         }
     );
