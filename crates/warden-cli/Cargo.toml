@@ -24,11 +24,16 @@ required-features = ["test-hooks"]
 name = "agent"
 required-features = ["test-hooks"]
 
+[[test]]
+name = "daemon"
+required-features = ["test-hooks"]
+
 [dependencies]
 warden-core = { path = "../warden-core" }
 warden-agent = { path = "../warden-agent" }
-# Runtime for `warden agent` only (built inside that subcommand).
-tokio = { version = "1", features = ["rt-multi-thread", "io-std", "io-util"] }
+# Runtime for `warden agent` and `warden daemon` only (built inside those
+# subcommands); `signal` for the daemon's SIGINT/SIGTERM shutdown.
+tokio = { version = "1", features = ["rt-multi-thread", "io-std", "io-util", "signal", "sync"] }
 clap = { version = "4", features = ["derive"] }
 # Constants only (O_NOFOLLOW); no unsafe calls.
 libc = "0.2"
@@ -43,3 +48,6 @@ assert_cmd = "2"
 tempfile = "3"
 serde_json = "1"
 regex = "1"
+# Loopback fake Telegram Bot API for the `daemon` tests.
+wiremock = "0.6"
+tokio = { version = "1", features = ["macros"] }

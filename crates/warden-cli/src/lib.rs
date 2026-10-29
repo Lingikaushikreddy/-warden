@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 //! Library behind the `warden` binary (`run`, `undo`, `audit verify`,
-//! `prune`, `init-pin` and `agent`); `main.rs` only parses and maps the
+//! `prune`, `init-pin`, `agent` and `daemon`); `main.rs` only parses and maps the
 //! returned code to an exit status.
 //!
 //! Exit codes: 0 ok, 1 error or broken audit log, 2 approval missing or bad
@@ -9,6 +9,8 @@
 pub mod agent;
 pub mod cli;
 pub mod commands;
+pub mod daemon;
+mod startup;
 
 pub use cli::Cli;
 

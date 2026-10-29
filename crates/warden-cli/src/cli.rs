@@ -128,6 +128,26 @@ pub enum Command {
         #[arg(long, hide = true)]
         allow_home_root: bool,
     },
+    /// Run the agent engine on Telegram as a foreground daemon.
+    ///
+    /// Reads the same config as `agent`, which must have a `[telegram]`
+    /// table; the bot token comes only from the environment variable named
+    /// by `bot_token_env` (default WARDEN_TELEGRAM_TOKEN). One daemon per
+    /// data dir. Any startup problem exits 1 and nothing runs. SIGINT or
+    /// SIGTERM stops it after the current step (exit 0); a fatal Telegram
+    /// error exits 1.
+    Daemon {
+        /// Config file. Default: <home>/config.toml
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        /// Also take messages and approvals on this terminal (owner `local`).
+        #[arg(long)]
+        console: bool,
+        /// Allow `root` to be your home directory itself (refused by default:
+        /// it exposes every dotfile to Auto reads).
+        #[arg(long, hide = true)]
+        allow_home_root: bool,
+    },
     /// Set the PIN for YesPin actions (from the argument or WARDEN_PIN).
     InitPin {
         pin: Option<String>,

@@ -99,6 +99,11 @@ pub fn dispatch(cli: Cli) -> u8 {
             config,
             allow_home_root,
         } => crate::agent::cmd_agent(&home, config, allow_home_root),
+        Command::Daemon {
+            config,
+            console,
+            allow_home_root,
+        } => crate::daemon::cmd_daemon(&home, config, console, allow_home_root),
     }
 }
 
