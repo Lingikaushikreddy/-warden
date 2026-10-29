@@ -896,6 +896,15 @@ impl Channel for WhatsAppChannel {
         let _ = self.deliver(&number, CANNOT_DELETE).await;
     }
 
+    /// Send the notices still queued (stale, not-text, delete-it-yourself),
+    /// best effort, inside the window only, and within
+    /// `shutdown_request_timeout` in all; whatever is left then is dropped.
+    async fn flush_pending(&mut self) {
+        let limit = self.opts.shutdown_request_timeout;
+        let _ = tokio::time::timeout(limit, self.flush()).await;
+        self.notices.clear();
+    }
+
     fn serves(&self, who: &SenderId) -> bool {
         who.0.starts_with("wa:")
     }

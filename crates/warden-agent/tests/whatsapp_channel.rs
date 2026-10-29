@@ -1387,3 +1387,53 @@ async fn delete_notice_outside_the_window_is_skipped_and_not_counted() {
     assert!(recv_quiet(&mut ch).await);
     assert_eq!(delete_notices(&h).await, 0);
 }
+
+/// Integration finding M4: notices still queued when the engine stops go
+/// out in `flush_pending` (best effort, bounded).
+#[tokio::test]
+async fn flush_pending_sends_queued_notices() {
+    let h = Harness::new().await;
+    let (tx, mut ch) = h.channel();
+    open_window(&tx, &mut ch).await;
+    // The reply is consumed inside ask_approval; its delete notice is
+    // queued, not yet sent.
+    tx.send(batch(vec![text("wamid.r1", OWNER, "yes 4821 482193")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        ch.ask_approval(&owner(), &prompt(Tier::Yes)).await,
+        ApprovalReply::No
+    );
+    assert_eq!(delete_notices(&h).await, 0);
+    ch.flush_pending().await;
+    assert_eq!(delete_notices(&h).await, 1);
+    // Nothing left: a second flush sends nothing.
+    let before = h.sent().await.len();
+    ch.flush_pending().await;
+    assert_eq!(h.sent().await.len(), before);
+}
+
+/// A Graph API that does not answer cannot hold up shutdown: the flush
+/// ends within the shutdown request timeout.
+#[tokio::test]
+async fn flush_pending_is_bounded_by_the_shutdown_request_timeout() {
+    let h = Harness::new().await;
+    let (tx, mut ch) = h.channel();
+    open_window(&tx, &mut ch).await;
+    tx.send(batch(vec![text("wamid.r1", OWNER, "yes 4821 482193")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        ch.ask_approval(&owner(), &prompt(Tier::Yes)).await,
+        ApprovalReply::No
+    );
+    h.script.push(sent_ok().set_delay(Duration::from_secs(10)));
+    let started = std::time::Instant::now();
+    ch.flush_pending().await;
+    // opts(): shutdown_request_timeout is 200 ms.
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+}
