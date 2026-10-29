@@ -19,7 +19,7 @@ pub mod webhook;
 pub use api::{AccessToken, ErrorClass, GraphApi, PhoneInfo, WhatsAppError};
 pub use channel::{sender_id, WhatsAppChannel, WhatsAppFatal, WhatsAppOptions, WINDOW_MS};
 pub use listener::{ListenerConfig, StatsSnapshot, WebhookListener, WebhookStats, WEBHOOK_PATH};
-pub use seen::{SeenStore, MAX_SEEN, SEEN_FILE};
+pub use seen::{SeenStore, MAX_SEEN, MAX_SEEN_HARD, SEEN_FILE, SEEN_MAGIC};
 pub use webhook::{
     check_signature, handshake, parse_notification, AppSecret, Notification, NotificationError,
     RefuseReason, SignatureCheck, VerifyToken, WaEvent, WebhookBatch, MAX_EVENTS,

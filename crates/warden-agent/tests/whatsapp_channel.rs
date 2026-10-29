@@ -506,6 +506,51 @@ async fn restart_does_not_redeliver_seen_wamid() {
     assert!(recv_quiet(&mut ch).await);
 }
 
+/// Integration finding I1: a stranger flood must not push an owner's
+/// message id out of the seen store, or a Meta redelivery inside the age
+/// limit would run the owner's command again.
+#[tokio::test]
+async fn stranger_flood_does_not_evict_owner_wamid_so_redelivery_is_not_replayed() {
+    let h = Harness::new().await;
+    let (tx, mut ch) = h.channel();
+    let cmd = batch(vec![text("wamid.CMD", OWNER, "delete notes.txt")]);
+    tx.send(cmd.clone()).await.unwrap();
+    assert_eq!(ch.recv().await.unwrap().text, "delete notes.txt");
+    for k in 0..5 {
+        let flood = (0..256)
+            .map(|i| text(&format!("wamid.s{k}_{i}"), STRANGER, "hi"))
+            .collect();
+        tx.send(batch(flood)).await.unwrap();
+        while !recv_quiet(&mut ch).await {}
+    }
+    tx.send(cmd).await.unwrap();
+    assert!(recv_quiet(&mut ch).await, "owner command replayed");
+}
+
+/// Only owner message ids are recorded: strangers' replays cost an audit
+/// entry, not seen-store room.
+#[tokio::test]
+async fn only_owner_wamids_are_recorded() {
+    let h = Harness::new().await;
+    let (tx, mut ch) = h.channel();
+    tx.send(batch(vec![
+        text("wamid.S", STRANGER, "hi"),
+        refused("wamid.R", STRANGER, RefuseReason::NotText),
+        refused("wamid.ON", OWNER, RefuseReason::NotText),
+        text("wamid.O", OWNER, "mine"),
+    ]))
+    .await
+    .unwrap();
+    for _ in 0..4 {
+        ch.recv().await.unwrap();
+    }
+    let seen = SeenStore::open(h.home.path()).unwrap();
+    assert!(seen.contains("wamid.O"));
+    assert!(seen.contains("wamid.ON"));
+    assert!(!seen.contains("wamid.S"));
+    assert!(!seen.contains("wamid.R"));
+}
+
 #[tokio::test]
 async fn seen_write_failure_is_fatal_and_nothing_is_delivered() {
     let h = Harness::new().await;

@@ -10,9 +10,9 @@
 //! audits it and nothing else happens. Delivery statuses are counted and
 //! dropped; they never reach the engine.
 //!
-//! Delivery is at most once: a batch's new message ids are written to the
-//! [`SeenStore`] before any of its messages is queued, and a failed write
-//! is fatal. Ingesting a batch is synchronous, and the only awaits are the
+//! Delivery is at most once: a batch's new owner message ids are written
+//! to the [`SeenStore`] before any of its messages is queued, and a failed
+//! write is fatal. Ingesting a batch is synchronous, and the only awaits are the
 //! receiver (cancel-safe) and sends, so `recv`, `ask_approval` and
 //! `discard_pending_input` may be dropped at any await without losing or
 //! replaying a message.
@@ -245,6 +245,19 @@ fn wamid_of(ev: &WaEvent) -> Option<&str> {
     }
 }
 
+/// The sender and timestamp of an event, if it has a sender.
+fn origin_of(ev: &WaEvent) -> Option<(&str, Option<i64>)> {
+    match ev {
+        WaEvent::Text {
+            from, timestamp_s, ..
+        } => Some((from.as_str(), Some(*timestamp_s))),
+        WaEvent::Refused {
+            from, timestamp_s, ..
+        } => Some((from.as_deref()?, *timestamp_s)),
+        WaEvent::Status => None,
+    }
+}
+
 impl WhatsAppChannel {
     /// A channel reading batches from `inbound` (the webhook listener) for
     /// the given owner numbers (digits only).
@@ -435,8 +448,8 @@ impl WhatsAppChannel {
     /// half way:
     /// 1. drop events whose wamid was seen before or earlier in the batch,
     ///    and count and drop statuses;
-    /// 2. record the remaining wamids; on failure the channel is fatal and
-    ///    the batch is dropped;
+    /// 2. record the remaining owner wamids; on failure the channel is
+    ///    fatal and the batch is dropped;
     /// 3. note the inbound time of every owner message;
     /// 4. sort the messages into owner text, stale, owner non-text and
     ///    pass-through; owners with stale messages get one notice.
@@ -455,24 +468,29 @@ impl WhatsAppChannel {
             }
             fresh.push(ev);
         }
-        let ids: Vec<&str> = fresh.iter().filter_map(wamid_of).collect();
-        if !ids.is_empty() && self.seen.record(&ids).is_err() {
+        let now = (self.clock)();
+        // Only owner ids are recorded (see [`SeenStore`]), each with its
+        // capped time so eviction can keep it while a redelivery could
+        // still be fresh.
+        let ids: Vec<(&str, u64)> = fresh
+            .iter()
+            .filter_map(|ev| {
+                let (from, ts) = origin_of(ev)?;
+                if !self.is_owner(from) {
+                    return None;
+                }
+                let at = ts.map_or(now, |t| capped_ms(t, now));
+                Some((wamid_of(ev)?, at))
+            })
+            .collect();
+        let keep_ms = u64::try_from(self.opts.max_message_age.as_millis()).unwrap_or(u64::MAX);
+        if !ids.is_empty() && self.seen.record(&ids, now, keep_ms).is_err() {
             self.fatal = Some(WhatsAppFatal::SeenUnwritable);
             return Vec::new();
         }
 
-        let now = (self.clock)();
         for ev in &fresh {
-            let (from, ts) = match ev {
-                WaEvent::Text {
-                    from, timestamp_s, ..
-                } => (Some(from.as_str()), Some(*timestamp_s)),
-                WaEvent::Refused {
-                    from, timestamp_s, ..
-                } => (from.as_deref(), *timestamp_s),
-                WaEvent::Status => (None, None),
-            };
-            let (Some(from), Some(ts)) = (from, ts) else {
+            let Some((from, Some(ts))) = origin_of(ev) else {
                 continue;
             };
             if !self.is_owner(from) {
