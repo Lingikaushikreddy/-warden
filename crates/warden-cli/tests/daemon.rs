@@ -431,7 +431,12 @@ impl Daemon {
 
     /// Wait for the exit code.
     fn wait_exit(&mut self) -> i32 {
-        let deadline = Instant::now() + TIMEOUT;
+        self.wait_exit_within(TIMEOUT)
+    }
+
+    /// Wait for the exit code, at most `limit`.
+    fn wait_exit_within(&mut self, limit: Duration) -> i32 {
+        let deadline = Instant::now() + limit;
         loop {
             if let Some(st) = self.child.try_wait().unwrap() {
                 // Let the pump threads drain.
@@ -1931,6 +1936,63 @@ fn whatsapp_batch_unread_at_stop_gets_a_notice_and_is_counted() {
     assert!(!e.audit_text().contains("what time is it"));
 }
 
+/// Follow-up F1: Telegram deletions hang and three are still owed at stop
+/// (5 s each, longer than the 10 s final flush), while a WhatsApp batch
+/// answered 200 waits in the queue. The batch is drained before the timed
+/// flush and its notice goes out beside the hung deletions, so it is
+/// neither lost nor uncounted. Stop takes about 10 s (the listener stop,
+/// then the final flush cut at 10 s), at most 15 s, inside `TIMEOUT`.
+#[test]
+fn whatsapp_unread_at_stop_survives_a_hung_telegram_flush() {
+    let e = Env::new();
+    let tg = Tg::start();
+    let wa = Wa::start();
+    tg._rt.block_on(
+        Mock::given(method("POST"))
+            .and(path(bot_path("deleteMessage")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"ok": true, "result": true}))
+                    .set_delay(Duration::from_secs(60)),
+            )
+            .with_priority(1)
+            .mount(&tg.server),
+    );
+    let a = e.root.join("a.txt");
+    fs::write(&a, "old").unwrap();
+    e.mock_wa(&wa.base(), write_script("a.txt", "new"), Some(&tg.base()));
+    let mut d = e.spawn();
+    let addr = d.ready_wa();
+    tg.push(vec![owner_text(1, "update a.txt")]);
+    let _code = wait_for_code(&mut d, &tg);
+    // Stale PIN-like texts at the prompt: dropped, and deletions owed.
+    tg.push(vec![
+        private_text(2, OWNER, "4815162342", now_s() - 3600),
+        private_text(3, OWNER, "2718281828", now_s() - 3600),
+        private_text(4, OWNER, "3141592653", now_s() - 3600),
+        private_text(5, OWNER, "1618033988", now_s() - 3600),
+    ]);
+    let deleting = || {
+        tg._rt
+            .block_on(tg.server.received_requests())
+            .unwrap()
+            .iter()
+            .any(|r| r.url.path() == bot_path("deleteMessage"))
+    };
+    d.wait_for("the deletion was never attempted", deleting);
+    post_owner(&mut d, addr, "wamid.unread", "what time is it");
+    assert_eq!(d.stop(), 0, "{}", d.stderr());
+    assert_eq!(fs::read_to_string(&a).unwrap(), "old");
+    assert_eq!(
+        wa.texts_to(WA_OWNER),
+        vec!["Warden stopped before reading 1 message(s); send them again.".to_string()],
+        "{}",
+        d.stderr()
+    );
+    let se = d.stderr();
+    assert!(se.contains("; other: 1 unread at stop"), "{se}");
+}
+
 #[test]
 fn whatsapp_token_rejected_at_startup_exits_1() {
     let e = Env::new();
@@ -2129,8 +2191,8 @@ fn sigterm_stops_the_whatsapp_listener() {
     let wa = Wa::start();
     // The first reply hangs: the step is still sending when SIGTERM
     // arrives, and the daemon lives on while it finishes (the request gets
-    // 5 s more), then stops the listener and flushes (each bounded, up to
-    // 15 s more in all), well inside `TIMEOUT`.
+    // 5 s more), then stops the listener (at most 5 s) and flushes (at most
+    // 10 s). The worst case, 20 s, equals `TIMEOUT`, so the exit gets 30 s.
     wa.rt.block_on(
         Mock::given(method("POST"))
             .and(path(graph_path("/messages")))
@@ -2158,7 +2220,12 @@ fn sigterm_stops_the_whatsapp_listener() {
             .contains("shutting down after the current step")
     });
     assert_listener_stops_while_alive(&mut d, addr);
-    assert_eq!(d.wait_exit(), 0, "{}", d.stderr());
+    assert_eq!(
+        d.wait_exit_within(Duration::from_secs(30)),
+        0,
+        "{}",
+        d.stderr()
+    );
     assert_eq!(
         e.decisions().last().map(String::as_str),
         Some("daemon session ended")

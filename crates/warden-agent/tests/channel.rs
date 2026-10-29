@@ -672,6 +672,7 @@ struct RemoteLog {
     discarded: Arc<Mutex<Vec<SenderId>>>,
     retracted: Arc<Mutex<Vec<SenderId>>>,
     flushed: Arc<std::sync::atomic::AtomicUsize>,
+    drained: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RemoteLog {
@@ -741,6 +742,11 @@ impl Channel for Remote {
             .flushed
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
+    fn drain_at_stop(&mut self) {
+        self.log
+            .drained
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     fn serves(&self, who: &SenderId) -> bool {
         *who == remote()
     }
@@ -758,6 +764,47 @@ async fn pair_flush_pending_reaches_both_sides() {
     for l in [log, log2] {
         assert_eq!(l.flushed.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
+}
+
+/// Follow-up F1: `drain_at_stop` is forwarded to both sides of a `Pair`
+/// (a defaulted method would silently do nothing).
+#[tokio::test]
+async fn pair_drain_at_stop_reaches_both_sides() {
+    let mut out = Vec::new();
+    let (r, _tx, log) = remote_chan();
+    let (r2, _tx2, log2) = remote_chan();
+    {
+        let mut p = Pair::new(r, Pair::new(chan(b"", &mut out), r2));
+        p.drain_at_stop();
+    }
+    for l in [log, log2] {
+        assert_eq!(l.drained.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(l.flushed.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+}
+
+/// Follow-up F1: one side's slow flush does not starve the other side's.
+#[tokio::test(start_paused = true)]
+async fn pair_flush_pending_runs_both_sides_at_once() {
+    use std::time::Duration;
+    struct Slow;
+    impl Channel for Slow {
+        async fn recv(&mut self) -> Option<Inbound> {
+            None
+        }
+        async fn send(&mut self, _to: &SenderId, _text: &str) {}
+        async fn ask_approval(&mut self, _to: &SenderId, _p: &ApprovalPrompt) -> ApprovalReply {
+            ApprovalReply::No
+        }
+        async fn flush_pending(&mut self) {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    }
+    let (r, _tx, log) = remote_chan();
+    let mut p = Pair::new(Slow, r);
+    let r = tokio::time::timeout(Duration::from_secs(10), p.flush_pending()).await;
+    assert!(r.is_err(), "the slow side is still flushing");
+    assert_eq!(log.flushed.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -881,6 +928,7 @@ async fn option_none_is_a_closed_channel_that_serves_nobody() {
         c.retract_last(&who).await;
     }
     c.flush_pending().await;
+    c.drain_at_stop();
     assert!(c.recv().await.is_none());
     assert!(c.recv().await.is_none(), "stays closed");
 }
@@ -903,6 +951,7 @@ async fn option_some_delegates_every_call() {
     assert_eq!(c.discard_pending_input(&remote()).await, 3);
     c.retract_last(&remote()).await;
     c.flush_pending().await;
+    c.drain_at_stop();
     drop(tx);
     assert!(c.recv().await.is_none(), "inner channel closed");
     assert_eq!(
@@ -913,6 +962,7 @@ async fn option_some_delegates_every_call() {
     assert_eq!(*log.discarded.lock().unwrap(), vec![remote()]);
     assert_eq!(*log.retracted.lock().unwrap(), vec![remote()]);
     assert_eq!(log.flushed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(log.drained.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

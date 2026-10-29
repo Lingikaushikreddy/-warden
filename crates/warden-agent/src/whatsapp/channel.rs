@@ -351,7 +351,7 @@ impl WhatsAppChannel {
 
     /// Owner texts that were taken from Meta (answered 200) but never
     /// handed to the engine because Warden stopped first (see
-    /// [`Channel::flush_pending`]). A handle shared with the channel, so it
+    /// [`Channel::drain_at_stop`]). A handle shared with the channel, so it
     /// can be read after the channel is wrapped.
     pub fn unread_at_stop_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.unread_at_stop)
@@ -959,10 +959,10 @@ impl Channel for WhatsAppChannel {
         let _ = self.deliver(&number, CANNOT_DELETE).await;
     }
 
-    /// Called once the engine has stopped. First the batches still waiting
-    /// from the listener are ingested and every owner text that will not be
-    /// handled is counted; each such owner is told, once, to send them
-    /// again. Then the notices still queued (stale, not-text,
+    /// Called once the engine has stopped, after
+    /// [`Channel::drain_at_stop`]. First the drain runs again (it finds
+    /// nothing when `drain_at_stop` already ran, so nothing is counted
+    /// twice). Then the notices still queued (stale, not-text,
     /// delete-it-yourself, unread) are sent, best effort, inside the window
     /// only, and within `shutdown_request_timeout` in all; whatever is left
     /// then is dropped.
@@ -971,6 +971,15 @@ impl Channel for WhatsAppChannel {
         let limit = self.opts.shutdown_request_timeout;
         let _ = tokio::time::timeout(limit, self.flush()).await;
         self.notices.clear();
+    }
+
+    /// The batches still waiting from the listener are ingested (their ids
+    /// recorded as seen) and every owner text that will not be handled is
+    /// counted; each such owner gets one notice, queued for
+    /// [`Channel::flush_pending`]. A seen-list write failure here is fatal
+    /// ([`WhatsAppFatal::SeenUnwritable`]) and no notice is sent.
+    fn drain_at_stop(&mut self) {
+        self.drain_unread();
     }
 
     fn serves(&self, who: &SenderId) -> bool {

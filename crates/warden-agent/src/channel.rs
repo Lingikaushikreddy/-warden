@@ -156,11 +156,19 @@ pub trait Channel {
 
     /// Best-effort completion of work the channel still owes, such as
     /// deleting messages that may hold the PIN. Called once when the
-    /// engine has stopped; the caller bounds how long it may take.
-    /// Default: nothing pending.
+    /// engine has stopped, after [`Channel::drain_at_stop`]; the caller
+    /// bounds how long it may take. Default: nothing pending.
     fn flush_pending(&mut self) -> impl Future<Output = ()> + Send {
         async {}
     }
+
+    /// Account for input the channel has already taken from its service
+    /// but the engine will never read, such as webhook batches answered
+    /// 200 and still queued. Called once when the engine has stopped,
+    /// before [`Channel::flush_pending`], so no time bound on the flush can
+    /// skip it. Synchronous: it only records and queues (notices go out in
+    /// `flush_pending`). Must be harmless to repeat. Default: nothing.
+    fn drain_at_stop(&mut self) {}
 
     /// Whether this channel can reach `who` (used by [`Pair`] to route
     /// outbound calls). Default: `true`.
@@ -175,6 +183,7 @@ pub trait Channel {
 /// goes to `a` if `a` serves the recipient, else to `b` if `b` does, else
 /// nowhere: `send` and `retract_last` do nothing, `ask_approval` is `No`,
 /// `discard_pending_input` is 0 and `accepts_pin` is `false`.
+/// `flush_pending` and `drain_at_stop` reach both sides.
 ///
 /// `recv` races both sides, keeps reading the other side after one has
 /// closed, is `None` once both have, and alternates which side is polled
@@ -286,10 +295,16 @@ impl<A: Channel + Send, B: Channel + Send> Channel for Pair<A, B> {
         }
     }
 
-    /// Both sides, `a` first.
+    /// Both sides at once, so a slow side (say, deletions that hang)
+    /// cannot use up the caller's time bound before the other side runs.
     async fn flush_pending(&mut self) {
-        self.a.flush_pending().await;
-        self.b.flush_pending().await;
+        tokio::join!(self.a.flush_pending(), self.b.flush_pending());
+    }
+
+    /// Both sides, `a` first.
+    fn drain_at_stop(&mut self) {
+        self.a.drain_at_stop();
+        self.b.drain_at_stop();
     }
 
     fn serves(&self, who: &SenderId) -> bool {
@@ -301,7 +316,8 @@ impl<A: Channel + Send, B: Channel + Send> Channel for Pair<A, B> {
 ///
 /// `Some` delegates every call, including the defaulted ones. `None` is a
 /// closed channel that serves nobody, so it fails closed: `recv` is `None`,
-/// `send`, `retract_last` and `flush_pending` do nothing, `ask_approval` is
+/// `send`, `retract_last`, `flush_pending` and `drain_at_stop` do nothing,
+/// `ask_approval` is
 /// `No`, `discard_pending_input` is 0, and `accepts_pin` and `serves` are
 /// `false`. Inside a [`Pair`], a `None` side therefore closes at once and
 /// every call goes to the other side.
@@ -346,6 +362,12 @@ impl<C: Channel + Send> Channel for Option<C> {
     async fn flush_pending(&mut self) {
         if let Some(c) = self {
             c.flush_pending().await;
+        }
+    }
+
+    fn drain_at_stop(&mut self) {
+        if let Some(c) = self {
+            c.drain_at_stop();
         }
     }
 

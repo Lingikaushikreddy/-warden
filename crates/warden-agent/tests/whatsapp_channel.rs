@@ -1471,6 +1471,52 @@ async fn flush_pending_tells_owners_about_messages_unread_at_stop() {
     assert_eq!(unread.load(Ordering::Relaxed), 3);
 }
 
+/// Follow-up F1: `drain_at_stop` takes the batches still waiting, records
+/// their ids, counts the unread owner texts and queues the notices without
+/// sending anything; the later `flush_pending` sends them and counts
+/// nothing twice.
+#[tokio::test]
+async fn drain_at_stop_counts_and_queues_without_sending() {
+    let h = Harness::new().await;
+    let (tx, mut ch) = h.channel();
+    tx.send(batch(vec![text("wamid.d1", OWNER, "one")]))
+        .await
+        .unwrap();
+    let unread = ch.unread_at_stop_counter();
+    ch.drain_at_stop();
+    assert_eq!(unread.load(Ordering::Relaxed), 1);
+    assert!(h.sent().await.is_empty(), "drain_at_stop sends nothing");
+    assert!(SeenStore::open(h.home.path()).unwrap().contains("wamid.d1"));
+    // Idempotent: a second drain finds nothing.
+    ch.drain_at_stop();
+    assert_eq!(unread.load(Ordering::Relaxed), 1);
+    ch.flush_pending().await;
+    assert_eq!(unread.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        h.sent_texts().await,
+        vec![(
+            OWNER.into(),
+            "Warden stopped before reading 1 message(s); send them again.".into()
+        )]
+    );
+}
+
+/// Follow-up F1: a seen-list write failure during `drain_at_stop` is
+/// fatal, and no notice is sent afterwards.
+#[tokio::test]
+async fn seen_write_failure_during_drain_at_stop_is_fatal() {
+    let h = Harness::new().await;
+    let (tx, mut ch) = h.channel();
+    std::fs::create_dir(h.home.path().join("whatsapp-seen")).unwrap();
+    tx.send(batch(vec![text("wamid.d1", OWNER, "one")]))
+        .await
+        .unwrap();
+    ch.drain_at_stop();
+    assert_eq!(ch.fatal(), Some(WhatsAppFatal::SeenUnwritable));
+    ch.flush_pending().await;
+    assert!(h.sent().await.is_empty());
+}
+
 /// Final review C2: a notice whose send is cancelled (here by a [`Pair`]
 /// whose other side delivered first) is sent again on the next flush,
 /// not lost.

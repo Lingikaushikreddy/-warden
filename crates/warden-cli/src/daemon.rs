@@ -629,9 +629,10 @@ fn serve<P: Planner>(
 /// listener to start once the session has begun, and its counters. A fatal
 /// channel error sets `shutdown` at once, which also closes the webhook
 /// listener, so Meta stops being answered 200 for new batches. Batches
-/// already answered 200 but still queued are read by the final flush: their
-/// ids are recorded as seen, and each owner with texts in them is told to
-/// send them again (counted as unread at stop). The listener alone holds
+/// already answered 200 but still queued are drained when the engine has
+/// stopped, before the timed final flush: their ids are recorded as seen,
+/// and each owner with texts in them is told to send them again (counted as
+/// unread at stop). The listener alone holds
 /// the batch queue's sender (moved into its serving future), so its end is
 /// what the WhatsApp channel sees as the queue closing.
 async fn run<P: Planner, C: Channel>(
@@ -726,10 +727,14 @@ async fn run<P: Planner, C: Channel>(
             h.abort();
         }
     }
-    // Deletions still owed (replies that may hold the PIN) and notices,
-    // best effort and bounded. Messages still queued are not acted on
-    // (delivery is at most once); WhatsApp owners are told to send theirs
-    // again.
+    // Messages still queued are not acted on (delivery is at most once).
+    // First, unbounded by time but synchronous, the WhatsApp batches
+    // answered 200 and still queued are ingested (ids recorded as seen),
+    // counted, and their owners' notices queued, so the timed flush below
+    // cannot skip them. A seen-list failure here is a fatal (exit 1).
+    engine.channel_mut().drain_at_stop();
+    // Then deletions still owed (replies that may hold the PIN) and
+    // notices, best effort and bounded; the channels flush side by side.
     let _ = tokio::time::timeout(FINAL_FLUSH, engine.channel_mut().flush_pending()).await;
 
     if let Err(e) = session_entry(&audit, DAEMON_SESSION, "daemon session ended") {
@@ -863,6 +868,12 @@ impl<C: Channel + FatalSource + Send> Channel for Watched<C> {
 
     async fn flush_pending(&mut self) {
         self.inner.flush_pending().await;
+        self.note();
+    }
+
+    fn drain_at_stop(&mut self) {
+        self.inner.drain_at_stop();
+        self.note();
     }
 
     fn serves(&self, who: &SenderId) -> bool {
@@ -1064,6 +1075,7 @@ WantedBy=default.target
 #[cfg(test)]
 mod tests {
     use super::*;
+    use warden_agent::whatsapp::{WaEvent, WebhookBatch};
 
     #[test]
     fn channel_fatal_display_is_the_inner_text() {
@@ -1148,6 +1160,87 @@ mod tests {
         let long = banner_field(&"9".repeat(500));
         assert_eq!(long.chars().count(), BANNER_FIELD_MAX);
         assert!(long.ends_with('…'));
+    }
+
+    /// A WhatsApp channel whose seen list cannot be written (a directory
+    /// sits where the file goes), with one owner text already waiting.
+    async fn unwritable_whatsapp(home: &Path) -> (mpsc::Sender<WebhookBatch>, WhatsAppChannel) {
+        let api = GraphApi::new(
+            AccessToken::new("EAAGtestTOKEN0123456789abcdefghijDONOTLEAK".into()).unwrap(),
+            "http://127.0.0.1:9",
+            "v26.0",
+            "123456789012345",
+        )
+        .unwrap();
+        let seen = SeenStore::open(home).unwrap();
+        std::fs::create_dir(home.join(SEEN_FILE)).unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        tx.send(WebhookBatch {
+            events: vec![WaEvent::Text {
+                wamid: "wamid.late".into(),
+                from: "15551234567".into(),
+                timestamp_s: i64::try_from(now).unwrap(),
+                body: "late".into(),
+                reply_to: None,
+            }],
+        })
+        .await
+        .unwrap();
+        let ch = WhatsAppChannel::new(
+            api,
+            rx,
+            vec!["15551234567".into()],
+            seen,
+            WhatsAppOptions::default(),
+        );
+        (tx, ch)
+    }
+
+    /// Follow-up F1: a seen-list write failure during the stop-time drain
+    /// reaches the fatal slot, so the daemon prints it and exits 1.
+    #[tokio::test]
+    async fn watched_drain_at_stop_records_a_late_fatal() {
+        let home = tempfile::tempdir().unwrap();
+        let (_tx, ch) = unwritable_whatsapp(home.path()).await;
+        let slot = FatalSlot::default();
+        let mut w = Pair::new(
+            None::<StdioChannel<tokio::io::Empty, tokio::io::Sink>>,
+            Some(Watched {
+                inner: ch,
+                slot: slot.clone(),
+            }),
+        );
+        w.drain_at_stop();
+        assert_eq!(
+            slot.get(),
+            Some(ChannelFatal::WhatsApp(WhatsAppFatal::SeenUnwritable))
+        );
+        assert_eq!(
+            slot.get().unwrap().to_string(),
+            "cannot save the WhatsApp seen-message list"
+        );
+    }
+
+    /// Follow-up F1: `flush_pending` records a late fatal too (its own
+    /// drain finds the same failure when `drain_at_stop` did not run).
+    #[tokio::test]
+    async fn watched_flush_pending_records_a_late_fatal() {
+        let home = tempfile::tempdir().unwrap();
+        let (_tx, ch) = unwritable_whatsapp(home.path()).await;
+        let slot = FatalSlot::default();
+        let mut w = Watched {
+            inner: ch,
+            slot: slot.clone(),
+        };
+        w.flush_pending().await;
+        assert_eq!(
+            slot.get(),
+            Some(ChannelFatal::WhatsApp(WhatsAppFatal::SeenUnwritable))
+        );
     }
 
     #[test]
