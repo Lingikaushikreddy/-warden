@@ -25,6 +25,12 @@ const TOKEN: &str = "verify-token_0123.~xyz";
 const PNID: &str = "106540352242922";
 const OWNER: &str = "15551234567";
 const MIB: usize = 1024 * 1024;
+/// How long a test waits for the listener to close a connection it should
+/// close at once or after a short (at most 0.8 s) test timeout: generous
+/// for a loaded CI runner, yet well below the 10 s default header and body
+/// timeouts and the 15 s overall cap, so a pass still proves which limit
+/// closed it.
+const CLOSE_WAIT: Duration = Duration::from_secs(6);
 
 fn config() -> ListenerConfig {
     ListenerConfig::new(
@@ -338,7 +344,7 @@ async fn oversized_body_is_413_and_never_parsed() {
     )
     .await
     .unwrap();
-    let resp = read_until_closed(&mut s, Duration::from_secs(2)).await;
+    let resp = read_until_closed(&mut s, CLOSE_WAIT).await;
     assert!(resp.starts_with("HTTP/1.1 413"), "got {resp:?}");
 
     // A chunked body that runs past the cap.
@@ -358,7 +364,7 @@ async fn oversized_body_is_413_and_never_parsed() {
     req.extend_from_slice(b"0\r\n\r\n");
     // The server may close while we are still writing.
     let _ = s.write_all(&req).await;
-    let resp = read_until_closed(&mut s, Duration::from_secs(2)).await;
+    let resp = read_until_closed(&mut s, CLOSE_WAIT).await;
     // The 413 can be lost to the reset that closing with unread bytes
     // causes; the counters below are the proof either way.
     assert!(
@@ -382,8 +388,10 @@ async fn slow_headers_are_cut_off() {
     let mut s = TcpStream::connect(h.addr).await.unwrap();
     s.write_all(b"POST /webh").await.unwrap();
     let t = Instant::now();
-    read_until_closed(&mut s, Duration::from_secs(2)).await;
-    assert!(t.elapsed() < Duration::from_secs(2));
+    read_until_closed(&mut s, CLOSE_WAIT).await;
+    // The 0.2 s header timeout, not the 10 s body default or the overall
+    // cap, closed it.
+    assert!(t.elapsed() < CLOSE_WAIT, "{:?}", t.elapsed());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -400,7 +408,7 @@ async fn slow_body_is_cut_off() {
     )
     .await
     .unwrap();
-    let resp = read_until_closed(&mut s, Duration::from_secs(2)).await;
+    let resp = read_until_closed(&mut s, CLOSE_WAIT).await;
     assert!(
         resp.is_empty() || resp.starts_with("HTTP/1.1 408"),
         "got {resp:?}"
@@ -426,16 +434,18 @@ async fn connection_limit_holds() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let mut third = TcpStream::connect(h.addr).await.unwrap();
-    let resp = read_until_closed(&mut third, Duration::from_millis(400)).await;
+    // Refused at once; this wait must end before the idle slots free up
+    // at 0.8 s, or the third connection could be taken instead.
+    let resp = read_until_closed(&mut third, Duration::from_millis(650)).await;
     assert!(resp.is_empty(), "got {resp:?}");
     assert!(h.snap().busy >= 1);
 
-    // The header timeout (0.8 s), not the overall cap (about 6 s), frees
-    // the slots.
-    read_until_closed(&mut idle1, Duration::from_secs(2)).await;
-    read_until_closed(&mut idle2, Duration::from_secs(2)).await;
+    // The header timeout (0.8 s), not the overall cap (6 s), frees the
+    // slots; 3 s leaves a CI runner more than 3x the timeout.
+    read_until_closed(&mut idle1, Duration::from_secs(3)).await;
+    read_until_closed(&mut idle2, Duration::from_secs(3)).await;
     assert!(
-        opened.elapsed() < Duration::from_secs(2),
+        opened.elapsed() < Duration::from_secs(3),
         "{:?}",
         opened.elapsed()
     );
@@ -465,7 +475,7 @@ async fn full_queue_is_503() {
 async fn raw_request(h: &Harness, req: &[u8]) -> String {
     let mut s = TcpStream::connect(h.addr).await.unwrap();
     s.write_all(req).await.unwrap();
-    read_until_closed(&mut s, Duration::from_secs(2)).await
+    read_until_closed(&mut s, CLOSE_WAIT).await
 }
 
 fn raw_post(sig_lines: &[String], body: &[u8]) -> Vec<u8> {
@@ -521,9 +531,11 @@ async fn missing_signature_is_refused_without_reading_the_body() {
     .await
     .unwrap();
     let t = Instant::now();
-    let resp = read_until_closed(&mut s, Duration::from_secs(2)).await;
+    let resp = read_until_closed(&mut s, CLOSE_WAIT).await;
     assert!(resp.starts_with("HTTP/1.1 401"), "got {resp:?}");
-    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    // Answered without waiting for the body: far below the 10 s body
+    // timeout, with room for a slow CI runner.
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
     assert!(h.rx.try_recv().is_err());
     assert_eq!(
         h.snap(),

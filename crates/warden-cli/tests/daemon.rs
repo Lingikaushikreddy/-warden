@@ -2128,7 +2128,9 @@ fn sigterm_stops_the_whatsapp_listener() {
     let e = Env::new();
     let wa = Wa::start();
     // The first reply hangs: the step is still sending when SIGTERM
-    // arrives, and the daemon lives on for up to 5 s finishing it.
+    // arrives, and the daemon lives on while it finishes (the request gets
+    // 5 s more), then stops the listener and flushes (each bounded, up to
+    // 15 s more in all), well inside `TIMEOUT`.
     wa.rt.block_on(
         Mock::given(method("POST"))
             .and(path(graph_path("/messages")))
@@ -2168,8 +2170,9 @@ fn whatsapp_fatal_stops_the_listener_while_the_daemon_runs() {
     let e = Env::new();
     let tg = Tg::start();
     let wa = Wa::start();
-    // Telegram deletions hang, so the final flush keeps the daemon alive
-    // for up to 5 s after shutdown has started.
+    // Telegram deletions hang, so the daemon stays alive after shutdown
+    // has started: the listener stop (at most 5 s) and the final flush (at
+    // most 10 s) can take up to 15 s in all.
     tg._rt.block_on(
         Mock::given(method("POST"))
             .and(path(bot_path("deleteMessage")))
