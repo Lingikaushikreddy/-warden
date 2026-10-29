@@ -1437,3 +1437,36 @@ async fn flush_pending_is_bounded_by_the_shutdown_request_timeout() {
         started.elapsed()
     );
 }
+
+/// Controller ruling: an approval reply that is exactly `no` (any case,
+/// trimmed) cannot hold a PIN and gets no delete notice; every other reply
+/// that is not a Yes does.
+#[tokio::test]
+async fn bare_no_reply_gets_no_delete_notice() {
+    let h = Harness::new().await;
+    let (tx, mut ch) = h.channel();
+    open_window(&tx, &mut ch).await;
+    for (i, reply) in ["no", "  NO ", "No"].iter().enumerate() {
+        tx.send(batch(vec![text(&format!("wamid.n{i}"), OWNER, reply)]))
+            .await
+            .unwrap();
+        assert_eq!(
+            ch.ask_approval(&owner(), &prompt(Tier::Yes)).await,
+            ApprovalReply::No
+        );
+        assert!(recv_quiet(&mut ch).await);
+        assert_eq!(delete_notices(&h).await, 0, "{reply:?}");
+    }
+    // Any other non-Yes reply still gets the notice.
+    for (i, reply) in ["no thanks", "ok", "yes 9999"].iter().enumerate() {
+        tx.send(batch(vec![text(&format!("wamid.o{i}"), OWNER, reply)]))
+            .await
+            .unwrap();
+        assert_eq!(
+            ch.ask_approval(&owner(), &prompt(Tier::Yes)).await,
+            ApprovalReply::No
+        );
+        assert!(recv_quiet(&mut ch).await);
+        assert_eq!(delete_notices(&h).await, i + 1, "{reply:?}");
+    }
+}

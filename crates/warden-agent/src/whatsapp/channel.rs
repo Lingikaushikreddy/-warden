@@ -408,7 +408,14 @@ impl WhatsAppChannel {
     /// engine): if it may hold the PIN, the owner is told to delete it once
     /// the current batch is handled ([`Self::queue_delete_notices`]).
     fn consumed(&mut self, from: &str, text: &str) {
-        if may_hold_pin(text) && !self.delete_due.iter().any(|f| f == from) {
+        if may_hold_pin(text) {
+            self.delete_due_for(from);
+        }
+    }
+
+    /// Note `from` for one [`CANNOT_DELETE`] notice this batch.
+    fn delete_due_for(&mut self, from: &str) {
+        if !self.delete_due.iter().any(|f| f == from) {
             self.delete_due.push(from.to_string());
         }
     }
@@ -819,9 +826,10 @@ impl Channel for WhatsAppChannel {
                         parse_reply(&text, false, &prompt.challenge)
                     };
                     // The reply is consumed here; anything but a Yes may
-                    // carry the PIN (`yes <code> <PIN>`).
-                    if answer != ApprovalReply::Yes {
-                        self.consumed(&number, &text);
+                    // carry the PIN (`yes <code> <PIN>`), except a bare
+                    // `no`, which cannot.
+                    if answer != ApprovalReply::Yes && !text.trim().eq_ignore_ascii_case("no") {
+                        self.delete_due_for(&number);
                     }
                     answer
                 }
